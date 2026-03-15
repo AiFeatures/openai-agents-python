@@ -1,6 +1,6 @@
 # Fork Customizations
 
-> This repository is a fork of [unknown]().
+> This repository is a fork of [openai/openai-agents-python](https://github.com/openai/openai-agents-python).
 > Managed under the [iAiFy Enterprise](https://github.com/enterprises/iAiFy) governance model.
 
 ## Purpose
@@ -11,7 +11,7 @@ A lightweight, powerful framework for multi-agent workflows
 
 | Property | Value |
 |----------|-------|
-| Upstream | [unknown]() |
+| Upstream | [openai/openai-agents-python](https://github.com/openai/openai-agents-python) |
 | Language | Python |
 | Fork org | AiFeatures |
 
