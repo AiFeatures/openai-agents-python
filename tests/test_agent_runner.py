@@ -45,6 +45,7 @@ from agents.items import (
     ReasoningItem,
     RunItem,
     ToolApprovalItem,
+    ToolCallItem,
     ToolCallOutputItem,
     TResponseInputItem,
 )
@@ -52,6 +53,8 @@ from agents.lifecycle import RunHooks
 from agents.run import AgentRunner, get_default_agent_runner, set_default_agent_runner
 from agents.run_config import _default_trace_include_sensitive_data
 from agents.run_internal.items import (
+    TOOL_CALL_SESSION_DESCRIPTION_KEY,
+    TOOL_CALL_SESSION_TITLE_KEY,
     drop_orphan_function_calls,
     ensure_input_item_format,
     fingerprint_input_item,
@@ -625,6 +628,45 @@ async def test_parallel_tool_call_with_cancelled_sibling_reaches_final_output() 
     ]
     assert tool_outputs == [
         {"call_id": "call_ok", "output": "ok", "type": "function_call_output"},
+        {
+            "call_id": "call_cancel",
+            "output": (
+                "An error occurred while running the tool. Please try again. Error: tool-cancelled"
+            ),
+            "type": "function_call_output",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_single_tool_call_with_cancelled_tool_reaches_final_output() -> None:
+    async def _cancel_tool() -> str:
+        raise asyncio.CancelledError("tool-cancelled")
+
+    model = FakeModel()
+    agent = Agent(
+        name="test",
+        model=model,
+        tools=[function_tool(_cancel_tool, name_override="cancel_tool")],
+    )
+
+    model.add_multiple_turn_outputs(
+        [
+            [get_function_tool_call("cancel_tool", "{}", call_id="call_cancel")],
+            [get_text_message("final answer")],
+        ]
+    )
+
+    result = await Runner.run(agent, input="user_message")
+
+    assert result.final_output == "final answer"
+    assert len(result.raw_responses) == 2
+
+    second_turn_input = cast(list[dict[str, Any]], model.last_turn_args["input"])
+    tool_outputs = [
+        item for item in second_turn_input if item.get("type") == "function_call_output"
+    ]
+    assert tool_outputs == [
         {
             "call_id": "call_cancel",
             "output": (
@@ -2259,6 +2301,148 @@ async def test_save_result_to_session_omits_reasoning_ids_when_policy_is_omit() 
     saved_reasoning = cast(dict[str, Any], session.saved_items[0])
     assert saved_reasoning.get("type") == "reasoning"
     assert "id" not in saved_reasoning
+
+
+@pytest.mark.asyncio
+async def test_save_result_to_session_keeps_tool_call_payload_api_safe() -> None:
+    session = SimpleListSession()
+    agent = Agent(name="agent", model=FakeModel())
+    tool_call = ToolCallItem(
+        agent=agent,
+        raw_item=ResponseFunctionToolCall(
+            id="fc_session",
+            call_id="call_session",
+            name="lookup_account",
+            arguments="{}",
+            type="function_call",
+            status="completed",
+        ),
+        description="Lookup customer records.",
+        title="Lookup Account",
+    )
+
+    saved_count = await save_result_to_session(
+        session,
+        [],
+        cast(list[RunItem], [tool_call]),
+        None,
+    )
+
+    assert saved_count == 1
+    assert len(session.saved_items) == 1
+    saved_tool_call = cast(dict[str, Any], session.saved_items[0])
+    assert saved_tool_call["type"] == "function_call"
+    assert TOOL_CALL_SESSION_DESCRIPTION_KEY not in saved_tool_call
+    assert TOOL_CALL_SESSION_TITLE_KEY not in saved_tool_call
+    assert "description" not in saved_tool_call
+    assert "title" not in saved_tool_call
+
+
+@pytest.mark.asyncio
+async def test_save_result_to_session_sanitizes_original_input_items() -> None:
+    session = SimpleListSession()
+
+    saved_count = await save_result_to_session(
+        session,
+        [
+            cast(
+                TResponseInputItem,
+                {
+                    "type": "function_call",
+                    "call_id": "call_input",
+                    "name": "lookup_account",
+                    "arguments": "{}",
+                    TOOL_CALL_SESSION_DESCRIPTION_KEY: "Lookup customer records.",
+                    TOOL_CALL_SESSION_TITLE_KEY: "Lookup Account",
+                },
+            )
+        ],
+        [],
+        None,
+    )
+
+    assert saved_count == 0
+    assert len(session.saved_items) == 1
+    saved_tool_call = cast(dict[str, Any], session.saved_items[0])
+    assert saved_tool_call["type"] == "function_call"
+    assert TOOL_CALL_SESSION_DESCRIPTION_KEY not in saved_tool_call
+    assert TOOL_CALL_SESSION_TITLE_KEY not in saved_tool_call
+    assert "description" not in saved_tool_call
+    assert "title" not in saved_tool_call
+
+
+@pytest.mark.asyncio
+async def test_prepare_input_with_session_strips_internal_tool_call_metadata() -> None:
+    tool_call = cast(
+        TResponseInputItem,
+        {
+            "type": "function_call",
+            "call_id": "call_history",
+            "name": "lookup_account",
+            "arguments": "{}",
+            TOOL_CALL_SESSION_DESCRIPTION_KEY: "Lookup customer records.",
+            TOOL_CALL_SESSION_TITLE_KEY: "Lookup Account",
+        },
+    )
+    tool_output = cast(
+        TResponseInputItem,
+        {
+            "type": "function_call_output",
+            "call_id": "call_history",
+            "output": "ok",
+        },
+    )
+    session = SimpleListSession(history=[tool_call, tool_output])
+
+    prepared_input, session_items = await prepare_input_with_session("hello", session, None)
+
+    assert isinstance(prepared_input, list)
+    prepared_tool_calls = [
+        cast(dict[str, Any], item)
+        for item in prepared_input
+        if isinstance(item, dict)
+        and item.get("type") == "function_call"
+        and item.get("call_id") == "call_history"
+    ]
+    assert len(prepared_tool_calls) == 1
+    assert TOOL_CALL_SESSION_DESCRIPTION_KEY not in prepared_tool_calls[0]
+    assert TOOL_CALL_SESSION_TITLE_KEY not in prepared_tool_calls[0]
+    assert len(session_items) == 1
+    assert cast(dict[str, Any], session_items[0])["role"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_prepare_input_with_session_sanitizes_new_tool_call_session_items() -> None:
+    prepared_input, session_items = await prepare_input_with_session(
+        [
+            cast(
+                TResponseInputItem,
+                {
+                    "type": "function_call",
+                    "call_id": "call_new",
+                    "name": "lookup_account",
+                    "arguments": "{}",
+                    TOOL_CALL_SESSION_DESCRIPTION_KEY: "Lookup customer records.",
+                    TOOL_CALL_SESSION_TITLE_KEY: "Lookup Account",
+                },
+            )
+        ],
+        SimpleListSession(),
+        None,
+    )
+
+    assert isinstance(prepared_input, list)
+    assert len(prepared_input) == 1
+    prepared_tool_call = cast(dict[str, Any], prepared_input[0])
+    assert prepared_tool_call["type"] == "function_call"
+    assert TOOL_CALL_SESSION_DESCRIPTION_KEY not in prepared_tool_call
+    assert TOOL_CALL_SESSION_TITLE_KEY not in prepared_tool_call
+
+    assert len(session_items) == 1
+    session_tool_call = cast(dict[str, Any], session_items[0])
+    assert session_tool_call["type"] == "function_call"
+    assert TOOL_CALL_SESSION_DESCRIPTION_KEY not in session_tool_call
+    assert TOOL_CALL_SESSION_TITLE_KEY not in session_tool_call
 
 
 @pytest.mark.asyncio

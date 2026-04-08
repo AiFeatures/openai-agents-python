@@ -18,7 +18,7 @@ ALLOWED_LABELS: Final[set[str]] = {
     "dependencies",
     "feature:chat-completions",
     "feature:core",
-    "feature:lite-llm",
+    "feature:extensions",
     "feature:mcp",
     "feature:realtime",
     "feature:sessions",
@@ -27,6 +27,7 @@ ALLOWED_LABELS: Final[set[str]] = {
 }
 
 SOURCE_FEATURE_PREFIXES: Final[dict[str, tuple[str, ...]]] = {
+    "feature:extensions": ("src/agents/extensions/",),
     "feature:realtime": ("src/agents/realtime/",),
     "feature:voice": ("src/agents/voice/",),
     "feature:mcp": ("src/agents/mcp/",),
@@ -169,13 +170,6 @@ def infer_specific_feature_labels(changed_files: Sequence[str]) -> set[str]:
         for path in source_files
     ):
         labels.add("feature:chat-completions")
-
-    if any(
-        path.startswith(("src/agents/models/", "src/agents/extensions/models/"))
-        and "litellm" in path
-        for path in source_files
-    ):
-        labels.add("feature:lite-llm")
 
     return labels
 
