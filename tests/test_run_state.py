@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import gc
+import io
 import json
 import logging
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, TypeVar, cast
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, TypeVar, cast
 
 import pytest
 from openai.types.responses import (
@@ -23,13 +27,20 @@ from openai.types.responses.response_computer_tool_call import (
     ActionScreenshot,
     ResponseComputerToolCall,
 )
-from openai.types.responses.response_output_item import LocalShellCall, McpApprovalRequest
+from openai.types.responses.response_function_tool_call import CallerProgram
+from openai.types.responses.response_output_item import (
+    LocalShellCall,
+    McpApprovalRequest,
+    Program,
+    ProgramOutput,
+)
+from openai.types.responses.response_usage import InputTokensDetails
 from openai.types.responses.tool_param import Mcp
 from pydantic import BaseModel
 
-from agents import Agent, Model, ModelSettings, Runner, handoff, trace
+from agents import Agent, Model, ModelSettings, RunConfig, Runner, handoff, trace
 from agents.computer import Computer
-from agents.exceptions import UserError
+from agents.exceptions import ModelBehaviorError, UserError
 from agents.guardrail import (
     GuardrailFunctionOutput,
     InputGuardrail,
@@ -41,6 +52,7 @@ from agents.handoffs import Handoff
 from agents.items import (
     HandoffOutputItem,
     ItemHelpers,
+    MCPApprovalResponseItem,
     MessageOutputItem,
     ModelResponse,
     ReasoningItem,
@@ -51,10 +63,18 @@ from agents.items import (
     ToolSearchCallItem,
     ToolSearchOutputItem,
     TResponseInputItem,
+    TResponseOutputItem,
     TResponseStreamEvent,
 )
 from agents.run_context import RunContextWrapper
-from agents.run_internal.items import run_items_to_input_items
+from agents.run_internal.agent_runner_helpers import resolve_trace_settings
+from agents.run_internal.items import (
+    NestedHistoryOwnedItemRef,
+    digest_input_item,
+    ensure_nested_history_run_item_occurrence_key,
+    run_item_to_input_item,
+    run_items_to_input_items,
+)
 from agents.run_internal.run_loop import (
     NextStepInterruption,
     ProcessedResponse,
@@ -68,20 +88,30 @@ from agents.run_internal.run_loop import (
 )
 from agents.run_state import (
     CURRENT_SCHEMA_VERSION,
+    SCHEMA_VERSION_SUMMARIES,
     SUPPORTED_SCHEMA_VERSIONS,
     RunState,
+    _build_agent_identity_map,
     _build_agent_map,
+    _capability_identity_signature,
     _deserialize_items,
     _deserialize_processed_response,
     _serialize_guardrail_results,
     _serialize_tool_action_groups,
 )
+from agents.sandbox import Manifest
+from agents.sandbox.capabilities.capability import Capability
+from agents.sandbox.sandboxes.unix_local import UnixLocalSandboxClient, UnixLocalSandboxSessionState
+from agents.sandbox.session.base_sandbox_session import BaseSandboxSession
+from agents.sandbox.snapshot import LocalSnapshot, NoopSnapshot
+from agents.sandbox.types import ExecResult
 from agents.tool import (
     ApplyPatchTool,
     ComputerTool,
     FunctionTool,
     HostedMCPTool,
     LocalShellTool,
+    ProgrammaticToolCallingTool,
     ShellTool,
     function_tool,
     tool_namespace,
@@ -96,11 +126,13 @@ from agents.tool_guardrails import (
     ToolOutputGuardrailResult,
 )
 from agents.usage import Usage
+from tests.utils.factories import TestSessionState
 
 from .fake_model import FakeModel
 from .test_responses import (
     get_final_output_message,
     get_function_tool_call,
+    get_handoff_tool_call,
     get_text_message,
 )
 from .utils.factories import (
@@ -118,7 +150,61 @@ from .utils.hitl import (
     run_and_resume_with_mutation,
 )
 
+_CURRENT_SCHEMA_MAJOR, _CURRENT_SCHEMA_MINOR = CURRENT_SCHEMA_VERSION.split(".")
+_NEXT_UNSUPPORTED_SCHEMA_VERSION = f"{_CURRENT_SCHEMA_MAJOR}.{int(_CURRENT_SCHEMA_MINOR) + 1}"
+
 TContext = TypeVar("TContext")
+
+
+class _IdentitySandboxSession(BaseSandboxSession):
+    def __init__(self, root: str) -> None:
+        self.state = TestSessionState(
+            manifest=Manifest(root=root),
+            snapshot=NoopSnapshot(id=f"snapshot:{root}"),
+        )
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    async def shutdown(self) -> None:
+        return None
+
+    async def running(self) -> bool:
+        return True
+
+    async def read(self, path: Path, *, user: object = None) -> Any:
+        _ = (path, user)
+        raise AssertionError("read() should not be called")
+
+    async def write(self, path: Path, data: io.IOBase, *, user: object = None) -> None:
+        _ = (path, data, user)
+        raise AssertionError("write() should not be called")
+
+    async def _exec_internal(
+        self,
+        *command: Any,
+        timeout: float | None = None,
+    ) -> ExecResult:
+        _ = (command, timeout)
+        raise AssertionError("_exec_internal() should not be called")
+
+    async def persist_workspace(self) -> Any:
+        raise AssertionError("persist_workspace() should not be called")
+
+    async def hydrate_workspace(self, data: Any) -> None:
+        _ = data
+        raise AssertionError("hydrate_workspace() should not be called")
+
+
+class _IdentityCapability(Capability):
+    type: str = "identity"
+    setting: str
+
+    def __init__(self, *, setting: str) -> None:
+        super().__init__(type="identity", **cast(Any, {"setting": setting}))
 
 
 def make_processed_response(
@@ -155,7 +241,7 @@ def make_state(
     *,
     context: RunContextWrapper[TContext],
     original_input: str | list[Any] = "input",
-    max_turns: int = 3,
+    max_turns: int | None = 3,
 ) -> RunState[TContext, Agent[Any]]:
     """Create a RunState with common defaults used across tests."""
 
@@ -164,6 +250,37 @@ def make_state(
         context=context,
         original_input=original_input,
         max_turns=max_turns,
+    )
+
+
+def record_pending_nested_agent_tool_state(
+    agent: Agent[Any],
+    tool_call: ResponseFunctionToolCall,
+    *,
+    inner_call_id: str,
+) -> None:
+    """Record a serializable nested interruption for an outer function call."""
+    from agents.agent_tool_state import record_agent_tool_run_result
+
+    nested_approval = make_tool_approval_item(
+        agent,
+        call_id=inner_call_id,
+        name="inner_sensitive_tool",
+    )
+    nested_state = make_state_with_interruptions(
+        agent,
+        [nested_approval],
+        original_input=f"nested input for {inner_call_id}",
+    )
+    record_agent_tool_run_result(
+        tool_call,
+        cast(
+            Any,
+            SimpleNamespace(
+                interruptions=nested_state.get_interruptions(),
+                to_state=lambda: nested_state,
+            ),
+        ),
     )
 
 
@@ -241,6 +358,339 @@ class TestRunState:
         str_data = state.to_string()
         assert isinstance(str_data, str)
         assert json.loads(str_data) == json_data
+
+    @pytest.mark.asyncio
+    async def test_max_turns_none_round_trips(self):
+        """RunState should preserve disabled max_turns across serialization."""
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent = Agent(name="Agent1")
+        state = make_state(agent, context=context, original_input="input1", max_turns=None)
+
+        json_data = state.to_json()
+        assert json_data["max_turns"] is None
+
+        restored = await RunState.from_json(agent, json_data)
+        assert restored._max_turns is None
+
+    @pytest.mark.asyncio
+    async def test_from_json_restores_duplicate_name_current_agent_by_identity(self):
+        """Duplicate agent names should round-trip through the serialized identity key."""
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        second = Agent(name="duplicate")
+        first = Agent(name="duplicate", handoffs=[second])
+        second.handoffs = [first]
+        state = make_state(first, context=context, original_input="input1", max_turns=2)
+        state._current_agent = second
+
+        json_data = state.to_json()
+        assert json_data["current_agent"] == {"name": "duplicate", "identity": "duplicate#2"}
+
+        restored = await RunState.from_json(first, json_data)
+        assert restored._current_agent is second
+
+    def test_build_agent_identity_map_avoids_literal_suffix_collisions(self) -> None:
+        """Literal `#<n>` names should not collide with generated duplicate identities."""
+        first = Agent(name="sandbox")
+        literal_suffix = Agent(name="sandbox#2")
+        second = Agent(name="sandbox")
+        first.handoffs = [literal_suffix, second]
+        literal_suffix.handoffs = [first, second]
+        second.handoffs = [first, literal_suffix]
+
+        identity_map = _build_agent_identity_map(first)
+
+        assert identity_map == {
+            "sandbox": first,
+            "sandbox#2": literal_suffix,
+            "sandbox#3": second,
+        }
+
+    def test_build_agent_identity_map_is_stable_across_reordered_duplicate_agents(self) -> None:
+        """Duplicate-name identities should not change when reachable order changes."""
+
+        @function_tool(name_override="alpha_tool")
+        def alpha_tool() -> str:
+            return "alpha"
+
+        @function_tool(name_override="beta_tool")
+        def beta_tool() -> str:
+            return "beta"
+
+        def _identity_for(
+            identity_map: Mapping[str, Agent[Any]],
+            target: Agent[Any],
+        ) -> str:
+            return next(identity for identity, agent in identity_map.items() if agent is target)
+
+        first_alpha = Agent(name="sandbox", instructions="Alpha", tools=[alpha_tool])
+        first_beta = Agent(name="sandbox", instructions="Beta", tools=[beta_tool])
+        first_root = Agent(name="triage", handoffs=[first_beta, first_alpha])
+        first_alpha.handoffs = [first_root]
+        first_beta.handoffs = [first_root]
+
+        second_alpha = Agent(name="sandbox", instructions="Alpha", tools=[alpha_tool])
+        second_beta = Agent(name="sandbox", instructions="Beta", tools=[beta_tool])
+        second_root = Agent(name="triage", handoffs=[second_alpha, second_beta])
+        second_alpha.handoffs = [second_root]
+        second_beta.handoffs = [second_root]
+
+        first_identity_map = _build_agent_identity_map(first_root)
+        second_identity_map = _build_agent_identity_map(second_root)
+
+        assert _identity_for(first_identity_map, first_alpha) == _identity_for(
+            second_identity_map, second_alpha
+        )
+        assert _identity_for(first_identity_map, first_beta) == _identity_for(
+            second_identity_map, second_beta
+        )
+
+    @pytest.mark.asyncio
+    async def test_from_json_restores_duplicate_name_current_agent_with_reordered_graph(self):
+        """Restore should keep the same logical duplicate agent after graph reordering."""
+
+        @function_tool(name_override="alpha_tool")
+        def alpha_tool() -> str:
+            return "alpha"
+
+        @function_tool(name_override="beta_tool")
+        def beta_tool() -> str:
+            return "beta"
+
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        first_alpha = Agent(name="sandbox", instructions="Alpha", tools=[alpha_tool])
+        first_beta = Agent(name="sandbox", instructions="Beta", tools=[beta_tool])
+        first_root = Agent(name="triage", handoffs=[first_beta, first_alpha])
+        first_alpha.handoffs = [first_root]
+        first_beta.handoffs = [first_root]
+
+        state = make_state(first_root, context=context, original_input="input1", max_turns=2)
+        state._current_agent = first_beta
+        json_data = state.to_json()
+
+        restored_alpha = Agent(name="sandbox", instructions="Alpha", tools=[alpha_tool])
+        restored_beta = Agent(name="sandbox", instructions="Beta", tools=[beta_tool])
+        restored_root = Agent(name="triage", handoffs=[restored_alpha, restored_beta])
+        restored_alpha.handoffs = [restored_root]
+        restored_beta.handoffs = [restored_root]
+
+        restored = await RunState.from_json(restored_root, json_data)
+        assert restored._current_agent is restored_beta
+
+    @pytest.mark.asyncio
+    async def test_from_json_restores_bare_duplicate_name_current_agent_via_identity_map(self):
+        """Bare duplicate names should resolve through the identity map, not traversal order."""
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        first = Agent(name="duplicate", instructions="zeta")
+        second = Agent(name="duplicate", instructions="alpha")
+        root = Agent(name="triage", handoffs=[first, second])
+        first.handoffs = [root]
+        second.handoffs = [root]
+
+        state = make_state(root, context=context, original_input="input1", max_turns=2)
+        state._current_agent = second
+
+        json_data = state.to_json()
+        assert json_data["current_agent"] == {"name": "duplicate"}
+
+        restored = await RunState.from_json(root, json_data)
+        assert restored._current_agent is second
+
+    def test_build_agent_identity_map_uses_tool_use_behavior_for_duplicate_names(self) -> None:
+        """Duplicate-name identities should stay stable when only tool_use_behavior differs."""
+
+        def _identity_for(
+            identity_map: Mapping[str, Agent[Any]],
+            target: Agent[Any],
+        ) -> str:
+            return next(identity for identity, agent in identity_map.items() if agent is target)
+
+        first_default = Agent(
+            name="sandbox",
+            instructions="Shared instructions.",
+            tool_use_behavior="run_llm_again",
+        )
+        first_stop = Agent(
+            name="sandbox",
+            instructions="Shared instructions.",
+            tool_use_behavior="stop_on_first_tool",
+        )
+        first_root = Agent(name="triage", handoffs=[first_default, first_stop])
+        first_default.handoffs = [first_root]
+        first_stop.handoffs = [first_root]
+
+        second_default = Agent(
+            name="sandbox",
+            instructions="Shared instructions.",
+            tool_use_behavior="run_llm_again",
+        )
+        second_stop = Agent(
+            name="sandbox",
+            instructions="Shared instructions.",
+            tool_use_behavior="stop_on_first_tool",
+        )
+        second_root = Agent(name="triage", handoffs=[second_stop, second_default])
+        second_default.handoffs = [second_root]
+        second_stop.handoffs = [second_root]
+
+        first_identity_map = _build_agent_identity_map(first_root)
+        second_identity_map = _build_agent_identity_map(second_root)
+
+        assert _identity_for(first_identity_map, first_default) == _identity_for(
+            second_identity_map, second_default
+        )
+        assert _identity_for(first_identity_map, first_stop) == _identity_for(
+            second_identity_map, second_stop
+        )
+
+    def test_capability_identity_uses_config_but_not_bound_session(self) -> None:
+        """Capability identity should consider config and ignore bound sessions."""
+
+        first_alpha_capability = _IdentityCapability(setting="alpha")
+        first_beta_capability = _IdentityCapability(setting="beta")
+        first_alpha_capability.bind(_IdentitySandboxSession("/workspace/first-alpha"))
+        first_beta_capability.bind(_IdentitySandboxSession("/workspace/first-beta"))
+
+        second_alpha_capability = _IdentityCapability(setting="alpha")
+        second_beta_capability = _IdentityCapability(setting="beta")
+        second_alpha_capability.bind(_IdentitySandboxSession("/workspace/second-alpha"))
+        second_beta_capability.bind(_IdentitySandboxSession("/workspace/second-beta"))
+
+        first_alpha_signature = _capability_identity_signature(first_alpha_capability)
+        first_beta_signature = _capability_identity_signature(first_beta_capability)
+        second_alpha_signature = _capability_identity_signature(second_alpha_capability)
+        second_beta_signature = _capability_identity_signature(second_beta_capability)
+
+        assert first_alpha_signature == second_alpha_signature
+        assert first_beta_signature == second_beta_signature
+        assert first_alpha_signature != first_beta_signature
+
+    @pytest.mark.asyncio
+    async def test_from_json_restores_duplicate_name_current_agent_when_tool_use_behavior_differs(
+        self,
+    ) -> None:
+        """Duplicate-name restore should stay stable when tool_use_behavior is the only delta."""
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        first_default = Agent(
+            name="sandbox",
+            instructions="Shared instructions.",
+            tool_use_behavior="run_llm_again",
+        )
+        first_stop = Agent(
+            name="sandbox",
+            instructions="Shared instructions.",
+            tool_use_behavior="stop_on_first_tool",
+        )
+        first_root = Agent(name="triage", handoffs=[first_default, first_stop])
+        first_default.handoffs = [first_root]
+        first_stop.handoffs = [first_root]
+
+        state = make_state(first_root, context=context, original_input="input1", max_turns=2)
+        state._current_agent = first_stop
+        json_data = state.to_json()
+
+        restored_default = Agent(
+            name="sandbox",
+            instructions="Shared instructions.",
+            tool_use_behavior="run_llm_again",
+        )
+        restored_stop = Agent(
+            name="sandbox",
+            instructions="Shared instructions.",
+            tool_use_behavior="stop_on_first_tool",
+        )
+        restored_root = Agent(name="triage", handoffs=[restored_stop, restored_default])
+        restored_default.handoffs = [restored_root]
+        restored_stop.handoffs = [restored_root]
+
+        restored = await RunState.from_json(restored_root, json_data)
+        assert restored._current_agent is restored_stop
+
+    @pytest.mark.asyncio
+    async def test_from_json_rejects_missing_saved_duplicate_identity(self):
+        """Identity-aware snapshots should fail when the saved duplicate no longer exists."""
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        second = Agent(name="duplicate", instructions="Second")
+        first = Agent(name="duplicate", instructions="First", handoffs=[second])
+        second.handoffs = [first]
+        state = make_state(first, context=context, original_input="input1", max_turns=2)
+        state._current_agent = second
+
+        json_data = state.to_json()
+        restored_root = Agent(name="duplicate", instructions="First")
+
+        with pytest.raises(UserError, match="agent identity"):
+            await RunState.from_json(restored_root, json_data)
+
+    @pytest.mark.asyncio
+    async def test_result_to_state_preserves_duplicate_name_root_and_owned_state(self):
+        """RunResult.to_state should keep the root graph while preserving the active duplicate."""
+
+        @function_tool(name_override="approval_tool", needs_approval=True)
+        def approval_tool() -> str:
+            return "approved"
+
+        first_model = FakeModel()
+        second_model = FakeModel()
+        first = Agent(name="duplicate", model=first_model)
+        second = Agent(
+            name="duplicate",
+            model=second_model,
+            tools=[approval_tool],
+            model_settings=ModelSettings(tool_choice="required"),
+        )
+        first.handoffs = [second]
+        second.handoffs = [first]
+
+        first_model.add_multiple_turn_outputs([[get_handoff_tool_call(second)]])
+        second_model.add_multiple_turn_outputs(
+            [[get_function_tool_call("approval_tool", json.dumps({}), call_id="call_approval")]]
+        )
+
+        result = await Runner.run(first, "start")
+        assert result.interruptions
+
+        state = result.to_state()
+        assert state._starting_agent is first
+        assert state._current_agent is second
+
+        json_data = state.to_json()
+        assert json_data["current_agent"] == {"name": "duplicate", "identity": "duplicate#2"}
+        assert json_data["tool_use_tracker"]["duplicate#2"] == ["approval_tool"]
+        assert json_data["current_step"] is not None
+        assert json_data["current_step"]["data"]["interruptions"][0]["agent"] == {
+            "name": "duplicate",
+            "identity": "duplicate#2",
+        }
+
+        approval_tool_items = [
+            item
+            for item in json_data["generated_items"]
+            if item["type"] == "tool_call_item"
+            and item["raw_item"].get("call_id") == "call_approval"
+        ]
+        assert len(approval_tool_items) == 1
+        assert approval_tool_items[0]["agent"] == {
+            "name": "duplicate",
+            "identity": "duplicate#2",
+        }
+        assert approval_tool_items[0]["raw_item"] == {
+            "arguments": "{}",
+            "call_id": "call_approval",
+            "id": "1",
+            "name": "approval_tool",
+            "type": "function_call",
+        }
+
+        restored = await RunState.from_json(first, json_data)
+        assert restored._starting_agent is first
+        assert restored._current_agent is second
+        assert restored.get_interruptions()[0].agent is second
+        assert any(
+            isinstance(item, ToolCallItem)
+            and item.agent is second
+            and getattr(item.raw_item, "call_id", None) == "call_approval"
+            for item in restored._generated_items
+        )
 
     async def test_reasoning_item_id_policy_survives_serialization(self):
         """RunState should preserve reasoning item input policy across serialization."""
@@ -322,6 +772,18 @@ class TestRunState:
             restored_without_key._trace_state.tracing_api_key_hash
             == default_json["trace"]["tracing_api_key_hash"]
         )
+
+        *_, restored_config = resolve_trace_settings(
+            run_state=restored_with_key,
+            run_config=RunConfig(),
+        )
+        assert restored_config is None
+
+        *_, explicit_config = resolve_trace_settings(
+            run_state=restored_with_key,
+            run_config=RunConfig(tracing={"api_key": "explicit-trace-key"}),
+        )
+        assert explicit_config == {"api_key": "explicit-trace-key"}
 
     async def test_throws_error_if_schema_version_is_missing_or_invalid(self):
         """Test that deserialization fails with missing or invalid schema version."""
@@ -607,6 +1069,59 @@ class TestRunState:
         assert restored_output.agent_output == "final"
         assert restored_output.agent.name == agent.name
 
+    def test_guardrail_results_to_string_normalizes_non_json_payloads(self):
+        """Guardrail result payloads are JSON-compatible in RunState strings."""
+        context: RunContextWrapper[dict[str, Any]] = RunContextWrapper(context={})
+        agent = Agent(name="GuardrailPayloadAgent")
+        state = make_state(agent, context=context, original_input="input", max_turns=1)
+        observed_at = datetime(2026, 5, 8, 12, 0, 0)
+
+        input_guardrail = InputGuardrail(
+            guardrail_function=lambda ctx, ag, inp: GuardrailFunctionOutput(
+                output_info={"observed_at": observed_at},
+                tripwire_triggered=False,
+            ),
+            name="input_guardrail",
+        )
+        output_guardrail = OutputGuardrail(
+            guardrail_function=lambda ctx, ag, out: GuardrailFunctionOutput(
+                output_info={"observed_at": observed_at},
+                tripwire_triggered=False,
+            ),
+            name="output_guardrail",
+        )
+
+        state._input_guardrail_results = [
+            InputGuardrailResult(
+                guardrail=input_guardrail,
+                output=GuardrailFunctionOutput(
+                    output_info={"observed_at": observed_at},
+                    tripwire_triggered=False,
+                ),
+            )
+        ]
+        state._output_guardrail_results = [
+            OutputGuardrailResult(
+                guardrail=output_guardrail,
+                agent_output={"observed_at": observed_at},
+                agent=agent,
+                output=GuardrailFunctionOutput(
+                    output_info={"observed_at": observed_at},
+                    tripwire_triggered=False,
+                ),
+            )
+        ]
+
+        state_string = state.to_string()
+        serialized = json.loads(state_string)
+
+        assert serialized["input_guardrail_results"][0]["output"]["outputInfo"] == {
+            "observed_at": str(observed_at)
+        }
+        output_result = serialized["output_guardrail_results"][0]
+        assert output_result["output"]["outputInfo"] == {"observed_at": str(observed_at)}
+        assert output_result["agentOutput"] == {"observed_at": str(observed_at)}
+
     @pytest.mark.asyncio
     async def test_tool_guardrail_results_round_trip(self):
         """Tool guardrail results survive RunState round-trip."""
@@ -661,6 +1176,57 @@ class TestRunState:
         assert restored_tool_output.guardrail.get_name() == "tool_output_guardrail"
         assert restored_tool_output.output.behavior["type"] == "allow"
         assert restored_tool_output.output.output_info == {"output": "info"}
+
+    def test_tool_guardrail_results_to_string_normalizes_non_json_output_info(self):
+        """Tool guardrail output_info is JSON-compatible in RunState strings."""
+        context: RunContextWrapper[dict[str, Any]] = RunContextWrapper(context={})
+        agent = Agent(name="ToolGuardrailPayloadAgent")
+        state = make_state(agent, context=context, original_input="input", max_turns=1)
+        observed_at = datetime(2026, 5, 8, 12, 0, 0)
+
+        tool_input_guardrail: ToolInputGuardrail[Any] = ToolInputGuardrail(
+            guardrail_function=lambda data: ToolGuardrailFunctionOutput(
+                output_info={"observed_at": observed_at},
+                behavior=AllowBehavior(type="allow"),
+            ),
+            name="tool_input_guardrail",
+        )
+        tool_output_guardrail: ToolOutputGuardrail[Any] = ToolOutputGuardrail(
+            guardrail_function=lambda data: ToolGuardrailFunctionOutput(
+                output_info={"observed_at": observed_at},
+                behavior=AllowBehavior(type="allow"),
+            ),
+            name="tool_output_guardrail",
+        )
+
+        state._tool_input_guardrail_results = [
+            ToolInputGuardrailResult(
+                guardrail=tool_input_guardrail,
+                output=ToolGuardrailFunctionOutput(
+                    output_info={"observed_at": observed_at},
+                    behavior=AllowBehavior(type="allow"),
+                ),
+            )
+        ]
+        state._tool_output_guardrail_results = [
+            ToolOutputGuardrailResult(
+                guardrail=tool_output_guardrail,
+                output=ToolGuardrailFunctionOutput(
+                    output_info={"observed_at": observed_at},
+                    behavior=AllowBehavior(type="allow"),
+                ),
+            )
+        ]
+
+        state_string = state.to_string()
+        serialized = json.loads(state_string)
+
+        assert serialized["tool_input_guardrail_results"][0]["output"]["outputInfo"] == {
+            "observed_at": str(observed_at)
+        }
+        assert serialized["tool_output_guardrail_results"][0]["output"]["outputInfo"] == {
+            "observed_at": str(observed_at)
+        }
 
     def test_reject_permanently_when_always_reject_option_is_passed(self):
         """Test that reject with always_reject=True sets permanent rejection."""
@@ -1128,13 +1694,21 @@ class TestSerializationRoundTrip:
         context.usage.input_tokens = 100
         context.usage.output_tokens = 50
         context.usage.total_tokens = 150
+        context.usage.input_tokens_details = InputTokensDetails.model_validate(
+            {"cache_write_tokens": 7, "cached_tokens": 3}
+        )
 
         agent = Agent(name="UsageAgent")
         state = make_state(agent, context=context, original_input="test", max_turns=10)
 
         str_data = state.to_string()
+        serialized = json.loads(str_data)
         new_state = await RunState.from_string(agent, str_data)
 
+        assert serialized["$schemaVersion"] == CURRENT_SCHEMA_VERSION
+        assert serialized["context"]["usage"]["input_tokens_details"] == [
+            {"cached_tokens": 3, "cache_write_tokens": 7}
+        ]
         assert new_state._context is not None
         assert new_state._context.usage.requests == 5
         assert new_state._context.usage is not None
@@ -1143,6 +1717,41 @@ class TestSerializationRoundTrip:
         assert new_state._context.usage.output_tokens == 50
         assert new_state._context.usage is not None
         assert new_state._context.usage.total_tokens == 150
+        assert new_state._context.usage.input_tokens_details.cached_tokens == 3
+        assert (
+            getattr(
+                new_state._context.usage.input_tokens_details,
+                "cache_write_tokens",
+                None,
+            )
+            == 7
+        )
+
+    async def test_restores_schema_1_11_usage_without_cache_write_tokens(self):
+        """Released snapshots default the newly required OpenAI usage field to zero."""
+        agent = Agent(name="UsageAgent")
+        state: RunState[dict[str, Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+            max_turns=10,
+        )
+        state_json = state.to_json()
+        state_json["$schemaVersion"] = "1.11"
+        state_json["context"]["usage"]["input_tokens_details"] = [{"cached_tokens": 3}]
+
+        restored = await RunState.from_json(agent, state_json)
+
+        assert restored._context is not None
+        assert restored._context.usage.input_tokens_details.cached_tokens == 3
+        assert (
+            getattr(
+                restored._context.usage.input_tokens_details,
+                "cache_write_tokens",
+                None,
+            )
+            == 0
+        )
 
     def test_serializes_generated_items(self):
         """Test that generated items are serialized and restored."""
@@ -1255,6 +1864,65 @@ class TestSerializationRoundTrip:
         assert new_state._generated_items[1].title == "My tool title"
         assert new_state._generated_items[2].description is None
         assert new_state._generated_items[2].title is None
+
+    async def test_deserializes_custom_tool_call_output_items(self):
+        """Custom tool call outputs should survive RunState roundtrips."""
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent = Agent(name="ItemAgent")
+        state = make_state(agent, context=context, original_input="test", max_turns=5)
+
+        custom_tool_output = {
+            "type": "custom_tool_call_output",
+            "call_id": "call_custom_1",
+            "output": "custom result",
+        }
+        state._generated_items.append(
+            ToolCallOutputItem(
+                agent=agent,
+                raw_item=custom_tool_output,
+                output="custom result",
+            )
+        )
+
+        json_data = state.to_json()
+        new_state = await RunState.from_json(agent, json_data)
+
+        assert len(new_state._generated_items) == 1
+        restored_item = new_state._generated_items[0]
+        assert isinstance(restored_item, ToolCallOutputItem)
+        assert restored_item.raw_item == custom_tool_output
+        assert restored_item.output == "custom result"
+
+    async def test_deserializes_tool_call_output_custom_data(self):
+        """SDK-only tool output custom data should survive RunState roundtrips."""
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent = Agent(name="ItemAgent")
+        state = make_state(agent, context=context, original_input="test", max_turns=5)
+
+        raw_tool_output = {
+            "type": "function_call_output",
+            "call_id": "call_custom_data",
+            "output": "result",
+        }
+        state._generated_items.append(
+            ToolCallOutputItem(
+                agent=agent,
+                raw_item=raw_tool_output,
+                output="result",
+                custom_data={"ui": {"kind": "chart"}, "ids": ["a", "b"]},
+            )
+        )
+
+        json_data = state.to_json()
+        serialized_item = json_data["generated_items"][0]
+        assert serialized_item["custom_data"] == {"ui": {"kind": "chart"}, "ids": ["a", "b"]}
+        assert "custom_data" not in serialized_item["raw_item"]
+
+        new_state = await RunState.from_json(agent, json_data)
+
+        restored_item = new_state._generated_items[0]
+        assert isinstance(restored_item, ToolCallOutputItem)
+        assert restored_item.custom_data == {"ui": {"kind": "chart"}, "ids": ["a", "b"]}
 
     async def test_serializes_original_input_with_function_call_output(self):
         """Test that original_input with function_call_output items is preserved."""
@@ -1797,6 +2465,64 @@ class TestDeserializeHelpers:
         assert len(restored._generated_items) == 1
         assert restored._generated_items[0].type == "handoff_output_item"
 
+    @pytest.mark.asyncio
+    async def test_serialization_uses_duplicate_identities_for_handoff_and_output_guardrails(self):
+        """Duplicate-name item ownership should round-trip with identity keys."""
+        first = Agent(name="duplicate")
+        second = Agent(name="duplicate")
+        third = Agent(name="duplicate")
+        first.handoffs = [second, third]
+        second.handoffs = [third]
+        third.handoffs = [first]
+
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        state = make_state(first, context=context, original_input="test handoff", max_turns=2)
+        state._current_agent = second
+        state._generated_items = [
+            HandoffOutputItem(
+                agent=second,
+                raw_item={"type": "handoff_output", "status": "completed"},  # type: ignore[arg-type]
+                source_agent=second,
+                target_agent=third,
+            )
+        ]
+
+        output_guardrail = OutputGuardrail(
+            guardrail_function=lambda _ctx, _agent, _output: GuardrailFunctionOutput(
+                output_info={"guardrail": "ok"},
+                tripwire_triggered=False,
+            ),
+            name="duplicate_output_guardrail",
+        )
+        state._output_guardrail_results = [
+            OutputGuardrailResult(
+                guardrail=output_guardrail,
+                agent_output="done",
+                agent=third,
+                output=GuardrailFunctionOutput(
+                    output_info={"guardrail": "ok"},
+                    tripwire_triggered=False,
+                ),
+            )
+        ]
+
+        json_data = state.to_json()
+        item_data = json_data["generated_items"][0]
+        assert item_data["agent"] == {"name": "duplicate", "identity": "duplicate#2"}
+        assert item_data["source_agent"] == {"name": "duplicate", "identity": "duplicate#2"}
+        assert item_data["target_agent"] == {"name": "duplicate", "identity": "duplicate#3"}
+        assert json_data["output_guardrail_results"][0]["agent"] == {
+            "name": "duplicate",
+            "identity": "duplicate#3",
+        }
+
+        restored = await RunState.from_json(first, json_data)
+        restored_item = cast(HandoffOutputItem, restored._generated_items[0])
+        assert restored_item.agent is second
+        assert restored_item.source_agent is second
+        assert restored_item.target_agent is third
+        assert restored._output_guardrail_results[0].agent is third
+
     async def test_model_response_serialization_roundtrip(self):
         """Test that model responses serialize and deserialize correctly."""
 
@@ -1887,8 +2613,214 @@ class TestDeserializeHelpers:
         assert interruptions[0].agent.name == "InnerAgent"
         assert interruptions[0].raw_item.name == "sensitive_tool"  # type: ignore[union-attr]
 
+    @pytest.mark.parametrize("drop_mode", ["disabled", "removed", "malformed_call"])
+    async def test_nested_agent_tool_state_survives_when_earlier_function_is_dropped(
+        self, drop_mode: str
+    ) -> None:
+        """A dropped function must not shift a later function's nested state."""
+        from agents.agent_tool_state import (
+            drop_agent_tool_run_result,
+            peek_agent_tool_run_result,
+        )
+
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent = Agent(name="OuterAgent")
+        earlier_tool_enabled = True
+        conditional_tool = function_tool(
+            lambda: "conditional",
+            name_override="conditional_tool",
+            is_enabled=lambda _context, _agent: earlier_tool_enabled,
+        )
+        nested_tool = function_tool(lambda: "nested", name_override="nested_agent_tool")
+        agent.tools = [conditional_tool, nested_tool]
+
+        conditional_call = make_tool_call(call_id="conditional-call", name="conditional_tool")
+        nested_call = make_tool_call(call_id="nested-call", name="nested_agent_tool")
+        state = make_state(agent, context=context)
+        state._last_processed_response = make_processed_response(
+            functions=[
+                ToolRunFunction(tool_call=conditional_call, function_tool=conditional_tool),
+                ToolRunFunction(tool_call=nested_call, function_tool=nested_tool),
+            ]
+        )
+
+        record_pending_nested_agent_tool_state(
+            agent,
+            nested_call,
+            inner_call_id="inner-call",
+        )
+
+        restored_call: ResponseFunctionToolCall | None = None
+        restored_scope_id: str | None = None
+        try:
+            state_json = state.to_json()
+            if drop_mode == "disabled":
+                earlier_tool_enabled = False
+            elif drop_mode == "removed":
+                agent.tools = [nested_tool]
+            else:
+                functions_data = state_json["last_processed_response"]["functions"]
+                functions_data[0]["tool_call"].pop("call_id")
+
+            restored = await RunState.from_json(agent, state_json)
+
+            assert restored._last_processed_response is not None
+            restored_scope_id = restored._agent_tool_state_scope_id
+            assert restored_scope_id is not None
+            assert len(restored._last_processed_response.functions) == 1
+            restored_call = restored._last_processed_response.functions[0].tool_call
+            assert restored_call.call_id == "nested-call"
+            pending_result = peek_agent_tool_run_result(restored_call, scope_id=restored_scope_id)
+            assert pending_result is not None
+            assert len(pending_result.interruptions) == 1
+            restored_approval = pending_result.interruptions[0]
+            assert isinstance(restored_approval.raw_item, ResponseFunctionToolCall)
+            assert restored_approval.raw_item.call_id == "inner-call"
+        finally:
+            drop_agent_tool_run_result(nested_call)
+            if restored_call is not None:
+                drop_agent_tool_run_result(restored_call, scope_id=restored_scope_id)
+
+    async def test_dropped_nested_agent_tool_state_is_not_moved_to_later_function(
+        self,
+    ) -> None:
+        """Nested state owned by a dropped function must not migrate to a retained function."""
+        from agents.agent_tool_state import (
+            drop_agent_tool_run_result,
+            peek_agent_tool_run_result,
+        )
+
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent = Agent(name="OuterAgent")
+        dropped_tool = function_tool(lambda: "dropped", name_override="dropped_agent_tool")
+        retained_tool = function_tool(lambda: "retained", name_override="retained_tool")
+        agent.tools = [dropped_tool, retained_tool]
+
+        dropped_call = make_tool_call(call_id="dropped-call", name="dropped_agent_tool")
+        retained_call = make_tool_call(call_id="retained-call", name="retained_tool")
+        state = make_state(agent, context=context)
+        state._last_processed_response = make_processed_response(
+            functions=[
+                ToolRunFunction(tool_call=dropped_call, function_tool=dropped_tool),
+                ToolRunFunction(tool_call=retained_call, function_tool=retained_tool),
+            ]
+        )
+
+        record_pending_nested_agent_tool_state(
+            agent,
+            dropped_call,
+            inner_call_id="dropped-inner-call",
+        )
+
+        restored_call: ResponseFunctionToolCall | None = None
+        restored_scope_id: str | None = None
+        try:
+            state_json = state.to_json()
+            agent.tools = [retained_tool]
+
+            restored = await RunState.from_json(agent, state_json)
+
+            assert restored._last_processed_response is not None
+            restored_scope_id = restored._agent_tool_state_scope_id
+            assert restored_scope_id is not None
+            assert len(restored._last_processed_response.functions) == 1
+            restored_call = restored._last_processed_response.functions[0].tool_call
+            assert restored_call.call_id == "retained-call"
+            assert peek_agent_tool_run_result(restored_call, scope_id=restored_scope_id) is None
+        finally:
+            drop_agent_tool_run_result(dropped_call)
+            if restored_call is not None:
+                drop_agent_tool_run_result(restored_call, scope_id=restored_scope_id)
+
+    async def test_multiple_nested_agent_tool_states_survive_multiple_dropped_functions(
+        self,
+    ) -> None:
+        """Multiple retained functions keep their own nested state across different drops."""
+        from agents.agent_tool_state import (
+            drop_agent_tool_run_result,
+            peek_agent_tool_run_result,
+        )
+
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent = Agent(name="OuterAgent")
+        earlier_tool_enabled = True
+        disabled_tool = function_tool(
+            lambda: "disabled",
+            name_override="disabled_tool",
+            is_enabled=lambda _context, _agent: earlier_tool_enabled,
+        )
+        first_nested_tool = function_tool(lambda: "first", name_override="first_agent_tool")
+        malformed_tool = function_tool(lambda: "malformed", name_override="malformed_tool")
+        second_nested_tool = function_tool(lambda: "second", name_override="second_agent_tool")
+        agent.tools = [disabled_tool, first_nested_tool, malformed_tool, second_nested_tool]
+
+        disabled_call = make_tool_call(call_id="disabled-call", name="disabled_tool")
+        first_nested_call = make_tool_call(call_id="first-call", name="first_agent_tool")
+        malformed_call = make_tool_call(call_id="malformed-call", name="malformed_tool")
+        second_nested_call = make_tool_call(call_id="second-call", name="second_agent_tool")
+        state = make_state(agent, context=context)
+        state._last_processed_response = make_processed_response(
+            functions=[
+                ToolRunFunction(tool_call=disabled_call, function_tool=disabled_tool),
+                ToolRunFunction(tool_call=first_nested_call, function_tool=first_nested_tool),
+                ToolRunFunction(tool_call=malformed_call, function_tool=malformed_tool),
+                ToolRunFunction(tool_call=second_nested_call, function_tool=second_nested_tool),
+            ]
+        )
+
+        nested_calls = [first_nested_call, second_nested_call]
+        inner_call_ids = ["first-inner-call", "second-inner-call"]
+        for nested_call, inner_call_id in zip(nested_calls, inner_call_ids, strict=True):
+            record_pending_nested_agent_tool_state(
+                agent,
+                nested_call,
+                inner_call_id=inner_call_id,
+            )
+
+        restored_calls: list[ResponseFunctionToolCall] = []
+        restored_scope_id: str | None = None
+        try:
+            state_json = state.to_json()
+            earlier_tool_enabled = False
+            functions_data = state_json["last_processed_response"]["functions"]
+            functions_data[2]["tool_call"].pop("call_id")
+
+            restored = await RunState.from_json(agent, state_json)
+
+            assert restored._last_processed_response is not None
+            restored_scope_id = restored._agent_tool_state_scope_id
+            assert restored_scope_id is not None
+            restored_calls = [
+                function.tool_call for function in restored._last_processed_response.functions
+            ]
+            assert [call.call_id for call in restored_calls] == ["first-call", "second-call"]
+            for restored_call, expected_inner_call_id in zip(
+                restored_calls, inner_call_ids, strict=True
+            ):
+                pending_result = peek_agent_tool_run_result(
+                    restored_call, scope_id=restored_scope_id
+                )
+                assert pending_result is not None
+                assert len(pending_result.interruptions) == 1
+                restored_approval = pending_result.interruptions[0]
+                assert isinstance(restored_approval.raw_item, ResponseFunctionToolCall)
+                assert restored_approval.raw_item.call_id == expected_inner_call_id
+        finally:
+            for nested_call in nested_calls:
+                drop_agent_tool_run_result(nested_call)
+            for restored_call in restored_calls:
+                drop_agent_tool_run_result(restored_call, scope_id=restored_scope_id)
+
     @pytest.mark.asyncio
-    async def test_nested_agent_tool_hitl_resume_survives_json_round_trip_after_gc(self) -> None:
+    @pytest.mark.parametrize(
+        "approve_nested_tool",
+        [True, False],
+        ids=["approve", "reject"],
+    )
+    async def test_nested_agent_tool_hitl_resume_survives_json_round_trip_after_gc(
+        self,
+        approve_nested_tool: bool,
+    ) -> None:
         """Nested agent-tool resumptions should survive RunState JSON round-trips."""
 
         def _has_function_call_output(input_data: str | list[TResponseInputItem]) -> bool:
@@ -1905,12 +2837,19 @@ class TestDeserializeHelpers:
 
         class ResumeAwareToolModel(Model):
             def __init__(
-                self, *, tool_name: str, tool_arguments: str, final_text: str, call_prefix: str
+                self,
+                *,
+                tool_name: str,
+                tool_arguments: str,
+                final_text: str,
+                call_prefix: str,
+                preceding_tool_name: str | None = None,
             ) -> None:
                 self.tool_name = tool_name
                 self.tool_arguments = tool_arguments
                 self.final_text = final_text
                 self.call_prefix = call_prefix
+                self.preceding_tool_name = preceding_tool_name
                 self.call_count = 0
 
             async def get_response(
@@ -1946,15 +2885,26 @@ class TestDeserializeHelpers:
                     )
 
                 self.call_count += 1
-                return ModelResponse(
-                    output=[
+                output: list[TResponseOutputItem] = []
+                if self.preceding_tool_name is not None:
+                    output.append(
                         ResponseFunctionToolCall(
                             type="function_call",
-                            name=self.tool_name,
-                            call_id=f"{self.call_prefix}-{id(self)}-{self.call_count}",
-                            arguments=self.tool_arguments,
+                            name=self.preceding_tool_name,
+                            call_id=f"{self.call_prefix}-preceding-{self.call_count}",
+                            arguments="{}",
                         )
-                    ],
+                    )
+                output.append(
+                    ResponseFunctionToolCall(
+                        type="function_call",
+                        name=self.tool_name,
+                        call_id=f"{self.call_prefix}-{id(self)}-{self.call_count}",
+                        arguments=self.tool_arguments,
+                    )
+                )
+                return ModelResponse(
+                    output=output,
                     usage=Usage(),
                     response_id=f"{self.call_prefix}-call-{self.call_count}",
                 )
@@ -2013,14 +2963,29 @@ class TestDeserializeHelpers:
             tool_arguments=json.dumps({"input": "hello"}),
             final_text="outer-complete",
             call_prefix="outer",
+            preceding_tool_name="conditional_outer_tool",
         )
-        outer_agent = Agent(name="OuterAgent", model=outer_model, tools=[outer_tool])
+        outer_tool_enabled = True
+        conditional_outer_tool = function_tool(
+            lambda: "conditional-complete",
+            name_override="conditional_outer_tool",
+            is_enabled=lambda _context, _agent: outer_tool_enabled,
+        )
+        outer_agent = Agent(
+            name="OuterAgent", model=outer_model, tools=[conditional_outer_tool, outer_tool]
+        )
 
         first_result = await Runner.run(outer_agent, "start")
         assert first_result.final_output is None
         assert first_result.interruptions
 
         state_json = first_result.to_state().to_json()
+        serialized_functions = state_json["last_processed_response"]["functions"]
+        assert [entry["tool_call"]["name"] for entry in serialized_functions] == [
+            "conditional_outer_tool",
+            "inner_agent_tool",
+        ]
+        outer_tool_enabled = False
         del first_result
         gc.collect()
 
@@ -2031,8 +2996,12 @@ class TestDeserializeHelpers:
         restored_interruptions_two = restored_state_two.get_interruptions()
         assert len(restored_interruptions_one) == 1
         assert len(restored_interruptions_two) == 1
-        restored_state_one.approve(restored_interruptions_one[0])
-        restored_state_two.approve(restored_interruptions_two[0])
+        if approve_nested_tool:
+            restored_state_one.approve(restored_interruptions_one[0])
+            restored_state_two.approve(restored_interruptions_two[0])
+        else:
+            restored_state_one.reject(restored_interruptions_one[0])
+            restored_state_two.reject(restored_interruptions_two[0])
 
         resumed_result_one = await Runner.run(outer_agent, restored_state_one)
         resumed_result_two = await Runner.run(outer_agent, restored_state_two)
@@ -2041,7 +3010,7 @@ class TestDeserializeHelpers:
         assert resumed_result_one.interruptions == []
         assert resumed_result_two.final_output == "outer-complete"
         assert resumed_result_two.interruptions == []
-        assert tool_calls == ["hello", "hello"]
+        assert tool_calls == (["hello", "hello"] if approve_nested_tool else [])
 
     async def test_json_decode_error_handling(self):
         """Test that invalid JSON raises appropriate error."""
@@ -2517,6 +3486,7 @@ class TestRunStateSerializationEdgeCases:
         assert set(serialized.keys()) == {
             "functions",
             "computer_actions",
+            "custom_tool_actions",
             "local_shell_actions",
             "shell_actions",
             "apply_patch_actions",
@@ -3073,12 +4043,18 @@ class TestRunStateSerializationEdgeCases:
                 "type": "mcp_approval_response",
                 "approval_request_id": "req123",
                 "approve": True,
+                "caller": {"type": "program", "caller_id": "program123"},
             },
         }
 
         result_response = _deserialize_items([item_data_response], {"TestAgent": agent})
         assert len(result_response) == 1
         assert result_response[0].type == "mcp_approval_response_item"
+        assert isinstance(result_response[0], MCPApprovalResponseItem)
+        assert result_response[0].raw_item.get("caller") == {
+            "type": "program",
+            "caller_id": "program123",
+        }
 
     async def test_deserialize_tool_approval_item(self):
         """Test deserialization of tool_approval_item."""
@@ -3187,6 +4163,44 @@ class TestRunStateSerializationEdgeCases:
         )
         assert result is not None
         assert len(result.handoffs) == 1
+
+    async def test_deserialize_processed_response_handoff_from_direct_agent(self):
+        """Pending handoffs configured with a direct Agent must survive RunState restoration."""
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        agent_b = Agent(name="AgentB")
+        agent_a = Agent(name="AgentA", handoffs=[agent_b])
+        handoff_name = Handoff.default_tool_name(agent_b)
+        processed_response_data = {
+            "new_items": [],
+            "handoffs": [
+                {
+                    "tool_call": {
+                        "type": "function_call",
+                        "name": handoff_name,
+                        "call_id": "call123",
+                        "status": "completed",
+                        "arguments": "{}",
+                    },
+                    "handoff": {"tool_name": handoff_name},
+                }
+            ],
+            "functions": [],
+            "computer_actions": [],
+            "local_shell_actions": [],
+            "mcp_approval_requests": [],
+            "tools_used": [],
+            "interruptions": [],
+        }
+
+        result = await _deserialize_processed_response(
+            processed_response_data,
+            agent_a,
+            context,
+            {"AgentA": agent_a, "AgentB": agent_b},
+        )
+
+        assert len(result.handoffs) == 1
+        assert result.handoffs[0].handoff.agent_name == "AgentB"
 
     async def test_deserialize_processed_response_function_in_tools_map(self):
         """Test deserialization of ProcessedResponse with function in tools_map."""
@@ -3849,7 +4863,7 @@ class TestRunStateSerializationEdgeCases:
             await RunState.from_json(agent, state_json)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("schema_version", ["1.6", "1.7", "2.0"])
+    @pytest.mark.parametrize("schema_version", [_NEXT_UNSUPPORTED_SCHEMA_VERSION, "2.0", "9.9"])
     async def test_from_json_unsupported_schema_version(self, schema_version: str):
         """Test that from_json raises error when schema version is unsupported."""
         agent = Agent(name="TestAgent")
@@ -3898,11 +4912,904 @@ class TestRunStateSerializationEdgeCases:
         assert restored._context is not None
         assert restored._context.context == {"foo": "bar"}
 
+    @pytest.mark.asyncio
+    async def test_programmatic_tool_calling_round_trip_uses_current_schema(self):
+        agent = Agent(name="TestAgent")
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        program = Program(
+            id="program_item",
+            call_id="call_program",
+            code="lookup()",
+            fingerprint="fingerprint",
+            type="program",
+        )
+        function_call = ResponseFunctionToolCall(
+            id="function_item",
+            call_id="call_function",
+            name="lookup",
+            arguments="{}",
+            caller=CallerProgram(type="program", caller_id="call_program"),
+            type="function_call",
+        )
+        program_output = ProgramOutput(
+            id="program_output_item",
+            call_id="call_program",
+            result="done",
+            status="completed",
+            type="program_output",
+        )
+        state._model_responses = [
+            ModelResponse(
+                output=[program, function_call, program_output],
+                usage=Usage(),
+                response_id="response_1",
+            )
+        ]
+        state._generated_items = [
+            ToolCallItem(agent=agent, raw_item=program),
+            ToolCallItem(agent=agent, raw_item=function_call),
+            ToolCallOutputItem(agent=agent, raw_item=program_output, output="done"),
+        ]
+
+        json_data = state.to_json()
+        assert json_data["$schemaVersion"] == CURRENT_SCHEMA_VERSION
+
+        restored = await RunState.from_json(agent, json_data)
+        assert isinstance(restored._model_responses[0].output[0], Program)
+        assert isinstance(restored._model_responses[0].output[2], ProgramOutput)
+        restored_call = cast(ResponseFunctionToolCall, restored._model_responses[0].output[1])
+        assert restored_call["caller"] if isinstance(restored_call, dict) else restored_call.caller
+        assert isinstance(restored._generated_items[0].raw_item, Program)
+        assert isinstance(restored._generated_items[2].raw_item, ProgramOutput)
+
+    @pytest.mark.asyncio
+    async def test_programmatic_tool_calling_round_trip_preserves_mapping_items(self):
+        agent = Agent(name="TestAgent")
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        program = {
+            "id": "program_item",
+            "call_id": "call_program",
+            "code": "lookup()",
+            "type": "program",
+        }
+        program_output = {
+            "id": "program_output_item",
+            "call_id": "call_program",
+            "result": "done",
+            "type": "program_output",
+        }
+        model_response = ModelResponse(output=[], usage=Usage(), response_id="response_1")
+        model_response.output = cast(list[TResponseOutputItem], [program, program_output])
+        state._model_responses = [model_response]
+        state._generated_items = [
+            ToolCallItem(agent=agent, raw_item=program),
+            ToolCallOutputItem(agent=agent, raw_item=program_output, output="done"),
+        ]
+
+        restored = await RunState.from_json(agent, state.to_json())
+
+        assert cast(list[Any], restored._model_responses[0].output) == [program, program_output]
+        assert restored._generated_items[0].raw_item == program
+        assert restored._generated_items[1].raw_item == program_output
+
+    @pytest.mark.asyncio
+    async def test_programmatic_tool_calling_rechecks_allowed_callers_on_resume(self):
+        @function_tool(allowed_callers=["programmatic"])
+        def saved_lookup() -> str:
+            return "saved"
+
+        saved_agent = Agent(
+            name="TestAgent",
+            tools=[ProgrammaticToolCallingTool(), saved_lookup],
+        )
+        state: RunState[Any, Agent[Any]] = make_state(
+            saved_agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        program = Program(
+            id="program_item",
+            call_id="call_program",
+            code="saved_lookup()",
+            fingerprint="fingerprint",
+            type="program",
+        )
+        function_call = ResponseFunctionToolCall(
+            id="function_item",
+            call_id="call_function",
+            name="saved_lookup",
+            arguments="{}",
+            caller=CallerProgram(type="program", caller_id="call_program"),
+            type="function_call",
+        )
+        state._model_responses = [
+            ModelResponse(output=[program], usage=Usage(), response_id="response_1")
+        ]
+        state._last_processed_response = make_processed_response(
+            functions=[
+                ToolRunFunction(
+                    tool_call=function_call,
+                    function_tool=saved_lookup,
+                )
+            ]
+        )
+
+        @function_tool(name_override="saved_lookup")
+        def rebound_lookup() -> str:
+            return "rebound"
+
+        rebound_agent = Agent(
+            name="TestAgent",
+            tools=[ProgrammaticToolCallingTool(), rebound_lookup],
+        )
+        with pytest.raises(ModelBehaviorError, match="caller programmatic"):
+            await RunState.from_json(
+                rebound_agent,
+                state.to_json(),
+                context_override={},
+            )
+
+    @pytest.mark.asyncio
+    async def test_programmatic_tool_calling_requires_configured_tool_on_resume(self):
+        @function_tool(allowed_callers=["programmatic"])
+        def saved_lookup() -> str:
+            return "saved"
+
+        saved_agent = Agent(
+            name="TestAgent",
+            tools=[ProgrammaticToolCallingTool(), saved_lookup],
+        )
+        state: RunState[Any, Agent[Any]] = make_state(
+            saved_agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        program = Program(
+            id="program_item",
+            call_id="call_program",
+            code="saved_lookup()",
+            fingerprint="fingerprint",
+            type="program",
+        )
+        function_call = ResponseFunctionToolCall(
+            id="function_item",
+            call_id="call_function",
+            name="saved_lookup",
+            arguments="{}",
+            caller=CallerProgram(type="program", caller_id="call_program"),
+            type="function_call",
+        )
+        state._model_responses = [
+            ModelResponse(output=[program], usage=Usage(), response_id="response_1")
+        ]
+        state._last_processed_response = make_processed_response(
+            functions=[ToolRunFunction(tool_call=function_call, function_tool=saved_lookup)]
+        )
+
+        @function_tool(name_override="saved_lookup", allowed_callers=["programmatic"])
+        def rebound_lookup() -> str:
+            return "rebound"
+
+        rebound_agent = Agent(name="TestAgent", tools=[rebound_lookup])
+        with pytest.raises(ModelBehaviorError, match="programmatic_tool_calling tool"):
+            await RunState.from_json(rebound_agent, state.to_json(), context_override={})
+
+    @pytest.mark.asyncio
+    async def test_programmatic_tool_calling_rejects_missing_parent_on_resume(self):
+        @function_tool(allowed_callers=["programmatic"])
+        def saved_lookup() -> str:
+            return "saved"
+
+        agent = Agent(
+            name="TestAgent",
+            tools=[ProgrammaticToolCallingTool(), saved_lookup],
+        )
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        function_call = ResponseFunctionToolCall(
+            id="function_item",
+            call_id="call_function",
+            name="saved_lookup",
+            arguments="{}",
+            caller=CallerProgram(type="program", caller_id="missing_program"),
+            type="function_call",
+        )
+        state._last_processed_response = make_processed_response(
+            functions=[ToolRunFunction(tool_call=function_call, function_tool=saved_lookup)]
+        )
+
+        with pytest.raises(ModelBehaviorError, match="parent program item"):
+            await RunState.from_json(agent, state.to_json(), context_override={})
+
+    @pytest.mark.asyncio
+    async def test_programmatic_tool_calling_rejects_completed_parent_on_resume(self):
+        @function_tool(allowed_callers=["programmatic"])
+        def saved_lookup() -> str:
+            return "saved"
+
+        agent = Agent(
+            name="TestAgent",
+            tools=[ProgrammaticToolCallingTool(), saved_lookup],
+        )
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        program = Program(
+            id="program_item",
+            call_id="call_program",
+            code="saved_lookup()",
+            fingerprint="fingerprint",
+            type="program",
+        )
+        program_output = ProgramOutput(
+            id="program_output_item",
+            call_id="call_program",
+            result="done",
+            status="completed",
+            type="program_output",
+        )
+        function_call = ResponseFunctionToolCall(
+            id="function_item",
+            call_id="call_function",
+            name="saved_lookup",
+            arguments="{}",
+            caller=CallerProgram(type="program", caller_id="call_program"),
+            type="function_call",
+        )
+        state._model_responses = [
+            ModelResponse(
+                output=[program, program_output],
+                usage=Usage(),
+                response_id="response_1",
+            )
+        ]
+        state._last_processed_response = make_processed_response(
+            functions=[ToolRunFunction(tool_call=function_call, function_tool=saved_lookup)]
+        )
+
+        with pytest.raises(ModelBehaviorError, match="already completed"):
+            await RunState.from_json(agent, state.to_json(), context_override={})
+
+    @pytest.mark.asyncio
+    async def test_programmatic_mcp_approval_rechecks_allowed_callers_on_resume(self):
+        saved_mcp_tool = HostedMCPTool(
+            tool_config=cast(
+                Mcp,
+                {
+                    "type": "mcp",
+                    "server_label": "docs_server",
+                    "server_url": "https://example.com/mcp",
+                    "allowed_callers": ["programmatic"],
+                },
+            )
+        )
+        saved_agent = Agent(
+            name="TestAgent",
+            tools=[ProgrammaticToolCallingTool(), saved_mcp_tool],
+        )
+        state: RunState[Any, Agent[Any]] = make_state(
+            saved_agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        program = Program(
+            id="program_item",
+            call_id="call_program",
+            code="tools.docs_server.lookup()",
+            fingerprint="fingerprint",
+            type="program",
+        )
+        approval_request = McpApprovalRequest.model_construct(
+            id="approval_item",
+            arguments="{}",
+            name="lookup",
+            server_label="docs_server",
+            type="mcp_approval_request",
+            caller=CallerProgram(type="program", caller_id="call_program"),
+        )
+        state._model_responses = [
+            ModelResponse(output=[program], usage=Usage(), response_id="response_1")
+        ]
+        state._last_processed_response = make_processed_response(
+            mcp_approval_requests=[
+                ToolRunMCPApprovalRequest(
+                    request_item=approval_request,
+                    mcp_tool=saved_mcp_tool,
+                )
+            ]
+        )
+
+        rebound_mcp_tool = HostedMCPTool(
+            tool_config=cast(
+                Mcp,
+                {
+                    "type": "mcp",
+                    "server_label": "docs_server",
+                    "server_url": "https://example.com/mcp",
+                    "allowed_callers": ["direct"],
+                },
+            )
+        )
+        rebound_agent = Agent(
+            name="TestAgent",
+            tools=[ProgrammaticToolCallingTool(), rebound_mcp_tool],
+        )
+        with pytest.raises(ModelBehaviorError, match="caller programmatic"):
+            await RunState.from_json(
+                rebound_agent,
+                state.to_json(),
+                context_override={},
+            )
+
+    @pytest.mark.asyncio
+    async def test_previous_schema_rejects_programmatic_tool_calling_items(self):
+        agent = Agent(name="TestAgent")
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        state._model_responses = [
+            ModelResponse(
+                output=[
+                    Program(
+                        id="program_item",
+                        call_id="call_program",
+                        code="lookup()",
+                        fingerprint="fingerprint",
+                        type="program",
+                    )
+                ],
+                usage=Usage(),
+                response_id="response_1",
+            )
+        ]
+        json_data = state.to_json()
+        json_data["$schemaVersion"] = "1.12"
+
+        with pytest.raises(UserError, match="Programmatic Tool Calling requires schema version"):
+            await RunState.from_json(agent, json_data)
+
+    @pytest.mark.asyncio
+    async def test_previous_schema_ignores_program_like_arbitrary_context(self):
+        agent = Agent(name="TestAgent")
+        state = make_state(
+            agent,
+            context=RunContextWrapper(
+                context={"payload": {"type": "program", "call_id": "not-a-run-item"}}
+            ),
+            original_input="test",
+        )
+        json_data = state.to_json()
+        json_data["$schemaVersion"] = "1.12"
+
+        restored = await RunState.from_json(agent, json_data)
+        assert restored._context is not None
+        assert restored._context.context == {
+            "payload": {"type": "program", "call_id": "not-a-run-item"}
+        }
+
     def test_supported_schema_versions_match_released_boundary(self):
         """The support set should include released versions plus the current unreleased writer."""
         assert SUPPORTED_SCHEMA_VERSIONS == frozenset(
-            {"1.0", "1.1", "1.2", "1.3", "1.4", CURRENT_SCHEMA_VERSION}
+            {
+                "1.0",
+                "1.1",
+                "1.2",
+                "1.3",
+                "1.4",
+                "1.5",
+                "1.6",
+                "1.7",
+                "1.8",
+                "1.9",
+                "1.10",
+                "1.11",
+                "1.12",
+                CURRENT_SCHEMA_VERSION,
+            }
         )
+
+    def test_supported_schema_versions_have_non_empty_summaries(self):
+        """Every supported schema version should have a one-line historical summary."""
+        assert frozenset(SCHEMA_VERSION_SUMMARIES) == SUPPORTED_SCHEMA_VERSIONS
+        assert CURRENT_SCHEMA_VERSION in SCHEMA_VERSION_SUMMARIES
+        assert all(summary.strip() for summary in SCHEMA_VERSION_SUMMARIES.values())
+
+    @pytest.mark.asyncio
+    async def test_nested_history_ownership_round_trips_and_defaults_for_schema_1_12(self):
+        """New snapshots persist ownership while released 1.12 snapshots default safely."""
+        agent = Agent(name="TestAgent")
+        message_item = MessageOutputItem(agent=agent, raw_item=make_message_output(text="owned"))
+        input_item = run_item_to_input_item(message_item)
+        assert input_item is not None
+        digest = digest_input_item(input_item)
+        assert digest is not None
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input=[input_item],
+        )
+        state._session_items = [message_item]
+        state._generated_items = [message_item]
+        item_ref = NestedHistoryOwnedItemRef(
+            session_index=0,
+            digest=digest,
+            input_index=0,
+            run_item=message_item,
+            input_item=input_item,
+        )
+        state._nested_history_owned_session_item_refs = [item_ref]
+
+        serialized = state.to_json()
+        restored = await RunState.from_json(agent, serialized)
+
+        assert serialized["nested_history_owned_session_item_refs"] == [
+            {
+                "index": 0,
+                "digest": digest,
+                "input_index": 0,
+            }
+        ]
+        assert serialized["generated_session_item_indexes"] == [0]
+        assert restored._nested_history_owned_session_item_refs == [item_ref]
+        assert restored._generated_items[0] is restored._session_items[0]
+        assert isinstance(restored._original_input, list)
+        assert (
+            restored._nested_history_owned_session_item_refs[0].input_item
+            is (restored._original_input[0])
+        )
+
+        serialized["$schemaVersion"] = "1.12"
+        serialized.pop("nested_history_owned_session_item_refs")
+        serialized.pop("generated_session_item_indexes")
+        restored_1_12 = await RunState.from_json(agent, serialized)
+
+        assert restored_1_12._nested_history_owned_session_item_refs == []
+        assert restored_1_12._generated_items[0] is not restored_1_12._session_items[0]
+
+    @pytest.mark.asyncio
+    async def test_nested_history_ownership_normalizes_raw_assistant_input_digest(self):
+        """Ownership digests must match the normalized original input written to JSON."""
+        agent = Agent(name="TestAgent")
+        raw_message = {
+            "id": "msg_raw",
+            "type": "message",
+            "role": "assistant",
+            "content": "owned",
+        }
+        message_item = MessageOutputItem(agent=agent, raw_item=cast(Any, raw_message))
+        input_item = run_item_to_input_item(message_item)
+        assert input_item is not None
+        digest = digest_input_item(input_item)
+        assert digest is not None
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input=[input_item],
+        )
+        state._session_items = [message_item]
+        state._generated_items = [message_item]
+        state._nested_history_owned_session_item_refs = [
+            NestedHistoryOwnedItemRef(
+                session_index=0,
+                digest=digest,
+                input_index=0,
+                run_item=message_item,
+                input_item=input_item,
+            )
+        ]
+
+        serialized = state.to_json()
+
+        assert serialized["nested_history_owned_session_item_refs"][0]["digest"] == (
+            digest_input_item(serialized["original_input"][0])
+        )
+        restored = await RunState.from_json(agent, serialized)
+        assert (
+            restored._nested_history_owned_session_item_refs[0].input_item
+            == (restored._original_input[0])
+        )
+
+    @pytest.mark.asyncio
+    async def test_nested_history_ownership_remaps_after_skipped_session_item(self):
+        """A skipped unrelated item must not shift a surviving ownership reference."""
+        agent = Agent(name="TestAgent")
+        skipped_item = MessageOutputItem(
+            agent=agent,
+            raw_item=make_message_output(text="skip me"),
+        )
+        owned_item = MessageOutputItem(
+            agent=agent,
+            raw_item=make_message_output(text="owned"),
+        )
+        owned_input = run_item_to_input_item(owned_item)
+        assert owned_input is not None
+        digest = digest_input_item(owned_input)
+        assert digest is not None
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input=[owned_input],
+        )
+        state._generated_items = [owned_item]
+        state._session_items = [skipped_item, owned_item]
+        state._nested_history_owned_session_item_refs = [
+            NestedHistoryOwnedItemRef(
+                session_index=1,
+                digest=digest,
+                input_index=0,
+                run_item=owned_item,
+                input_item=owned_input,
+            )
+        ]
+        serialized = state.to_json()
+        serialized["session_items"][0]["agent"]["name"] = "UnknownAgent"
+
+        restored = await RunState.from_json(agent, serialized)
+
+        assert len(restored._session_items) == 1
+        assert restored._generated_items[0] is restored._session_items[0]
+        assert restored._nested_history_owned_session_item_refs[0].session_index == 0
+        assert (
+            restored._nested_history_owned_session_item_refs[0].run_item
+            is (restored._session_items[0])
+        )
+
+    @pytest.mark.asyncio
+    async def test_copied_generated_item_round_trips_to_its_session_occurrence(self):
+        """The generated/session sidecar must recognize an explicitly copied occurrence."""
+        agent = Agent(name="TestAgent")
+        session_item = MessageOutputItem(
+            agent=agent,
+            raw_item=make_message_output(text="copied"),
+        )
+        ensure_nested_history_run_item_occurrence_key(session_item)
+        generated_copy = deepcopy(session_item)
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+        )
+        state._generated_items = [generated_copy]
+        state._session_items = [session_item]
+
+        serialized = state.to_json()
+        restored = await RunState.from_json(agent, serialized)
+
+        assert serialized["generated_session_item_indexes"] == [0]
+        assert "_agents_nested_history_occurrence_key" not in json.dumps(serialized)
+        assert restored._generated_items[0] is restored._session_items[0]
+
+    @pytest.mark.asyncio
+    async def test_repeated_generated_item_identity_maps_to_distinct_session_occurrences(self):
+        """Repeated references must retain multiplicity in generated/session coordinates."""
+        agent = Agent(name="TestAgent")
+        repeated = MessageOutputItem(
+            agent=agent,
+            raw_item=make_message_output(text="same"),
+        )
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+        )
+        state._generated_items = [repeated, repeated]
+        state._session_items = [repeated, repeated]
+
+        serialized = state.to_json()
+        restored = await RunState.from_json(agent, serialized)
+
+        assert serialized["generated_session_item_indexes"] == [0, 1]
+        assert restored._generated_items[0] is restored._session_items[0]
+        assert restored._generated_items[1] is restored._session_items[1]
+
+    @pytest.mark.parametrize(
+        "invalid_mapping",
+        [
+            "not-a-list",
+            [0],
+            [-1, None],
+            [2, None],
+            [True, None],
+            [0, 0],
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_invalid_generated_session_item_indexes_are_ignored(
+        self,
+        invalid_mapping: object,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A malformed alias sidecar must not partially bind generated and session items."""
+        agent = Agent(name="TestAgent")
+        first = MessageOutputItem(agent=agent, raw_item=make_message_output(text="first"))
+        second = MessageOutputItem(agent=agent, raw_item=make_message_output(text="second"))
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+        )
+        state._generated_items = [first, second]
+        state._session_items = [first, second]
+        serialized = state.to_json()
+        serialized["generated_session_item_indexes"] = invalid_mapping
+
+        with caplog.at_level(logging.WARNING, logger="openai.agents"):
+            restored = await RunState.from_json(agent, serialized)
+
+        assert all(
+            generated is not session
+            for generated, session in zip(
+                restored._generated_items,
+                restored._session_items,
+                strict=True,
+            )
+        )
+        assert "Ignoring invalid generated_session_item_indexes" in caplog.text
+
+    @pytest.mark.parametrize(
+        "invalid_sidecar",
+        [
+            {},
+            ["not-an-object"],
+            [{"index": -1, "digest": "a" * 64, "input_index": 0}],
+            [{"index": 0, "digest": "short", "input_index": 0}],
+            [{"index": 0, "digest": "a" * 64, "input_index": -1}],
+            [{"index": 9, "digest": "a" * 64, "input_index": 0}],
+            [{"index": 0, "digest": "a" * 64, "input_index": 9}],
+            [{"index": 0, "digest": "a" * 64, "input_index": 0}],
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_invalid_nested_history_ownership_sidecars_are_rejected(
+        self,
+        invalid_sidecar: object,
+    ) -> None:
+        """Malformed or mismatched ownership must fail closed during RunState restore."""
+        agent = Agent(name="TestAgent")
+        item = MessageOutputItem(agent=agent, raw_item=make_message_output(text="owned"))
+        input_item = run_item_to_input_item(item)
+        assert input_item is not None
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input=[input_item],
+        )
+        state._generated_items = [item]
+        state._session_items = [item]
+        serialized = state.to_json()
+        serialized["nested_history_owned_session_item_refs"] = invalid_sidecar
+
+        with pytest.raises(UserError):
+            await RunState.from_json(agent, serialized)
+
+    @pytest.mark.asyncio
+    async def test_mismatched_generated_session_occurrence_is_not_aliased(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A valid coordinate cannot alias generated and session items with different payloads."""
+        agent = Agent(name="TestAgent")
+        item = MessageOutputItem(agent=agent, raw_item=make_message_output(text="same"))
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+        )
+        state._generated_items = [item]
+        state._session_items = [item]
+        serialized = state.to_json()
+        serialized["session_items"][0]["raw_item"]["content"][0]["text"] = "changed"
+
+        with caplog.at_level(logging.WARNING, logger="openai.agents"):
+            restored = await RunState.from_json(agent, serialized)
+
+        assert restored._generated_items[0] is not restored._session_items[0]
+        assert "Ignoring mismatched generated/session occurrence" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_nested_history_ownership_with_changed_input_digest_is_rejected(self) -> None:
+        """A sidecar cannot claim an input occurrence whose payload changed after serialization."""
+        agent = Agent(name="TestAgent")
+        item = MessageOutputItem(agent=agent, raw_item=make_message_output(text="owned"))
+        input_item = run_item_to_input_item(item)
+        assert input_item is not None
+        digest = digest_input_item(input_item)
+        assert digest is not None
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input=[input_item],
+        )
+        state._generated_items = [item]
+        state._session_items = [item]
+        state._nested_history_owned_session_item_refs = [
+            NestedHistoryOwnedItemRef(
+                session_index=0,
+                digest=digest,
+                input_index=0,
+                run_item=item,
+                input_item=input_item,
+            )
+        ]
+        serialized = state.to_json()
+        serialized["original_input"][0]["content"][0]["text"] = "changed"
+
+        with pytest.raises(UserError, match="input digest does not match"):
+            await RunState.from_json(agent, serialized)
+
+    @pytest.mark.asyncio
+    async def test_nested_history_ownership_for_skipped_session_item_is_ignored(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Ownership for an item that cannot be restored must not shift to another occurrence."""
+        agent = Agent(name="TestAgent")
+        skipped = MessageOutputItem(agent=agent, raw_item=make_message_output(text="skipped"))
+        kept = MessageOutputItem(agent=agent, raw_item=make_message_output(text="kept"))
+        skipped_input = run_item_to_input_item(skipped)
+        assert skipped_input is not None
+        digest = digest_input_item(skipped_input)
+        assert digest is not None
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input=[skipped_input],
+        )
+        state._generated_items = [skipped]
+        state._session_items = [skipped, kept]
+        state._nested_history_owned_session_item_refs = [
+            NestedHistoryOwnedItemRef(
+                session_index=0,
+                digest=digest,
+                input_index=0,
+                run_item=skipped,
+                input_item=skipped_input,
+            )
+        ]
+        serialized = state.to_json()
+        serialized["session_items"][0]["agent"]["name"] = "UnknownAgent"
+
+        with caplog.at_level(logging.WARNING, logger="openai.agents"):
+            restored = await RunState.from_json(agent, serialized)
+
+        assert len(restored._session_items) == 1
+        assert restored._session_items[0].raw_item == kept.raw_item
+        assert restored._generated_items[0].raw_item == skipped.raw_item
+        assert restored._generated_items[0] is not restored._session_items[0]
+        assert restored._nested_history_owned_session_item_refs == []
+        assert "Ignoring nested history ownership for skipped session item" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_equal_generated_replacement_does_not_claim_session_occurrence(self):
+        """Equal payloads without explicit lineage must serialize as distinct occurrences."""
+        agent = Agent(name="TestAgent")
+        session_item = MessageOutputItem(
+            agent=agent,
+            raw_item=make_message_output(text="same"),
+        )
+        generated_replacement = MessageOutputItem(
+            agent=agent,
+            raw_item=deepcopy(session_item.raw_item),
+        )
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+        )
+        state._generated_items = [generated_replacement]
+        state._session_items = [session_item]
+
+        serialized = state.to_json()
+        restored = await RunState.from_json(agent, serialized)
+
+        assert serialized["generated_session_item_indexes"] == [None]
+        assert restored._generated_items[0] is not restored._session_items[0]
+
+        serialized["$schemaVersion"] = "1.12"
+        serialized.pop("nested_history_owned_session_item_refs")
+        serialized.pop("generated_session_item_indexes")
+        restored_1_12 = await RunState.from_json(agent, serialized)
+
+        assert restored_1_12._generated_items[0] is not restored_1_12._session_items[0]
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_copied_generated_item_does_not_claim_equal_session_occurrence(self):
+        """An equal partial copy must remain separate when its session occurrence is ambiguous."""
+        agent = Agent(name="TestAgent")
+        first = MessageOutputItem(agent=agent, raw_item=make_message_output(text="same"))
+        second = MessageOutputItem(agent=agent, raw_item=make_message_output(text="same"))
+        state: RunState[Any] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+        )
+        state._generated_items = [deepcopy(second)]
+        state._session_items = [first, second]
+
+        serialized = state.to_json()
+        restored = await RunState.from_json(agent, serialized)
+
+        assert serialized["generated_session_item_indexes"] == [None]
+        assert all(restored._generated_items[0] is not item for item in restored._session_items)
+
+    @pytest.mark.asyncio
+    async def test_from_json_accepts_schema_version_1_5_without_sandbox_payload(self):
+        """RunState snapshots written before sandbox resume support should still restore."""
+        agent = Agent(name="TestAgent")
+        state_json = {
+            "$schemaVersion": "1.5",
+            "original_input": "test",
+            "current_agent": {"name": "TestAgent"},
+            "context": {
+                "context": {"foo": "bar"},
+                "usage": {"requests": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                "approvals": {},
+            },
+            "max_turns": 3,
+            "current_turn": 0,
+            "model_responses": [],
+            "generated_items": [],
+        }
+
+        restored = await RunState.from_json(agent, state_json)
+
+        assert restored._current_agent is not None
+        assert restored._current_agent.name == "TestAgent"
+        assert restored._context is not None
+        assert restored._context.context == {"foo": "bar"}
+        assert restored._sandbox is None
+
+    @pytest.mark.asyncio
+    async def test_run_state_round_trip_preserves_serialized_sandbox_session_snapshot_fields(
+        self,
+    ):
+        """RunState should preserve sandbox session payloads needed for typed snapshot restore."""
+        agent = Agent(name="TestAgent")
+        context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        state: RunState[Any, Agent[Any]] = make_state(agent, context=context, original_input="test")
+        client = UnixLocalSandboxClient()
+        session_state = UnixLocalSandboxSessionState(
+            manifest=Manifest(),
+            snapshot=LocalSnapshot(id="local-snapshot", base_path=Path("/tmp/snapshots")),
+        )
+        serialized_session_state = client.serialize_session_state(session_state)
+        state._sandbox = {
+            "backend_id": "unix_local",
+            "current_agent_key": agent.name,
+            "current_agent_name": agent.name,
+            "session_state": serialized_session_state,
+            "sessions_by_agent": {
+                agent.name: {
+                    "agent_name": agent.name,
+                    "session_state": serialized_session_state,
+                }
+            },
+        }
+
+        restored = await RunState.from_json(agent, state.to_json())
+
+        assert restored._sandbox is not None
+        restored_session_payload = cast(dict[str, object], restored._sandbox["session_state"])
+        restored_snapshot_payload = cast(dict[str, object], restored_session_payload["snapshot"])
+        assert restored_snapshot_payload == {
+            "type": "local",
+            "id": "local-snapshot",
+            "base_path": "/tmp/snapshots",
+        }
+
+        restored_session_state = client.deserialize_session_state(restored_session_payload)
+        assert isinstance(restored_session_state, UnixLocalSandboxSessionState)
+        assert isinstance(restored_session_state.snapshot, LocalSnapshot)
+        assert restored_session_state.snapshot.base_path == Path("/tmp/snapshots")
 
     @pytest.mark.asyncio
     async def test_from_json_agent_not_found(self):
@@ -4536,6 +6443,78 @@ class TestToolApprovalItem:
         restored_item = new_state._generated_items[0]
         assert isinstance(restored_item, ToolApprovalItem)
         assert restored_item.tool_lookup_key == ("deferred_top_level", "get_weather")
+
+    async def test_round_trip_deserializes_statusless_message_output_items(self) -> None:
+        """RunState should restore SDK-built messages that omit response-only defaults."""
+        agent = Agent(name="TestAgent")
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        message = ResponseOutputMessage.model_construct(
+            id="msg_constructed",
+            type="message",
+            role="assistant",
+            content=[
+                ResponseOutputText.model_construct(
+                    type="output_text",
+                    text="hello",
+                    annotations=[],
+                )
+            ],
+        )
+        state._generated_items.append(MessageOutputItem(agent=agent, raw_item=message))
+
+        restored = await RunState.from_json(agent, state.to_json())
+
+        restored_message = cast(MessageOutputItem, restored._generated_items[0]).raw_item
+        assert isinstance(restored_message, ResponseOutputMessage)
+        assert "status" not in restored_message.model_fields_set
+        assert isinstance(restored_message.content[0], ResponseOutputText)
+        assert "logprobs" not in restored_message.content[0].model_fields_set
+        assert restored_message.model_dump(exclude_unset=True) == {
+            "id": "msg_constructed",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hello", "annotations": []}],
+        }
+
+    async def test_round_trip_deserializes_statusless_model_response_messages(self) -> None:
+        """ModelResponse output should use the same status-preserving reconstruction path."""
+        agent = Agent(name="TestAgent")
+        state: RunState[Any, Agent[Any]] = make_state(
+            agent,
+            context=RunContextWrapper(context={}),
+            original_input="test",
+        )
+        message = ResponseOutputMessage.model_construct(
+            id="msg_response",
+            type="message",
+            role="assistant",
+            content=[
+                ResponseOutputText.model_construct(
+                    type="output_text",
+                    text="world",
+                    annotations=[],
+                )
+            ],
+        )
+        state._model_responses.append(
+            ModelResponse(output=[message], usage=Usage(), response_id=None)
+        )
+
+        restored = await RunState.from_json(agent, state.to_json())
+
+        restored_message = cast(ResponseOutputMessage, restored._model_responses[0].output[0])
+        assert isinstance(restored_message, ResponseOutputMessage)
+        assert "status" not in restored_message.model_fields_set
+        assert restored_message.model_dump(exclude_unset=True) == {
+            "id": "msg_response",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "world", "annotations": []}],
+        }
 
     async def test_deserialize_items_restores_tool_search_items(self):
         """Test that tool search run items survive RunState round-trips."""

@@ -2,7 +2,9 @@
 
 Agents are the core building block in your apps. An agent is a large language model (LLM) configured with instructions, tools, and optional runtime behavior such as handoffs, guardrails, and structured outputs.
 
-Use this page when you want to define or customize a single agent. If you are deciding how multiple agents should collaborate, read [Agent orchestration](multi_agent.md).
+Use this page when you want to define or customize a single plain `Agent`. If you are deciding how multiple agents should collaborate, read [Agent orchestration](multi_agent.md). If the agent should run inside an isolated workspace with manifest-defined files and sandbox-native capabilities, read [Sandbox agent concepts](sandbox/guide.md).
+
+The SDK uses the Responses API by default for OpenAI models, but the distinction here is orchestration: `Agent` plus `Runner` lets the SDK manage turns, tools, guardrails, handoffs, and sessions for you. If you want to own that loop yourself, use the Responses API directly instead.
 
 ## Choose the next guide
 
@@ -12,6 +14,7 @@ Use this page as the hub for agent definition. Jump to the adjacent guide that m
 | --- | --- |
 | Choose a model or provider setup | [Models](models/index.md) |
 | Add capabilities to the agent | [Tools](tools.md) |
+| Run an agent against a real repo, document bundle, or isolated workspace | [Sandbox agents quickstart](sandbox_agents.md) |
 | Decide between manager-style orchestration and handoffs | [Agent orchestration](multi_agent.md) |
 | Configure handoff behavior | [Handoffs](handoffs.md) |
 | Run turns, stream events, or manage conversation state | [Running agents](running_agents.md) |
@@ -25,7 +28,7 @@ The most common properties of an agent are:
 | Property | Required | Description |
 | --- | --- | --- |
 | `name` | yes | Human-readable agent name. |
-| `instructions` | yes | System prompt or dynamic instructions callback. See [Dynamic instructions](#dynamic-instructions). |
+| `instructions` | no | System prompt or dynamic instructions callback. Strongly recommended. See [Dynamic instructions](#dynamic-instructions). |
 | `prompt` | no | OpenAI Responses API prompt configuration. Accepts a static prompt object or a function. See [Prompt templates](#prompt-templates). |
 | `handoff_description` | no | Short description exposed when this agent is offered as a handoff target. |
 | `handoffs` | no | Delegate the conversation to specialist agents. See [handoffs](handoffs.md). |
@@ -40,7 +43,7 @@ The most common properties of an agent are:
 | `reset_tool_choice` | no | Reset `tool_choice` after a tool call (default: `True`) to avoid tool-use loops. See [Forcing tool use](#forcing-tool-use). |
 
 ```python
-from agents import Agent, ModelSettings, function_tool
+from agents import Agent, function_tool
 
 @function_tool
 def get_weather(city: str) -> str:
@@ -54,6 +57,8 @@ agent = Agent(
     tools=[get_weather],
 )
 ```
+
+Everything in this section applies to `Agent`. `SandboxAgent` builds on the same ideas, then adds `default_manifest`, `base_instructions`, `capabilities`, and `run_as` for workspace-scoped runs. See [Sandbox agent concepts](sandbox/guide.md).
 
 ## Prompt templates
 
@@ -121,14 +126,21 @@ Agents are generic on their `context` type. Context is a dependency-injection to
 Read the [context guide](context.md) for the full `RunContextWrapper` surface, shared usage tracking, nested `tool_input`, and serialization caveats.
 
 ```python
+from dataclasses import dataclass
+
+@dataclass
+class Purchase:
+    id: str
+
 @dataclass
 class UserContext:
     name: str
     uid: str
     is_pro_user: bool
 
-    async def fetch_purchases() -> list[Purchase]:
-        return ...
+    async def fetch_purchases(self) -> list[Purchase]:
+        # implement your logic here
+        return []
 
 agent = Agent[UserContext](
     ...,
@@ -224,6 +236,8 @@ triage_agent = Agent(
 In most cases, you can provide instructions when you create the agent. However, you can also provide dynamic instructions via a function. The function will receive the agent and context, and must return the prompt. Both regular and `async` functions are accepted.
 
 ```python
+from agents import Agent, RunContextWrapper
+
 def dynamic_instructions(
     context: RunContextWrapper[UserContext], agent: Agent[UserContext]
 ) -> str:
@@ -254,7 +268,7 @@ Typical hook timing:
 
 -   `on_agent_start` / `on_agent_end`: when a specific agent begins or finishes producing a final output.
 -   `on_llm_start` / `on_llm_end`: immediately around each model call.
--   `on_tool_start` / `on_tool_end`: around each local tool invocation.
+- `on_tool_start` / `on_tool_end`: around each local tool invocation. For function tools, the hook `context` is typically a `ToolContext`, so you can inspect tool-call metadata such as `tool_call_id`.
 -   `on_handoff`: when control moves from one agent to another.
 
 Use `RunHooks` when you want a single observer for the whole workflow, and `AgentHooks` when one agent needs custom side effects.
@@ -293,7 +307,7 @@ By using the `clone()` method on an agent, you can duplicate an Agent, and optio
 pirate_agent = Agent(
     name="Pirate",
     instructions="Write like a pirate",
-    model="gpt-5.4",
+    model="gpt-5.6-sol",
 )
 
 robot_agent = pirate_agent.clone(
@@ -314,7 +328,7 @@ Supplying a list of tools doesn't always mean the LLM will use a tool. You can f
 When you are using OpenAI Responses tool search, named tool choices are more limited: you cannot target bare namespace names or deferred-only tools with `tool_choice`, and `tool_choice="tool_search"` does not target [`ToolSearchTool`][agents.tool.ToolSearchTool]. In those cases, prefer `auto` or `required`. See [Hosted tool search](tools.md#hosted-tool-search) for the Responses-specific constraints.
 
 ```python
-from agents import Agent, Runner, function_tool, ModelSettings
+from agents import Agent, function_tool, ModelSettings
 
 @function_tool
 def get_weather(city: str) -> str:
@@ -337,7 +351,7 @@ The `tool_use_behavior` parameter in the `Agent` configuration controls how tool
 - `"stop_on_first_tool"`: The output of the first tool call is used as the final response, without further LLM processing.
 
 ```python
-from agents import Agent, Runner, function_tool, ModelSettings
+from agents import Agent, function_tool
 
 @function_tool
 def get_weather(city: str) -> str:
@@ -355,7 +369,7 @@ agent = Agent(
 - `StopAtTools(stop_at_tool_names=[...])`: Stops if any specified tool is called, using its output as the final response.
 
 ```python
-from agents import Agent, Runner, function_tool
+from agents import Agent, function_tool
 from agents.agent import StopAtTools
 
 @function_tool
@@ -379,7 +393,7 @@ agent = Agent(
 - `ToolsToFinalOutputFunction`: A custom function that processes tool results and decides whether to stop or continue with the LLM.
 
 ```python
-from agents import Agent, Runner, function_tool, FunctionToolResult, RunContextWrapper
+from agents import Agent, function_tool, FunctionToolResult, RunContextWrapper
 from agents.agent import ToolsToFinalOutputResult
 from typing import List, Any
 

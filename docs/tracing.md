@@ -31,6 +31,8 @@ The Agents SDK includes built-in tracing, collecting a comprehensive record of e
 By default, the SDK traces the following:
 
 -   The entire `Runner.{run, run_sync, run_streamed}()` is wrapped in a `trace()`.
+-   Each runner invocation is wrapped in a `task_span()`.
+-   Each model turn is wrapped in a `turn_span()`.
 -   Each time an agent runs, it is wrapped in `agent_span()`
 -   LLM generations are wrapped in `generation_span()`
 -   Function tool calls are each wrapped in `function_span()`
@@ -42,19 +44,25 @@ By default, the SDK traces the following:
 
 By default, the trace is named "Agent workflow". You can set this name if you use `trace`, or you can configure the name and other properties with the [`RunConfig`][agents.run.RunConfig].
 
+If you want a more compact hierarchy, disable the automatic task and turn spans for a run. Agent, generation, function, guardrail, handoff, and custom spans are still recorded.
+
+```python
+from agents import RunConfig, Runner
+
+result = await Runner.run(
+    agent,
+    "Hello",
+    run_config=RunConfig(tracing={"include_task_and_turn_spans": False}),
+)
+```
+
 In addition, you can set up [custom trace processors](#custom-tracing-processors) to push traces to other destinations (as a replacement, or secondary destination).
 
 ## Long-running workers and immediate exports
 
-The default [`BatchTraceProcessor`][agents.tracing.processors.BatchTraceProcessor] exports traces
-in the background every few seconds, or sooner when the in-memory queue reaches its size trigger,
-and also performs a final flush when the process exits. In long-running workers such as Celery,
-RQ, Dramatiq, or FastAPI background tasks, this means traces are usually exported automatically
-without any extra code, but they may not appear in the Traces dashboard immediately after each job
-finishes.
+The default [`BatchTraceProcessor`][agents.tracing.processors.BatchTraceProcessor] exports traces in the background every few seconds, or sooner when the in-memory queue reaches its size trigger, and also performs a final flush when the process exits. In long-running workers such as Celery, RQ, Dramatiq, or FastAPI background tasks, this means traces are usually exported automatically without any extra code, but they may not appear in the Traces dashboard immediately after each job finishes.
 
-If you need an immediate delivery guarantee at the end of a unit of work, call
-[`flush_traces()`][agents.tracing.flush_traces] after the trace context exits.
+If you need an immediate delivery guarantee at the end of a unit of work, call [`flush_traces()`][agents.tracing.flush_traces] after the trace context exits.
 
 ```python
 from agents import Runner, flush_traces, trace
@@ -91,9 +99,7 @@ async def run(prompt: str, background_tasks: BackgroundTasks):
     return {"status": "queued"}
 ```
 
-[`flush_traces()`][agents.tracing.flush_traces] blocks until currently buffered traces and spans are
-exported, so call it after `trace()` closes to avoid flushing a partially built trace. You can skip
-this call when the default export latency is acceptable.
+[`flush_traces()`][agents.tracing.flush_traces] blocks until currently buffered traces and spans are exported, so call it after `trace()` closes to avoid flushing a partially built trace. You can skip this call when the default export latency is acceptable.
 
 ## Higher level traces
 
@@ -158,7 +164,7 @@ You can use an OpenAI API key with non-OpenAI models to enable free tracing in t
 
 ```python
 import os
-from agents import set_tracing_export_api_key, Agent, Runner
+from agents import set_tracing_export_api_key, Agent
 from agents.extensions.models.any_llm_model import AnyLLMModel
 
 tracing_api_key = os.environ["OPENAI_API_KEY"]
@@ -188,7 +194,7 @@ await Runner.run(
 ```
 
 ## Additional notes
-- View free traces at Openai Traces dashboard.
+- View free traces at OpenAI Traces dashboard.
 
 
 ## Ecosystem integrations
@@ -222,3 +228,6 @@ The following community and vendor integrations support the OpenAI Agents SDK tr
 -   [PromptLayer](https://docs.promptlayer.com/languages/integrations#openai-agents-sdk)
 -   [HoneyHive](https://docs.honeyhive.ai/v2/integrations/openai-agents)
 -   [Asqav](https://www.asqav.com/docs/integrations#openai-agents)
+-   [Datadog](https://docs.datadoghq.com/llm_observability/instrumentation/auto_instrumentation/?tab=python#openai-agents)
+-   [Latitude](https://docs.latitude.so/telemetry/frameworks/openai-agents)
+-   [DProvenanceKit](https://dprovenance.dev/openai-agents/)

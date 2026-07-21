@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, cast
+from collections.abc import Callable
+from typing import Any, Optional, cast
 
 import pytest
 from openai.types.responses import ResponseComputerToolCall, ResponseFunctionToolCall
@@ -26,6 +27,7 @@ from agents import (
     function_tool,
     tool_namespace,
 )
+from agents._public_agent import set_public_agent
 from agents.computer import Computer, Environment
 from agents.exceptions import ModelBehaviorError, UserError
 from agents.items import (
@@ -39,19 +41,24 @@ from agents.items import (
 from agents.lifecycle import RunHooks
 from agents.run import RunConfig
 from agents.run_internal import run_loop
+from agents.run_internal.agent_bindings import bind_execution_agent, bind_public_agent
 from agents.run_internal.run_loop import (
     NextStepInterruption,
     NextStepRunAgain,
     ProcessedResponse,
+    ToolRunApplyPatchCall,
     ToolRunComputerAction,
     ToolRunFunction,
     ToolRunMCPApprovalRequest,
     ToolRunShellCall,
     extract_tool_call_id,
 )
-from agents.run_internal.tool_planning import _select_function_tool_runs_for_resume
+from agents.run_internal.tool_planning import (
+    _collect_runs_by_approval,
+    _select_function_tool_runs_for_resume,
+)
 from agents.run_state import RunState as RunStateClass
-from agents.tool import HostedMCPTool
+from agents.tool import FunctionTool, HostedMCPTool
 from agents.usage import Usage
 
 from .fake_model import FakeModel
@@ -69,7 +76,6 @@ from .utils.hitl import (
     collect_tool_outputs,
     consume_stream,
     make_agent,
-    make_apply_patch_call,
     make_apply_patch_dict,
     make_context_wrapper,
     make_function_tool_call,
@@ -82,6 +88,20 @@ from .utils.hitl import (
     resume_after_first_approval,
     run_and_resume_after_approval,
 )
+
+
+def _bind_agent(agent: Agent[Any]):
+    public_agent = getattr(agent, "_agents_public_agent", None)
+    if isinstance(public_agent, Agent):
+        return bind_execution_agent(public_agent=public_agent, execution_agent=agent)
+    return bind_public_agent(agent)
+
+
+async def _resolve_interrupted_turn(*, agent: Agent[Any], **kwargs: Any):
+    return await run_loop.resolve_interrupted_turn(
+        bindings=_bind_agent(agent),
+        **kwargs,
+    )
 
 
 class TrackingComputer(Computer):
@@ -147,7 +167,7 @@ def _shell_approval_setup() -> ApprovalScenario:
 def _apply_patch_approval_setup() -> ApprovalScenario:
     editor = RecordingEditor()
     tool = ApplyPatchTool(editor=editor, needs_approval=require_approval)
-    apply_patch_call = make_apply_patch_call("call_apply_1")
+    apply_patch_call = make_apply_patch_dict("call_apply_1")
 
     def _assert(result: RunResult) -> None:
         apply_patch_outputs = collect_tool_outputs(
@@ -181,7 +201,7 @@ def _apply_patch_pending_setup() -> PendingScenario:
 
     return PendingScenario(
         tool=apply_patch_tool,
-        raw_call=make_apply_patch_call("call_apply_pending"),
+        raw_call=make_apply_patch_dict("call_apply_pending"),
         assert_result=_assert_editor,
     )
 
@@ -236,7 +256,7 @@ async def test_resuming_skips_approvals_for_non_hitl_tools(tool_kind: str) -> No
     else:
         editor = RecordingEditor()
         auto_tool = ApplyPatchTool(editor=editor)
-        raw_call = make_apply_patch_call("call_apply_auto")
+        raw_call = make_apply_patch_dict("call_apply_auto")
         output_type = "apply_patch_call_output"
 
     async def needs_hitl() -> str:
@@ -705,7 +725,7 @@ async def test_hosted_mcp_approval_matches_unknown_tool_key() -> None:
         interruptions=[],
     )
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="test",
         original_pre_step_items=[approval_item],
@@ -745,7 +765,7 @@ async def test_shell_call_without_call_id_raises() -> None:
     )
 
     with pytest.raises(ModelBehaviorError):
-        await run_loop.resolve_interrupted_turn(
+        await _resolve_interrupted_turn(
             agent=agent,
             original_input="test",
             original_pre_step_items=[],
@@ -862,6 +882,91 @@ async def test_function_needs_approval_invalid_type_raises() -> None:
         await Runner.run(agent, "run invalid")
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"subject": "refund"',
+        "null",
+        "[]",
+        '{"amount": NaN}',
+        '{"amount": Infinity}',
+        '{"amount": -Infinity}',
+    ],
+)
+@pytest.mark.asyncio
+async def test_callable_function_approval_fails_closed_for_invalid_arguments(
+    arguments: str,
+) -> None:
+    """Uninspectable function arguments must require approval before a manual tool can run."""
+    approval_inputs: list[dict[str, Any]] = []
+    tool_inputs: list[str] = []
+
+    async def needs_approval(_ctx: Any, params: dict[str, Any], _call_id: str) -> bool:
+        approval_inputs.append(params)
+        return False
+
+    async def invoke_tool(_ctx: Any, raw_arguments: str) -> str:
+        tool_inputs.append(raw_arguments)
+        return "sent"
+
+    tool = FunctionTool(
+        name="send_email",
+        description="Send an email.",
+        params_json_schema={"type": "object", "properties": {}},
+        on_invoke_tool=invoke_tool,
+        needs_approval=needs_approval,
+    )
+    model, agent = make_model_and_agent(tools=[tool])
+    model.set_next_output(
+        [make_function_tool_call(tool.name, arguments=arguments, call_id="call-invalid")]
+    )
+
+    result = await Runner.run(agent, "send an email")
+
+    assert len(result.interruptions) == 1
+    assert result.interruptions[0].tool_name == tool.name
+    assert approval_inputs == []
+    assert tool_inputs == []
+
+
+@pytest.mark.asyncio
+async def test_callable_function_approval_receives_valid_object_arguments() -> None:
+    """Valid object arguments should preserve callable approval behavior."""
+    approval_inputs: list[dict[str, Any]] = []
+    tool_inputs: list[str] = []
+
+    async def needs_approval(_ctx: Any, params: dict[str, Any], _call_id: str) -> bool:
+        approval_inputs.append(params)
+        return False
+
+    async def invoke_tool(_ctx: Any, raw_arguments: str) -> str:
+        tool_inputs.append(raw_arguments)
+        return "sent"
+
+    tool = FunctionTool(
+        name="send_email",
+        description="Send an email.",
+        params_json_schema={"type": "object", "properties": {"subject": {"type": "string"}}},
+        on_invoke_tool=invoke_tool,
+        needs_approval=needs_approval,
+    )
+    arguments = '{"subject": "status update"}'
+    model, agent = make_model_and_agent(tools=[tool])
+    model.add_multiple_turn_outputs(
+        [
+            [make_function_tool_call(tool.name, arguments=arguments, call_id="call-valid")],
+            [get_text_message("done")],
+        ]
+    )
+
+    result = await Runner.run(agent, "send an email")
+
+    assert result.final_output == "done"
+    assert approval_inputs
+    assert all(params == {"subject": "status update"} for params in approval_inputs)
+    assert tool_inputs == [arguments]
+
+
 @pytest.mark.asyncio
 async def test_resume_invalid_needs_approval_raises() -> None:
     """Resume path should surface invalid needs_approval configuration errors."""
@@ -891,7 +996,7 @@ async def test_resume_invalid_needs_approval_raises() -> None:
     )
 
     with pytest.raises(UserError, match="needs_approval"):
-        await run_loop.resolve_interrupted_turn(
+        await _resolve_interrupted_turn(
             agent=agent,
             original_input="resume invalid",
             original_pre_step_items=[],
@@ -1006,7 +1111,7 @@ async def test_resume_rebuilds_function_runs_from_pending_approvals() -> None:
         interruptions=[],
     )
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume approvals",
         original_pre_step_items=[],
@@ -1078,7 +1183,7 @@ async def test_resume_rebuilds_deferred_function_runs_from_lookup_key_without_ra
         interruptions=[],
     )
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume approvals",
         original_pre_step_items=[],
@@ -1097,6 +1202,71 @@ async def test_resume_rebuilds_deferred_function_runs_from_lookup_key_without_ra
         if isinstance(item, ToolCallOutputItem) and item.output == "deferred:customer_1"
     ]
     assert deferred_outputs == ["deferred:customer_1"]
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_rebuild_approved_calls_for_same_named_sibling_agent() -> None:
+    """Approved interruptions should match the current public agent, not any same-named sibling."""
+
+    first_calls: list[str] = []
+    second_calls: list[str] = []
+
+    @function_tool(needs_approval=True, name_override="approval_tool")
+    async def first_approval_tool() -> str:
+        first_calls.append("first")
+        return "first"
+
+    @function_tool(needs_approval=True, name_override="approval_tool")
+    async def second_approval_tool() -> str:
+        second_calls.append("second")
+        return "second"
+
+    first = Agent(name="sandbox", tools=[first_approval_tool])
+    second = Agent(name="sandbox", tools=[second_approval_tool])
+    first.handoffs = [second]
+    second.handoffs = [first]
+
+    approval_item = ToolApprovalItem(
+        agent=second,
+        raw_item=make_function_tool_call(
+            name="approval_tool",
+            call_id="call-sibling-approval",
+            arguments="{}",
+        ),
+        tool_name="approval_tool",
+    )
+    context_wrapper = make_context_wrapper()
+    context_wrapper.approve_tool(approval_item)
+    run_state = make_state_with_interruptions(first, [approval_item])
+    processed_response = ProcessedResponse(
+        new_items=[],
+        handoffs=[],
+        functions=[],
+        computer_actions=[],
+        local_shell_calls=[],
+        shell_calls=[],
+        apply_patch_calls=[],
+        tools_used=[],
+        mcp_approval_requests=[],
+        interruptions=[],
+    )
+
+    execution_agent = set_public_agent(first.clone(), first)
+    result = await _resolve_interrupted_turn(
+        agent=execution_agent,
+        original_input="resume approvals",
+        original_pre_step_items=[],
+        new_response=ModelResponse(output=[], usage=Usage(), response_id="resp"),
+        processed_response=processed_response,
+        hooks=RunHooks(),
+        context_wrapper=context_wrapper,
+        run_config=RunConfig(),
+        run_state=run_state,
+    )
+
+    assert first_calls == []
+    assert second_calls == []
+    assert not any(isinstance(item, ToolCallOutputItem) for item in result.new_step_items)
 
 
 @pytest.mark.asyncio
@@ -1166,6 +1336,127 @@ async def test_resume_honors_permanent_namespaced_function_approval_with_new_cal
 
 
 @pytest.mark.asyncio
+async def test_resume_skips_needs_approval_checker_when_status_resolved() -> None:
+    """Resolved approve/reject decisions must short-circuit needs_approval_checker.
+
+    A user-supplied checker may have side effects (telemetry, network, exceptions).
+    When the approval status is already True or False, we must not invoke it.
+    """
+
+    @function_tool(needs_approval=True)
+    async def approve_me(value: str) -> str:
+        return value
+
+    approved_call = make_function_tool_call(
+        approve_me.name, call_id="approved-call", arguments='{"value":"a"}'
+    )
+    rejected_call = make_function_tool_call(
+        approve_me.name, call_id="rejected-call", arguments='{"value":"b"}'
+    )
+    agent = Agent(name="agent")
+    context_wrapper = make_context_wrapper()
+    context_wrapper.approve_tool(ToolApprovalItem(agent=agent, raw_item=approved_call))
+    context_wrapper.reject_tool(ToolApprovalItem(agent=agent, raw_item=rejected_call))
+
+    runs = [
+        ToolRunFunction(tool_call=approved_call, function_tool=approve_me),
+        ToolRunFunction(tool_call=rejected_call, function_tool=approve_me),
+    ]
+    checker_calls: list[str] = []
+
+    async def _needs_approval_checker(run: ToolRunFunction) -> bool:
+        checker_calls.append(run.tool_call.call_id)
+        raise AssertionError("checker must not run for resolved approvals")
+
+    rejections: list[str | None] = []
+
+    async def _record_rejection(
+        call_id: str | None,
+        _tool_call: ResponseFunctionToolCall,
+        _tool: Any,
+    ) -> None:
+        rejections.append(call_id)
+
+    selected = await _select_function_tool_runs_for_resume(
+        runs,
+        approval_items_by_call_id={},
+        context_wrapper=context_wrapper,
+        needs_approval_checker=_needs_approval_checker,
+        output_exists_checker=lambda _run: False,
+        record_rejection=_record_rejection,
+        pending_interruption_adder=lambda _item: None,
+        pending_item_builder=lambda run: ToolApprovalItem(agent=agent, raw_item=run.tool_call),
+    )
+
+    assert checker_calls == []
+    assert [run.tool_call.call_id for run in selected] == ["approved-call"]
+    assert rejections == ["rejected-call"]
+
+
+@pytest.mark.asyncio
+async def test_collect_runs_by_approval_skips_checker_when_status_resolved() -> None:
+    """Approved/rejected shell calls must not invoke needs_approval_checker.
+
+    Mirrors #3229 for non-function tools: when the approval status is already
+    True or False, a user-supplied checker (which may have side effects, hit
+    the network, or raise) must be short-circuited.
+    """
+    shell_tool = ShellTool(executor=lambda _req: "ok", needs_approval=True)
+    approved_call = make_shell_call("approved-shell")
+    rejected_call = make_shell_call("rejected-shell")
+    agent = Agent(name="agent")
+    context_wrapper = make_context_wrapper()
+    context_wrapper.approve_tool(
+        ToolApprovalItem(
+            agent=agent,
+            raw_item=cast(dict[str, Any], approved_call),
+            tool_name=shell_tool.name,
+        )
+    )
+    context_wrapper.reject_tool(
+        ToolApprovalItem(
+            agent=agent,
+            raw_item=cast(dict[str, Any], rejected_call),
+            tool_name=shell_tool.name,
+        )
+    )
+
+    runs = [
+        ToolRunShellCall(tool_call=approved_call, shell_tool=shell_tool),
+        ToolRunShellCall(tool_call=rejected_call, shell_tool=shell_tool),
+    ]
+    checker_calls: list[str] = []
+
+    async def _needs_approval(run: ToolRunShellCall) -> bool:
+        checker_calls.append(run.tool_call["call_id"])
+        raise AssertionError("checker must not run for resolved approvals")
+
+    async def _build_rejection(run: ToolRunShellCall, call_id: str) -> RunItem:
+        return ToolCallOutputItem(
+            output="rejected",
+            raw_item={"type": "function_call_output", "call_id": call_id, "output": "rejected"},
+            agent=agent,
+        )
+
+    approved, rejections = await _collect_runs_by_approval(
+        runs,
+        call_id_extractor=lambda run: run.tool_call["call_id"],
+        tool_name_resolver=lambda run: run.shell_tool.name,
+        rejection_builder=_build_rejection,
+        context_wrapper=context_wrapper,
+        approval_items_by_call_id={},
+        agent=agent,
+        pending_interruption_adder=lambda _item: None,
+        needs_approval_checker=_needs_approval,
+        output_exists_checker=lambda _call_id: False,
+    )
+
+    assert checker_calls == []
+    assert approved == [runs[0]]
+    assert len(rejections) == 1
+
+
+@pytest.mark.asyncio
 async def test_resume_rebuilds_function_runs_from_object_approvals() -> None:
     """Rebuild should handle ResponseFunctionToolCall approval items."""
 
@@ -1198,7 +1489,7 @@ async def test_resume_rebuilds_function_runs_from_object_approvals() -> None:
         interruptions=[],
     )
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume approvals",
         original_pre_step_items=[],
@@ -1252,7 +1543,7 @@ async def test_resume_rebuilds_local_mcp_function_runs_from_approvals() -> None:
         interruptions=[],
     )
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume approvals",
         original_pre_step_items=[],
@@ -1317,7 +1608,7 @@ async def test_resume_rebuild_rejections_use_deferred_tool_display_name() -> Non
         interruptions=[],
     )
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume approvals",
         original_pre_step_items=[],
@@ -1377,7 +1668,7 @@ async def test_rebuild_function_runs_handles_object_pending_and_rejections() -> 
         interruptions=[],
     )
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume approvals",
         original_pre_step_items=[],
@@ -1397,6 +1688,127 @@ async def test_rebuild_function_runs_handles_object_pending_and_rejections() -> 
         if isinstance(item, ToolCallOutputItem) and item.output == HITL_REJECTION_MSG
     ]
     assert rejection_outputs, "Rejected function call should emit rejection output"
+
+
+@pytest.mark.asyncio
+async def test_resume_function_rejection_outputs_use_public_agent() -> None:
+    @function_tool(needs_approval=True)
+    def reject_me(text: str = "nope") -> str:
+        return text
+
+    _model, public_agent = make_model_and_agent(tools=[reject_me])
+    execution_agent = public_agent.clone()
+    set_public_agent(execution_agent, public_agent)
+    context_wrapper = make_context_wrapper()
+
+    rejected_call = make_function_tool_call(reject_me.name, call_id="obj-reject-public")
+    assert isinstance(rejected_call, ResponseFunctionToolCall)
+    rejected_item = ToolApprovalItem(agent=public_agent, raw_item=rejected_call)
+    context_wrapper.reject_tool(rejected_item)
+
+    run_state = make_state_with_interruptions(public_agent, [rejected_item])
+    processed_response = ProcessedResponse(
+        new_items=[],
+        handoffs=[],
+        functions=[],
+        computer_actions=[],
+        local_shell_calls=[],
+        shell_calls=[],
+        apply_patch_calls=[],
+        tools_used=[],
+        mcp_approval_requests=[],
+        interruptions=[],
+    )
+
+    result = await _resolve_interrupted_turn(
+        agent=execution_agent,
+        original_input="resume approvals",
+        original_pre_step_items=[],
+        new_response=ModelResponse(output=[], usage=Usage(), response_id="resp"),
+        processed_response=processed_response,
+        hooks=RunHooks(),
+        context_wrapper=context_wrapper,
+        run_config=RunConfig(),
+        run_state=run_state,
+    )
+
+    rejection_outputs = [
+        item
+        for item in result.new_step_items
+        if isinstance(item, ToolCallOutputItem) and item.output == HITL_REJECTION_MSG
+    ]
+    assert rejection_outputs
+    assert all(item.agent is public_agent for item in rejection_outputs)
+
+
+@pytest.mark.parametrize("tool_kind", ["shell", "apply_patch"])
+@pytest.mark.asyncio
+async def test_resume_non_function_rejection_outputs_use_public_agent(
+    tool_kind: str,
+) -> None:
+    context_wrapper = make_context_wrapper()
+    processed_response = ProcessedResponse(
+        new_items=[],
+        handoffs=[],
+        functions=[],
+        computer_actions=[],
+        local_shell_calls=[],
+        shell_calls=[],
+        apply_patch_calls=[],
+        tools_used=[],
+        mcp_approval_requests=[],
+        interruptions=[],
+    )
+
+    if tool_kind == "shell":
+        shell_tool = ShellTool(executor=lambda _req: "should_not_run", needs_approval=True)
+        _model, public_agent = make_model_and_agent(tools=[shell_tool])
+        raw_item = cast(
+            dict[str, Any],
+            make_shell_call(
+                "call_reject_shell_public",
+                id_value="shell_reject_public",
+                commands=["echo test"],
+                status="in_progress",
+            ),
+        )
+        processed_response.shell_calls = [
+            ToolRunShellCall(tool_call=raw_item, shell_tool=shell_tool)
+        ]
+        tool_name = shell_tool.name
+    else:
+        apply_patch_tool = ApplyPatchTool(editor=RecordingEditor(), needs_approval=True)
+        _model, public_agent = make_model_and_agent(tools=[apply_patch_tool])
+        raw_item = cast(Any, make_apply_patch_dict("call_apply_reject_public"))
+        processed_response.apply_patch_calls = [
+            ToolRunApplyPatchCall(tool_call=raw_item, apply_patch_tool=apply_patch_tool)
+        ]
+        tool_name = apply_patch_tool.name
+
+    execution_agent = public_agent.clone()
+    set_public_agent(execution_agent, public_agent)
+    approval_item = ToolApprovalItem(agent=public_agent, raw_item=raw_item, tool_name=tool_name)
+    context_wrapper.reject_tool(approval_item)
+
+    result = await _resolve_interrupted_turn(
+        agent=execution_agent,
+        original_input="resume rejection",
+        original_pre_step_items=[],
+        new_response=ModelResponse(output=[], usage=Usage(), response_id="resp"),
+        processed_response=processed_response,
+        hooks=RunHooks(),
+        context_wrapper=context_wrapper,
+        run_config=RunConfig(),
+        run_state=make_state_with_interruptions(public_agent, [approval_item]),
+    )
+
+    rejection_outputs = [
+        item
+        for item in result.new_step_items
+        if isinstance(item, ToolCallOutputItem) and item.output == HITL_REJECTION_MSG
+    ]
+    assert rejection_outputs
+    assert all(item.agent is public_agent for item in rejection_outputs)
 
 
 @pytest.mark.asyncio
@@ -1437,7 +1849,7 @@ async def test_resume_keeps_unmatched_pending_approvals_with_function_runs() -> 
         interruptions=[],
     )
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume approvals",
         original_pre_step_items=[],
@@ -1477,7 +1889,7 @@ async def test_resume_executes_non_hitl_function_calls_without_output() -> None:
         interruptions=[],
     )
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume run",
         original_pre_step_items=[],
@@ -1538,7 +1950,7 @@ async def test_resume_skips_non_hitl_function_calls_with_existing_output() -> No
         )
     ]
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume run",
         original_pre_step_items=original_pre_step_items,
@@ -1593,7 +2005,7 @@ async def test_resume_skips_shell_calls_with_existing_output() -> None:
         )
     ]
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume shell",
         original_pre_step_items=cast(list[RunItem], original_pre_step_items),
@@ -1653,7 +2065,7 @@ async def test_resume_keeps_approved_shell_outputs_with_pending_interruptions() 
         interruptions=[],
     )
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume shell with pending approval",
         original_pre_step_items=[],
@@ -1709,7 +2121,7 @@ async def test_resume_executes_pending_computer_actions() -> None:
         interruptions=[],
     )
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume computer",
         original_pre_step_items=[],
@@ -1777,7 +2189,7 @@ async def test_resume_skips_computer_actions_with_existing_output() -> None:
         )
     ]
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume computer existing",
         original_pre_step_items=cast(list[RunItem], original_pre_step_items),
@@ -1840,7 +2252,7 @@ async def test_rebuild_function_runs_handles_pending_and_rejections() -> None:
         interruptions=[],
     )
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume approvals",
         original_pre_step_items=[],
@@ -1910,7 +2322,7 @@ async def test_rebuild_preserves_unmatched_pending_approvals(
         interruptions=[],
     )
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume approvals",
         original_pre_step_items=[],
@@ -1957,7 +2369,7 @@ async def test_rejected_shell_calls_emit_rejection_output() -> None:
         interruptions=[],
     )
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume shell rejection",
         original_pre_step_items=[],
@@ -2041,7 +2453,7 @@ async def test_rejected_shell_calls_with_existing_output_are_not_duplicated() ->
         )
     ]
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="resume shell rejection existing",
         original_pre_step_items=cast(list[RunItem], original_pre_step_items),
@@ -2101,7 +2513,7 @@ async def test_mcp_callback_approvals_are_processed() -> None:
         interruptions=[],
     )
 
-    result = await run_loop.resolve_interrupted_turn(
+    result = await _resolve_interrupted_turn(
         agent=agent,
         original_input="handle mcp",
         original_pre_step_items=[],

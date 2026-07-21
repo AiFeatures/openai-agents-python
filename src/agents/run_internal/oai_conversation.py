@@ -83,6 +83,39 @@ def _is_tool_search_item(item: Any) -> bool:
     return item_type in {"tool_search_call", "tool_search_output"}
 
 
+def _extract_call_id(item: Any) -> str | None:
+    """Return a tool call id from mapping or object payloads."""
+    call_id = item.get("call_id") if isinstance(item, dict) else getattr(item, "call_id", None)
+    return call_id if isinstance(call_id, str) else None
+
+
+def _has_output_payload(item: Any) -> bool:
+    """Return True when an item carries a local tool output payload."""
+    return (isinstance(item, dict) and "output" in item) or hasattr(item, "output")
+
+
+def _is_tracked_object(items: Sequence[Any], candidate: Any) -> bool:
+    """Return True when the exact object instance is already tracked."""
+    return any(item is candidate for item in items)
+
+
+def _track_object_once(items: list[Any], candidate: Any) -> None:
+    """Track an object instance once, keeping it alive while identity dedupe is needed."""
+    if not _is_tracked_object(items, candidate):
+        items.append(candidate)
+
+
+def _untrack_object(items: list[Any], candidate: Any) -> None:
+    """Remove an object instance from an identity-tracking list."""
+    for index, item in enumerate(items):
+        if item is candidate:
+            items.pop(index)
+            return
+
+
+_PreparedItemSource = tuple[TResponseInputItem, TResponseInputItem]
+
+
 @dataclass
 class OpenAIServerConversationTracker:
     """Track server-side conversation state for conversation-aware runs.
@@ -101,9 +134,10 @@ class OpenAIServerConversationTracker:
     previous_response_id: str | None = None
     auto_previous_response_id: bool = False
 
-    # In-process object identity for items that have already been delivered or acknowledged.
-    sent_items: set[int] = field(default_factory=set)
-    server_items: set[int] = field(default_factory=set)
+    # In-process object identity for delivered or acknowledged items. Keep object references
+    # instead of id(obj) integers so a later allocation cannot reuse a stale address.
+    sent_items: list[Any] = field(default_factory=list)
+    server_items: list[Any] = field(default_factory=list)
 
     # Stable provider identifiers returned by the Responses API.
     server_item_ids: set[str] = field(default_factory=set)
@@ -120,7 +154,8 @@ class OpenAIServerConversationTracker:
 
     # Mapping from normalized prepared items back to their original source objects so that
     # mark_input_as_sent() can mark the right object identities after the model call succeeds.
-    prepared_item_sources: dict[int, TResponseInputItem] = field(default_factory=dict)
+    # Keep the prepared item alive so its object ID cannot be reused before the input is marked.
+    prepared_item_sources: dict[int, _PreparedItemSource] = field(default_factory=dict)
     prepared_item_sources_by_fingerprint: dict[str, list[TResponseInputItem]] = field(
         default_factory=dict
     )
@@ -140,6 +175,7 @@ class OpenAIServerConversationTracker:
         generated_items: list[RunItem],
         model_responses: list[ModelResponse],
         session_items: list[TResponseInputItem] | None = None,
+        unsent_tool_call_ids: set[str] | None = None,
     ) -> None:
         """Seed tracking from prior state so resumed runs do not replay already-sent content.
 
@@ -150,6 +186,7 @@ class OpenAIServerConversationTracker:
         """
         if self.sent_initial_input:
             return
+        unsent_tool_call_ids = unsent_tool_call_ids or set()
 
         normalized_input = original_input
         if isinstance(original_input, list):
@@ -176,12 +213,18 @@ class OpenAIServerConversationTracker:
         self.sent_initial_input = True
         self.remaining_initial_input = None
 
-        latest_response = model_responses[-1] if model_responses else None
+        # Pick the most recent response that actually carries an id; live runs preserve the
+        # last-known id via track_server_items, so resume must mirror that behavior instead of
+        # blindly using model_responses[-1] (which may have response_id=None for non-Responses
+        # providers and would silently break the chain).
+        latest_response_id: str | None = None
         for response in model_responses:
+            if response.response_id is not None:
+                latest_response_id = response.response_id
             for output_item in response.output:
                 if output_item is None:
                     continue
-                self.server_items.add(id(output_item))
+                _track_object_once(self.server_items, output_item)
                 item_id = _normalize_server_item_id(
                     output_item.get("id")
                     if isinstance(output_item, dict)
@@ -189,18 +232,13 @@ class OpenAIServerConversationTracker:
                 )
                 if item_id is not None:
                     self.server_item_ids.add(item_id)
-                call_id = (
-                    output_item.get("call_id")
-                    if isinstance(output_item, dict)
-                    else getattr(output_item, "call_id", None)
-                )
-                has_output_payload = isinstance(output_item, dict) and "output" in output_item
-                has_output_payload = has_output_payload or hasattr(output_item, "output")
+                call_id = _extract_call_id(output_item)
+                has_output_payload = _has_output_payload(output_item)
                 if isinstance(call_id, str) and has_output_payload:
                     self.server_tool_call_ids.add(call_id)
 
-        if self.conversation_id is None and latest_response and latest_response.response_id:
-            self.previous_response_id = latest_response.response_id
+        if self.conversation_id is None and latest_response_id is not None:
+            self.previous_response_id = latest_response_id
 
         if session_items:
             for item in session_items:
@@ -209,13 +247,8 @@ class OpenAIServerConversationTracker:
                 )
                 if item_id is not None:
                     self.server_item_ids.add(item_id)
-                call_id = (
-                    item.get("call_id")
-                    if isinstance(item, dict)
-                    else getattr(item, "call_id", None)
-                )
-                has_output = isinstance(item, dict) and "output" in item
-                has_output = has_output or hasattr(item, "output")
+                call_id = _extract_call_id(item)
+                has_output = _has_output_payload(item)
                 if isinstance(call_id, str) and has_output:
                     self.server_tool_call_ids.add(call_id)
                 fp = _fingerprint_for_tracker(item)
@@ -237,10 +270,15 @@ class OpenAIServerConversationTracker:
 
             if isinstance(raw_item, dict):
                 item_id = _normalize_server_item_id(raw_item.get("id"))
-                call_id = raw_item.get("call_id")
-                has_output_payload = "output" in raw_item
-                has_output_payload = has_output_payload or hasattr(raw_item, "output")
+                call_id = _extract_call_id(raw_item)
+                has_output_payload = _has_output_payload(raw_item)
                 has_call_id = isinstance(call_id, str)
+                if (
+                    isinstance(call_id, str)
+                    and has_output_payload
+                    and call_id in unsent_tool_call_ids
+                ):
+                    continue
                 should_mark = (
                     item_id is not None
                     or (has_call_id and (has_output_payload or is_tool_call_item))
@@ -249,8 +287,7 @@ class OpenAIServerConversationTracker:
                 if not should_mark:
                     continue
 
-                raw_item_id = id(raw_item)
-                self.sent_items.add(raw_item_id)
+                _track_object_once(self.sent_items, raw_item)
                 fp = _fingerprint_for_tracker(raw_item)
                 if fp:
                     self.sent_item_fingerprints.add(fp)
@@ -266,9 +303,15 @@ class OpenAIServerConversationTracker:
                     self.server_tool_call_ids.add(call_id)
             else:
                 item_id = _normalize_server_item_id(getattr(raw_item, "id", None))
-                call_id = getattr(raw_item, "call_id", None)
-                has_output_payload = hasattr(raw_item, "output")
+                call_id = _extract_call_id(raw_item)
+                has_output_payload = _has_output_payload(raw_item)
                 has_call_id = isinstance(call_id, str)
+                if (
+                    isinstance(call_id, str)
+                    and has_output_payload
+                    and call_id in unsent_tool_call_ids
+                ):
+                    continue
                 should_mark = (
                     item_id is not None
                     or (has_call_id and (has_output_payload or is_tool_call_item))
@@ -277,7 +320,7 @@ class OpenAIServerConversationTracker:
                 if not should_mark:
                     continue
 
-                self.sent_items.add(id(raw_item))
+                _track_object_once(self.sent_items, raw_item)
                 fp = _fingerprint_for_tracker(raw_item)
                 if fp:
                     self.sent_item_fingerprints.add(fp)
@@ -301,7 +344,7 @@ class OpenAIServerConversationTracker:
         for output_item in model_response.output:
             if output_item is None:
                 continue
-            self.server_items.add(id(output_item))
+            _track_object_once(self.server_items, output_item)
             item_id = _normalize_server_item_id(
                 output_item.get("id")
                 if isinstance(output_item, dict)
@@ -309,13 +352,8 @@ class OpenAIServerConversationTracker:
             )
             if item_id is not None:
                 self.server_item_ids.add(item_id)
-            call_id = (
-                output_item.get("call_id")
-                if isinstance(output_item, dict)
-                else getattr(output_item, "call_id", None)
-            )
-            has_output_payload = isinstance(output_item, dict) and "output" in output_item
-            has_output_payload = has_output_payload or hasattr(output_item, "output")
+            call_id = _extract_call_id(output_item)
+            has_output_payload = _has_output_payload(output_item)
             if isinstance(call_id, str) and has_output_payload:
                 self.server_tool_call_ids.add(call_id)
             fp = _fingerprint_for_tracker(output_item)
@@ -346,17 +384,16 @@ class OpenAIServerConversationTracker:
         if not items:
             return
 
-        delivered_source_ids: set[int] = set()
+        delivered_sources: list[TResponseInputItem] = []
         delivered_by_content: set[str] = set()
         for item in items:
             if item is None:
                 continue
             source_item = self._consume_prepared_item_source(item)
-            source_item_id = id(source_item)
-            if source_item_id in delivered_source_ids:
+            if _is_tracked_object(delivered_sources, source_item):
                 continue
-            delivered_source_ids.add(source_item_id)
-            self.sent_items.add(source_item_id)
+            delivered_sources.append(source_item)
+            _track_object_once(self.sent_items, source_item)
             fp = _fingerprint_for_tracker(source_item)
             if fp:
                 delivered_by_content.add(fp)
@@ -367,7 +404,7 @@ class OpenAIServerConversationTracker:
 
         remaining: list[TResponseInputItem] = []
         for pending in self.remaining_initial_input:
-            if id(pending) in delivered_source_ids:
+            if _is_tracked_object(delivered_sources, pending):
                 continue
             pending_fp = _fingerprint_for_tracker(pending)
             if pending_fp and pending_fp in delivered_by_content:
@@ -387,7 +424,7 @@ class OpenAIServerConversationTracker:
                 continue
             source_item = self._consume_prepared_item_source(item)
             rewind_items.append(source_item)
-            self.sent_items.discard(id(source_item))
+            _untrack_object(self.sent_items, source_item)
             fp = _fingerprint_for_tracker(source_item)
             if fp:
                 self.sent_item_fingerprints.discard(fp)
@@ -405,7 +442,12 @@ class OpenAIServerConversationTracker:
         generated_items: list[RunItem],
     ) -> list[TResponseInputItem]:
         """Assemble the next model input while skipping duplicates and approvals."""
-        input_items: list[TResponseInputItem] = []
+        self.prepared_item_sources.clear()
+        self.prepared_item_sources_by_fingerprint.clear()
+
+        prepared_initial_items: list[TResponseInputItem] = []
+        prepared_generated_items: list[TResponseInputItem] = []
+        generated_item_sources: dict[int, TResponseInputItem] = {}
 
         if not self.sent_initial_input:
             initial_items = ItemHelpers.input_to_new_input_list(original_input)
@@ -414,7 +456,7 @@ class OpenAIServerConversationTracker:
                 self._register_prepared_item_source(item)
             filtered_initials = []
             for item in initial_items:
-                if item is None or isinstance(item, (str, bytes)):
+                if item is None or isinstance(item, str | bytes):
                     continue
                 filtered_initials.append(item)
             self.remaining_initial_input = filtered_initials or None
@@ -439,13 +481,8 @@ class OpenAIServerConversationTracker:
             if item_id is not None and item_id in self.server_item_ids:
                 continue
 
-            call_id = (
-                raw_item.get("call_id")
-                if isinstance(raw_item, dict)
-                else getattr(raw_item, "call_id", None)
-            )
-            has_output_payload = isinstance(raw_item, dict) and "output" in raw_item
-            has_output_payload = has_output_payload or hasattr(raw_item, "output")
+            call_id = _extract_call_id(raw_item)
+            has_output_payload = _has_output_payload(raw_item)
             if (
                 isinstance(call_id, str)
                 and has_output_payload
@@ -453,8 +490,9 @@ class OpenAIServerConversationTracker:
             ):
                 continue
 
-            raw_item_id = id(raw_item)
-            if raw_item_id in self.sent_items or raw_item_id in self.server_items:
+            if _is_tracked_object(self.sent_items, raw_item) or _is_tracked_object(
+                self.server_items, raw_item
+            ):
                 continue
 
             converted_input_item = run_item_to_input_item(run_item, self.reasoning_item_id_policy)
@@ -488,46 +526,33 @@ class OpenAIServerConversationTracker:
     ) -> None:
         if source_item is None:
             source_item = prepared_item
-        self.prepared_item_sources[id(prepared_item)] = source_item
+        self.prepared_item_sources[id(prepared_item)] = (prepared_item, source_item)
         fingerprint = _fingerprint_for_tracker(prepared_item)
         if fingerprint:
             self.prepared_item_sources_by_fingerprint.setdefault(fingerprint, []).append(
                 source_item
             )
 
-    def _resolve_prepared_item_source(self, item: TResponseInputItem) -> TResponseInputItem:
-        source_item = self.prepared_item_sources.get(id(item))
-        if source_item is not None:
-            return source_item
-
-        fingerprint = _fingerprint_for_tracker(item)
-        if not fingerprint:
-            return item
-
-        source_items = self.prepared_item_sources_by_fingerprint.get(fingerprint)
-        if not source_items:
-            return item
-        return source_items[0]
-
     def _consume_prepared_item_source(self, item: TResponseInputItem) -> TResponseInputItem:
-        source_item = self._resolve_prepared_item_source(item)
-        direct_source = self.prepared_item_sources.pop(id(item), None)
+        direct_entry = self.prepared_item_sources.get(id(item))
+        direct_source = None
+        if direct_entry is not None and direct_entry[0] is item:
+            self.prepared_item_sources.pop(id(item), None)
+            direct_source = direct_entry[1]
 
         fingerprint = _fingerprint_for_tracker(item)
         if not fingerprint:
-            return source_item
+            return direct_source if direct_source is not None else item
 
         source_items = self.prepared_item_sources_by_fingerprint.get(fingerprint)
         if not source_items:
-            return source_item
+            return direct_source if direct_source is not None else item
 
-        target_source = direct_source if direct_source is not None else source_item
+        source_item = direct_source if direct_source is not None else source_items[0]
         for index, candidate in enumerate(source_items):
-            if candidate is target_source:
+            if candidate is source_item:
                 source_items.pop(index)
                 break
-        else:
-            source_items.pop(0)
 
         if not source_items:
             self.prepared_item_sources_by_fingerprint.pop(fingerprint, None)

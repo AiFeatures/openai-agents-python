@@ -6,7 +6,7 @@ import logging
 import sqlite3
 from contextlib import closing
 from pathlib import Path
-from typing import Any, Union, cast
+from typing import Any, cast
 
 from agents.result import RunResult
 from agents.usage import Usage
@@ -15,6 +15,20 @@ from ..._tool_identity import is_reserved_synthetic_tool_namespace, tool_qualifi
 from ...items import TResponseInputItem
 from ...memory import SQLiteSession
 from ...memory.session_settings import SessionSettings, resolve_session_limit
+
+
+def _content_preview(content: Any, max_length: int | None = None) -> str:
+    """Return a string preview of a stored user-message ``content``.
+
+    User-message ``content`` may be a plain string or a list of structured parts
+    (for example multimodal ``input_text``/``input_image`` items). Both shapes are
+    coerced to a string so callers always receive the documented preview type, then
+    truncated to ``max_length`` characters when a limit is provided.
+    """
+    text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+    if max_length is not None and len(text) > max_length:
+        return text[:max_length] + "..."
+    return text
 
 
 class AdvancedSQLiteSession(SQLiteSession):
@@ -48,7 +62,27 @@ class AdvancedSQLiteSession(SQLiteSession):
         if create_tables:
             self._init_structure_tables()
         self._current_branch_id = "main"
+        # Bumped (under the connection lock) whenever clear_session() wipes the
+        # session. switch_to_branch / create_branch_from_turn capture the
+        # generation before their DB work and only update the branch pointer if
+        # no clear has committed since, so a stale switch/create cannot resurrect
+        # a branch that clear already removed.
+        self._generation = 0
         self._logger = logger or logging.getLogger(__name__)
+
+    def _commit_branch_pointer(self, branch_id: str, generation: int) -> bool:
+        """Set the current-branch pointer unless a clear has committed meanwhile.
+
+        Acquires the connection lock so the generation check and the assignment
+        are atomic with clear_session's reset. Returns True if the pointer was
+        updated, False if a clear_session committed after ``generation`` was
+        captured (in which case its reset to 'main' wins).
+        """
+        with self._lock:
+            if self._generation != generation:
+                return False
+            self._current_branch_id = branch_id
+            return True
 
     def _init_structure_tables(self):
         """Add structure and usage tracking tables.
@@ -133,26 +167,15 @@ class AdvancedSQLiteSession(SQLiteSession):
         def _add_items_sync():
             """Synchronous helper to add items and structure metadata together."""
             with self._locked_connection() as conn:
-                # Keep both writes in one critical section so message IDs and metadata stay aligned.
-                self._insert_items(conn, items)
-                conn.commit()
                 try:
+                    # Keep both writes in one transaction so metadata failures do not leave orphans.
+                    self._insert_items(conn, items)
                     self._insert_structure_metadata(conn, items)
                     conn.commit()
-                except Exception as e:
+                except Exception:
                     conn.rollback()
-                    self._logger.error(
-                        f"Failed to add structure metadata for session {self.session_id}: {e}"
-                    )
-                    try:
-                        deleted_count = self._cleanup_orphaned_messages_sync(conn)
-                        if deleted_count:
-                            conn.commit()
-                        else:
-                            conn.rollback()
-                    except Exception as cleanup_error:
-                        conn.rollback()
-                        self._logger.error(f"Failed to cleanup orphaned messages: {cleanup_error}")
+                    self._logger.exception("Failed to add items for session %s", self.session_id)
+                    raise
 
         await asyncio.to_thread(_add_items_sync)
 
@@ -263,6 +286,154 @@ class AdvancedSQLiteSession(SQLiteSession):
 
         return await asyncio.to_thread(_get_items_sync)
 
+    async def pop_item(self) -> TResponseInputItem | None:
+        """Remove and return the most recent item from the current branch.
+
+        Overrides the base implementation so the popped message's
+        `message_structure` row is removed in the same transaction and only the
+        current branch is affected. The underlying message row is deleted only
+        when no other branch still references it, mirroring `delete_branch`. When
+        popping empties a turn on the current branch, its `turn_usage` row is
+        removed as well so usage analytics do not report a turn that no longer
+        exists.
+        """
+
+        # Snapshot the current branch at call time so a concurrent
+        # switch_to_branch() cannot redirect this pop to a different branch once
+        # it has been dispatched to the worker thread.
+        branch_id = self._current_branch_id
+
+        def _pop_item_sync():
+            with self._locked_connection() as conn:
+                while True:
+                    with closing(conn.cursor()) as cursor:
+                        # Find the most recent item on the snapshotted branch.
+                        cursor.execute(
+                            """
+                            SELECT id, message_id, user_turn_number FROM message_structure
+                            WHERE session_id = ? AND branch_id = ?
+                            ORDER BY sequence_number DESC
+                            LIMIT 1
+                            """,
+                            (self.session_id, branch_id),
+                        )
+                        row = cursor.fetchone()
+                        if row is None:
+                            return None
+
+                        structure_id, message_id, user_turn_number = row
+
+                        # Read the message payload before removing anything.
+                        cursor.execute(
+                            f"SELECT message_data FROM {self.messages_table} WHERE id = ?",
+                            (message_id,),
+                        )
+                        message_row = cursor.fetchone()
+
+                        try:
+                            # Remove the structure row for this branch, then drop
+                            # the underlying message only if no other branch
+                            # references it.
+                            cursor.execute(
+                                "DELETE FROM message_structure WHERE id = ?",
+                                (structure_id,),
+                            )
+                            self._cleanup_orphaned_messages_sync(conn)
+
+                            # If this was the last item of the turn on this
+                            # branch, drop the now-stale turn_usage row for it.
+                            if user_turn_number is not None:
+                                cursor.execute(
+                                    """
+                                    SELECT COUNT(*) FROM message_structure
+                                    WHERE session_id = ? AND branch_id = ?
+                                    AND user_turn_number = ?
+                                    """,
+                                    (self.session_id, branch_id, user_turn_number),
+                                )
+                                if cursor.fetchone()[0] == 0:
+                                    cursor.execute(
+                                        """
+                                        DELETE FROM turn_usage
+                                        WHERE session_id = ? AND branch_id = ?
+                                        AND user_turn_number = ?
+                                        """,
+                                        (self.session_id, branch_id, user_turn_number),
+                                    )
+
+                            conn.commit()
+                        except Exception:
+                            # _locked_connection() does not manage transactions;
+                            # roll back explicitly so a failure partway through
+                            # this delete sequence never leaves a partial
+                            # mutation or an open transaction for a later
+                            # operation on this connection to inherit.
+                            conn.rollback()
+                            raise
+
+                        if message_row is None:
+                            # Structure row pointed at a missing message; keep looking.
+                            continue
+
+                        try:
+                            return json.loads(message_row[0])
+                        except (json.JSONDecodeError, TypeError):
+                            # Drop corrupted JSON entries and keep looking for a valid item.
+                            continue
+
+        return await asyncio.to_thread(_pop_item_sync)
+
+    async def clear_session(self) -> None:
+        """Clear all items for this session.
+
+        Overrides the base implementation so the `message_structure` and
+        `turn_usage` metadata tables are cleared in the same transaction. Those
+        rows declare an `ON DELETE CASCADE` foreign key, but SQLite does not
+        enforce foreign keys unless `PRAGMA foreign_keys=ON` is set, so they must
+        be deleted explicitly to avoid leaking stale structure and usage data.
+        """
+
+        def _clear_session_sync():
+            with self._locked_connection() as conn:
+                try:
+                    conn.execute(
+                        f"DELETE FROM {self.messages_table} WHERE session_id = ?",
+                        (self.session_id,),
+                    )
+                    conn.execute(
+                        f"DELETE FROM {self.sessions_table} WHERE session_id = ?",
+                        (self.session_id,),
+                    )
+                    conn.execute(
+                        "DELETE FROM message_structure WHERE session_id = ?",
+                        (self.session_id,),
+                    )
+                    conn.execute(
+                        "DELETE FROM turn_usage WHERE session_id = ?",
+                        (self.session_id,),
+                    )
+                    conn.commit()
+                except Exception:
+                    # _locked_connection() does not manage transactions; roll
+                    # back explicitly so a failure partway through this delete
+                    # sequence never leaves a partial mutation or an open
+                    # transaction for a later operation on this connection to
+                    # inherit. The in-memory branch state below is only updated
+                    # after a successful commit, so it stays consistent with it.
+                    conn.rollback()
+                    raise
+                # All branches were removed, so reset the in-memory pointer to
+                # 'main' while still holding the lock. Doing this inside the
+                # locked operation keeps the reset atomic with the clear, so no
+                # other locked operation observes the session as cleared while
+                # the pointer still references a deleted branch. Bumping the
+                # generation invalidates any in-flight switch/create that
+                # captured the pre-clear generation.
+                self._generation += 1
+                self._current_branch_id = "main"
+
+        await asyncio.to_thread(_clear_session_sync)
+
     async def store_run_usage(self, result: RunResult) -> None:
         """Store usage data for the current conversation turn.
 
@@ -274,12 +445,55 @@ class AdvancedSQLiteSession(SQLiteSession):
         """
         try:
             if result.context_wrapper.usage is not None:
-                # Get the current turn number for this branch
-                current_turn = self._get_current_turn_number()
+                # Capture the current turn together with an anchor that pins the
+                # exact turn incarnation: the id of its first message_structure
+                # row (ids are monotonic and never reused). If that turn is
+                # removed before the write commits — even if a new turn later
+                # reuses the same numeric id — the anchor row is gone and the
+                # write is skipped. The anchor is scoped to this branch/turn, so
+                # unrelated removals (e.g. delete_branch on another branch) do
+                # not drop this write.
+                current_turn, branch_id, turn_anchor = self._capture_current_turn()
                 # Only update turn-level usage - session usage is aggregated on demand
-                await self._update_turn_usage_internal(current_turn, result.context_wrapper.usage)
+                await self._update_turn_usage_internal(
+                    current_turn,
+                    result.context_wrapper.usage,
+                    branch_id=branch_id,
+                    turn_anchor=turn_anchor,
+                )
         except Exception as e:
-            self._logger.error(f"Failed to store usage for session {self.session_id}: {e}")
+            self._logger.error("Failed to store usage for session %s: %s", self.session_id, e)
+
+    def _capture_current_turn(self) -> tuple[int, str, int | None]:
+        """Return (current_turn, branch_id, turn_anchor) in one locked read.
+
+        ``turn_anchor`` is the smallest ``message_structure.id`` of the current
+        turn on the current branch (``None`` if the turn has no rows). Because
+        ids are monotonic and never reused, it uniquely identifies this turn
+        incarnation, so a later pop+recreate that reuses the numeric turn id
+        yields a different anchor.
+        """
+        with self._locked_connection() as conn:
+            with closing(conn.cursor()) as cursor:
+                branch_id = self._current_branch_id
+                cursor.execute(
+                    """
+                    SELECT COALESCE(MAX(user_turn_number), 0)
+                    FROM message_structure
+                    WHERE session_id = ? AND branch_id = ?
+                    """,
+                    (self.session_id, branch_id),
+                )
+                current_turn = cursor.fetchone()[0]
+                cursor.execute(
+                    """
+                    SELECT MIN(id) FROM message_structure
+                    WHERE session_id = ? AND branch_id = ? AND user_turn_number = ?
+                    """,
+                    (self.session_id, branch_id, current_turn),
+                )
+                turn_anchor = cursor.fetchone()[0]
+                return current_turn, branch_id, turn_anchor
 
     def _get_next_turn_number(self, branch_id: str) -> int:
         """Get the next turn number for a specific branch.
@@ -367,16 +581,16 @@ class AdvancedSQLiteSession(SQLiteSession):
 
         try:
             await asyncio.to_thread(_add_structure_sync)
-        except Exception as e:
-            self._logger.error(
-                f"Failed to add structure metadata for session {self.session_id}: {e}"
+        except Exception:
+            self._logger.exception(
+                "Failed to add structure metadata for session %s", self.session_id
             )
-            # Try to clean up any orphaned messages to maintain consistency
+            # Try to clean up any orphaned messages to maintain consistency.
             try:
                 await self._cleanup_orphaned_messages()
-            except Exception as cleanup_error:
-                self._logger.error(f"Failed to cleanup orphaned messages: {cleanup_error}")
-            # Don't re-raise - structure metadata is supplementary
+            except Exception:
+                self._logger.exception("Failed to cleanup orphaned messages")
+            raise
 
     def _insert_structure_metadata(
         self,
@@ -430,7 +644,7 @@ class AdvancedSQLiteSession(SQLiteSession):
         structure_data = []
         user_message_count = 0
 
-        for i, (item, msg_id) in enumerate(zip(items, message_ids)):
+        for i, (item, msg_id) in enumerate(zip(items, message_ids, strict=False)):
             msg_type = self._classify_message_type(item)
             tool_name = self._extract_tool_name(item)
 
@@ -469,8 +683,8 @@ class AdvancedSQLiteSession(SQLiteSession):
     async def _cleanup_orphaned_messages(self) -> int:
         """Remove messages that exist in the configured message table but not in message_structure.
 
-        This can happen if _add_structure_metadata fails after super().add_items() succeeds.
-        Used for maintaining data consistency.
+        This can happen for rows written by older or non-atomic structure metadata paths.
+        `add_items()` writes message rows and structure metadata in a single transaction.
         """
 
         def _cleanup_sync():
@@ -487,30 +701,22 @@ class AdvancedSQLiteSession(SQLiteSession):
 
     def _cleanup_orphaned_messages_sync(self, conn: sqlite3.Connection) -> int:
         with closing(conn.cursor()) as cursor:
-            # Find messages without structure metadata.
             cursor.execute(
                 f"""
-                SELECT am.id
-                FROM {self.messages_table} am
-                LEFT JOIN message_structure ms ON am.id = ms.message_id
-                WHERE am.session_id = ? AND ms.message_id IS NULL
-            """,
-                (self.session_id,),
-            )
-
-            orphaned_ids = [row[0] for row in cursor.fetchall()]
-
-            if not orphaned_ids:
-                return 0
-
-            placeholders = ",".join("?" * len(orphaned_ids))
-            cursor.execute(
-                f"DELETE FROM {self.messages_table} WHERE id IN ({placeholders})",
-                orphaned_ids,
+                DELETE FROM {self.messages_table}
+                WHERE session_id = ?
+                AND id NOT IN (
+                    SELECT message_id
+                    FROM message_structure ms
+                    WHERE ms.session_id = ?
+                )
+                """,
+                (self.session_id, self.session_id),
             )
 
             deleted_count = cursor.rowcount
-            self._logger.info(f"Cleaned up {deleted_count} orphaned messages")
+            if deleted_count:
+                self._logger.info("Cleaned up %s orphaned messages", deleted_count)
             return deleted_count
 
     def _classify_message_type(self, item: TResponseInputItem) -> str:
@@ -613,6 +819,11 @@ class AdvancedSQLiteSession(SQLiteSession):
         """
         import time
 
+        # Capture the generation before any DB work so a clear that commits
+        # while this branch is being created cannot be overwritten by the
+        # pointer update below.
+        generation = self._generation
+
         # Validate the turn exists and contains a user message
         def _validate_turn():
             """Synchronous helper to validate turn exists and contains user message."""
@@ -653,12 +864,18 @@ class AdvancedSQLiteSession(SQLiteSession):
         # Copy messages before the branch point to the new branch
         await self._copy_messages_to_new_branch(branch_name, turn_number)
 
-        # Switch to new branch
+        # Switch to new branch under the lock; skipped if a clear_session has
+        # committed since `generation` was captured (its reset to 'main' wins),
+        # so we never point at a branch that clear removed.
         old_branch = self._current_branch_id
-        self._current_branch_id = branch_name
+        await asyncio.to_thread(self._commit_branch_pointer, branch_name, generation)
 
         self._logger.debug(
-            f"Created branch '{branch_name}' from turn {turn_number} ('{turn_content}') in '{old_branch}'"  # noqa: E501
+            "Created branch '%s' from turn %s ('%s') in '%s'",
+            branch_name,
+            turn_number,
+            turn_content,
+            old_branch,
         )
         return branch_name
 
@@ -695,6 +912,10 @@ class AdvancedSQLiteSession(SQLiteSession):
             ValueError: If the branch doesn't exist.
         """
 
+        # Capture the generation before validating so a clear that commits
+        # between validation and the pointer update is detected and skipped.
+        generation = self._generation
+
         # Validate branch exists
         def _validate_branch():
             """Synchronous helper to validate branch exists."""
@@ -715,8 +936,11 @@ class AdvancedSQLiteSession(SQLiteSession):
         await asyncio.to_thread(_validate_branch)
 
         old_branch = self._current_branch_id
-        self._current_branch_id = branch_id
-        self._logger.info(f"Switched from branch '{old_branch}' to '{branch_id}'")
+        # Update the pointer under the lock; a no-op if a clear_session has
+        # committed since `generation` was captured (its reset to 'main' wins).
+        switched = await asyncio.to_thread(self._commit_branch_pointer, branch_id, generation)
+        if switched:
+            self._logger.info("Switched from branch '%s' to '%s'", old_branch, branch_id)
 
     async def delete_branch(self, branch_id: str, force: bool = False) -> None:
         """Delete a branch and all its associated data.
@@ -786,14 +1010,22 @@ class AdvancedSQLiteSession(SQLiteSession):
 
                     structure_deleted = cursor.rowcount
 
+                    orphaned_messages_deleted = self._cleanup_orphaned_messages_sync(conn)
+
                     conn.commit()
 
-                    return usage_deleted, structure_deleted
+                    return usage_deleted, structure_deleted, orphaned_messages_deleted
 
-        usage_deleted, structure_deleted = await asyncio.to_thread(_delete_sync)
+        usage_deleted, structure_deleted, orphaned_messages_deleted = await asyncio.to_thread(
+            _delete_sync
+        )
 
         self._logger.info(
-            f"Deleted branch '{branch_id}': {structure_deleted} message entries, {usage_deleted} usage entries"  # noqa: E501
+            "Deleted branch '%s': %s message entries, %s usage entries, %s orphaned messages",
+            branch_id,
+            structure_deleted,
+            usage_deleted,
+            orphaned_messages_deleted,
         )
 
     async def list_branches(self) -> list[dict[str, Any]]:
@@ -970,9 +1202,7 @@ class AdvancedSQLiteSession(SQLiteSession):
                             turns.append(
                                 {
                                     "turn": turn_num,
-                                    "content": (
-                                        content[:100] + "..." if len(content) > 100 else content
-                                    ),
+                                    "content": _content_preview(content, 100),
                                     "full_content": content,
                                     "timestamp": created_at,
                                     "can_branch": True,
@@ -1028,7 +1258,7 @@ class AdvancedSQLiteSession(SQLiteSession):
                             matches.append(
                                 {
                                     "turn": turn_num,
-                                    "content": content,
+                                    "content": _content_preview(content),
                                     "full_content": content,
                                     "timestamp": created_at,
                                     "can_branch": True,
@@ -1193,7 +1423,7 @@ class AdvancedSQLiteSession(SQLiteSession):
 
         result = await asyncio.to_thread(_get_usage_sync)
 
-        return cast(Union[dict[str, int], None], result)
+        return cast(dict[str, int] | None, result)
 
     async def get_turn_usage(
         self,
@@ -1298,19 +1528,50 @@ class AdvancedSQLiteSession(SQLiteSession):
 
         result = await asyncio.to_thread(_get_turn_usage_sync)
 
-        return cast(Union[list[dict[str, Any]], dict[str, Any]], result)
+        return cast(list[dict[str, Any]] | dict[str, Any], result)
 
-    async def _update_turn_usage_internal(self, user_turn_number: int, usage_data: Usage) -> None:
+    async def _update_turn_usage_internal(
+        self,
+        user_turn_number: int,
+        usage_data: Usage,
+        branch_id: str | None = None,
+        turn_anchor: int | None = None,
+    ) -> None:
         """Internal method to update usage for a specific turn with full JSON details.
 
         Args:
             user_turn_number: The turn number to update usage for.
             usage_data: The usage data to store.
+            branch_id: The branch the turn was read from. Defaults to the current
+                branch when not provided.
+            turn_anchor: The id of the turn's first ``message_structure`` row,
+                captured when the turn was read. When provided, the write is
+                skipped unless that exact row still exists for the given
+                branch/turn, so usage is never recorded against a turn that was
+                removed — even if a new turn reused the same numeric id. Because
+                the check is scoped to this branch/turn, unrelated removals (e.g.
+                delete_branch on another branch) do not drop this write.
         """
+
+        target_branch = branch_id if branch_id is not None else self._current_branch_id
 
         def _update_sync():
             """Synchronous helper to update turn usage data."""
             with self._locked_connection() as conn:
+                if turn_anchor is not None:
+                    with closing(conn.cursor()) as guard_cursor:
+                        guard_cursor.execute(
+                            """
+                            SELECT 1 FROM message_structure
+                            WHERE session_id = ? AND branch_id = ?
+                            AND user_turn_number = ? AND id = ?
+                            """,
+                            (self.session_id, target_branch, user_turn_number, turn_anchor),
+                        )
+                        if guard_cursor.fetchone() is None:
+                            # The exact turn incarnation is gone (removed, or its
+                            # numeric id reused by a new turn); skip the stale write.
+                            return
                 # Serialize token details as JSON
                 input_details_json = None
                 output_details_json = None
@@ -1319,20 +1580,18 @@ class AdvancedSQLiteSession(SQLiteSession):
                     try:
                         input_details_json = json.dumps(usage_data.input_tokens_details.__dict__)
                     except (TypeError, ValueError) as e:
-                        self._logger.warning(f"Failed to serialize input tokens details: {e}")
+                        self._logger.warning("Failed to serialize input tokens details: %s", e)
                         input_details_json = None
 
-                    if (
-                        hasattr(usage_data, "output_tokens_details")
-                        and usage_data.output_tokens_details
-                    ):
-                        try:
-                            output_details_json = json.dumps(
-                                usage_data.output_tokens_details.__dict__
-                            )
-                        except (TypeError, ValueError) as e:
-                            self._logger.warning(f"Failed to serialize output tokens details: {e}")
-                            output_details_json = None
+                if (
+                    hasattr(usage_data, "output_tokens_details")
+                    and usage_data.output_tokens_details
+                ):
+                    try:
+                        output_details_json = json.dumps(usage_data.output_tokens_details.__dict__)
+                    except (TypeError, ValueError) as e:
+                        self._logger.warning("Failed to serialize output tokens details: %s", e)
+                        output_details_json = None
 
                 with closing(conn.cursor()) as cursor:
                     cursor.execute(
@@ -1344,7 +1603,7 @@ class AdvancedSQLiteSession(SQLiteSession):
                     """,  # noqa: E501
                         (
                             self.session_id,
-                            self._current_branch_id,
+                            target_branch,
                             user_turn_number,
                             usage_data.requests or 0,
                             usage_data.input_tokens or 0,

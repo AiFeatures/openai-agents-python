@@ -93,7 +93,7 @@ crm_tools = tool_namespace(
 
 agent = Agent(
     name="Operations assistant",
-    model="gpt-5.4",
+    model="gpt-5.6-sol",
     instructions="Load the crm namespace before using CRM tools.",
     tools=[*crm_tools, ToolSearchTool()],
 )
@@ -134,7 +134,7 @@ csv_skill: ShellToolSkillReference = {
 
 agent = Agent(
     name="Container shell agent",
-    model="gpt-5.4",
+    model="gpt-5.6-sol",
     instructions="Use the mounted skill when helpful.",
     tools=[
         ShellTool(
@@ -186,20 +186,20 @@ Local runtime tools require you to supply implementations:
 
 `ComputerTool` is still a local harness: you provide a [`Computer`][agents.computer.Computer] or [`AsyncComputer`][agents.computer.AsyncComputer] implementation, and the SDK maps that harness onto the OpenAI Responses API computer surface.
 
-For explicit [`gpt-5.4`](https://developers.openai.com/api/docs/models/gpt-5.4) requests, the SDK sends the GA built-in tool payload `{"type": "computer"}`. The older `computer-use-preview` model keeps the preview payload `{"type": "computer_use_preview", "environment": ..., "display_width": ..., "display_height": ...}`. This mirrors the platform migration described in OpenAI's [Computer use guide](https://developers.openai.com/api/docs/guides/tools-computer-use/):
+For explicit [`gpt-5.5`](https://developers.openai.com/api/docs/models/gpt-5.5) requests, the SDK sends the GA built-in tool payload `{"type": "computer"}`. The older `computer-use-preview` model keeps the preview payload `{"type": "computer_use_preview", "environment": ..., "display_width": ..., "display_height": ...}`. This mirrors the platform migration described in OpenAI's [Computer use guide](https://developers.openai.com/api/docs/guides/tools-computer-use/):
 
--   Model: `computer-use-preview` -> `gpt-5.4`
+-   Model: `computer-use-preview` -> `gpt-5.5`
 -   Tool selector: `computer_use_preview` -> `computer`
 -   Computer call shape: one `action` per `computer_call` -> batched `actions[]` on `computer_call`
 -   Truncation: `ModelSettings(truncation="auto")` required on the preview path -> not required on the GA path
 
-The SDK chooses that wire shape from the effective model on the actual Responses request. If you use a prompt template and the request omits `model` because the prompt owns it, the SDK keeps the preview-compatible computer payload unless you either keep `model="gpt-5.4"` explicit or force the GA selector with `ModelSettings(tool_choice="computer")` or `ModelSettings(tool_choice="computer_use")`.
+The SDK chooses that wire shape from the effective model on the actual Responses request. If you use a prompt template and the request omits `model` because the prompt owns it, the SDK keeps the preview-compatible computer payload unless you either keep `model="gpt-5.5"` explicit or force the GA selector with `ModelSettings(tool_choice="computer")` or `ModelSettings(tool_choice="computer_use")`.
 
 When a [`ComputerTool`][agents.tool.ComputerTool] is present, `tool_choice="computer"`, `"computer_use"`, and `"computer_use_preview"` are all accepted and normalized to the built-in selector that matches the effective request model. Without a `ComputerTool`, those strings still behave like ordinary function names.
 
 This distinction matters when `ComputerTool` is backed by a [`ComputerProvider`][agents.tool.ComputerProvider] factory. The GA `computer` payload does not need `environment` or dimensions at serialization time, so unresolved factories are fine. Preview-compatible serialization still needs a resolved `Computer` or `AsyncComputer` instance so the SDK can send `environment`, `display_width`, and `display_height`.
 
-At runtime, both paths still use the same local harness. Preview responses emit `computer_call` items with a single `action`; `gpt-5.4` can emit batched `actions[]`, and the SDK executes them in order before producing a `computer_call_output` screenshot item. See `examples/tools/computer_use.py` for a runnable Playwright-based harness.
+At runtime, both paths still use the same local harness. Preview responses emit `computer_call` items with a single `action`; `gpt-5.5` can emit batched `actions[]`, and the SDK executes them in order before producing a `computer_call_output` screenshot item. See `examples/tools/computer_use.py` for a runnable Playwright-based harness.
 
 ```python
 from agents import Agent, ApplyPatchTool, ShellTool
@@ -243,7 +243,7 @@ agent = Agent(
 
 ## Function tools
 
-You can use any Python function as a tool. The Agents SDK will setup the tool automatically:
+You can use any Python function as a tool. The Agents SDK will set up the tool automatically:
 
 -   The name of the tool will be the name of the Python function (or you can provide a name)
 -   Tool description will be taken from the docstring of the function (or you can provide a description)
@@ -462,7 +462,7 @@ You can set per-call timeouts for async function tools with `@function_tool(time
 
 ```python
 import asyncio
-from agents import Agent, Runner, function_tool
+from agents import Agent, function_tool
 
 
 @function_tool(timeout=2.0)
@@ -545,8 +545,9 @@ If you are manually creating a `FunctionTool` object, then you must handle error
 In some workflows, you may want a central agent to orchestrate a network of specialized agents, instead of handing off control. You can do this by modeling agents as tools.
 
 ```python
-from agents import Agent, Runner
 import asyncio
+
+from agents import Agent, Runner
 
 spanish_agent = Agent(
     name="Spanish agent",
@@ -561,7 +562,7 @@ french_agent = Agent(
 orchestrator_agent = Agent(
     name="orchestrator_agent",
     instructions=(
-        "You are a translation agent. You use the tools given to you to translate."
+        "You are a translation agent. You use the tools given to you to translate. "
         "If asked for multiple translations, you call the relevant tools."
     ),
     tools=[
@@ -579,11 +580,17 @@ orchestrator_agent = Agent(
 async def main():
     result = await Runner.run(orchestrator_agent, input="Say 'Hello, how are you?' in Spanish.")
     print(result.final_output)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
 ### Customizing tool-agents
 
-The `agent.as_tool` function is a convenience method to make it easy to turn an agent into a tool. It supports common runtime options such as `max_turns`, `run_config`, `hooks`, `previous_response_id`, `conversation_id`, `session`, and `needs_approval`. It also supports structured input with `parameters`, `input_builder`, and `include_input_schema`. For advanced orchestration (for example, conditional retries, fallback behavior, or chaining multiple agent calls), use `Runner.run` directly in your tool implementation:
+The `agent.as_tool` function is a convenience method to make it easy to turn an agent into a tool. It supports common runtime options such as `max_turns`, `run_config`, `hooks`, `previous_response_id`, `conversation_id`, `session`, and `needs_approval`. It also supports structured input with `parameters`, `input_builder`, and `include_input_schema`.
+
+The state options configure the nested agent run started by the tool call; the parent run's conversation state is not inherited automatically. To share client-managed history between the parent and nested runs, explicitly pass the same `session` to both. As with `Runner.run`, choose one state strategy for the nested run: a client-managed `session`, or server-managed continuation through `previous_response_id` or `conversation_id`.
 
 ```python
 @function_tool
@@ -663,10 +670,7 @@ json_tool = data_agent.as_tool(
 )
 ```
 
-Inside a custom extractor, the nested [`RunResult`][agents.result.RunResult] also exposes
-[`agent_tool_invocation`][agents.result.RunResultBase.agent_tool_invocation], which is useful when
-you need the outer tool name, call ID, or raw arguments while post-processing the nested result.
-See the [Results guide](results.md#agent-as-tool-metadata).
+Inside a custom extractor, the nested [`RunResult`][agents.result.RunResult] also exposes [`agent_tool_invocation`][agents.result.RunResultBase.agent_tool_invocation], which is useful when you need the outer tool name, call ID, or raw arguments while post-processing the nested result. See the [Results guide](results.md#agent-as-tool-metadata).
 
 ### Streaming nested agent runs
 
@@ -746,8 +750,8 @@ orchestrator = Agent(
 )
 
 async def main():
-    context = RunContextWrapper(LanguageContext(language_preference="french_spanish"))
-    result = await Runner.run(orchestrator, "How are you?", context=context.context)
+    context = LanguageContext(language_preference="french_spanish")
+    result = await Runner.run(orchestrator, "How are you?", context=context)
     print(result.final_output)
 
 asyncio.run(main())
@@ -784,7 +788,7 @@ agent = Agent(
             sandbox_mode="workspace-write",
             working_directory="/path/to/repo",
             default_thread_options=ThreadOptions(
-                model="gpt-5.4",
+                model="gpt-5.5",
                 model_reasoning_effort="low",
                 network_access_enabled=True,
                 web_search_mode="disabled",

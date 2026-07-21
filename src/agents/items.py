@@ -5,7 +5,7 @@ import json
 import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, Union, cast
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeAlias, TypeVar, cast
 
 import pydantic
 from openai.types.responses import (
@@ -45,20 +45,24 @@ from openai.types.responses.response_output_item import (
     McpApprovalRequest,
     McpCall,
     McpListTools,
+    Program,
+    ProgramOutput,
 )
 from openai.types.responses.response_reasoning_item import ResponseReasoningItem
 from pydantic import BaseModel
-from typing_extensions import TypeAlias, assert_never
+from typing_extensions import assert_never
 
 from ._tool_identity import FunctionToolLookupKey, get_function_tool_lookup_key, tool_trace_name
-from .exceptions import AgentsException, ModelBehaviorError
+from .exceptions import AgentsException, ModelBehaviorError, UserError
 from .logger import logger
 from .tool import (
+    ToolOrigin,
     ToolOutputFileContent,
     ToolOutputImage,
     ToolOutputText,
     ValidToolOutputPydanticModels,
     ValidToolOutputPydanticModelsTypeAdapter,
+    _is_programmatic_tool_call,
 )
 from .usage import Usage
 from .util._json import _to_dump_compatible
@@ -78,12 +82,13 @@ TResponseOutputItem = ResponseOutputItem
 TResponseStreamEvent = ResponseStreamEvent
 """A type alias for the ResponseStreamEvent type from the OpenAI SDK."""
 
-T = TypeVar("T", bound=Union[TResponseOutputItem, TResponseInputItem, dict[str, Any]])
+T = TypeVar("T", bound=TResponseOutputItem | TResponseInputItem | dict[str, Any])
 ToolSearchCallRawItem: TypeAlias = ResponseToolSearchCall | dict[str, Any]
 ToolSearchOutputRawItem: TypeAlias = ResponseToolSearchOutputItem | dict[str, Any]
 
 # Distinguish a missing dict entry from an explicit None value.
 _MISSING_ATTR_SENTINEL = object()
+_JSON_OUTPUT_ADAPTER = pydantic.TypeAdapter(Any)
 
 
 @dataclass
@@ -329,17 +334,18 @@ class HandoffOutputItem(RunItemBase[TResponseInputItem]):
             self.__dict__["target_agent"] = None
 
 
-ToolCallItemTypes: TypeAlias = Union[
-    ResponseFunctionToolCall,
-    ResponseComputerToolCall,
-    ResponseFileSearchToolCall,
-    ResponseFunctionWebSearch,
-    McpCall,
-    ResponseCodeInterpreterToolCall,
-    ImageGenerationCall,
-    LocalShellCall,
-    dict[str, Any],
-]
+ToolCallItemTypes: TypeAlias = (
+    ResponseFunctionToolCall
+    | ResponseComputerToolCall
+    | ResponseFileSearchToolCall
+    | ResponseFunctionWebSearch
+    | McpCall
+    | ResponseCodeInterpreterToolCall
+    | ImageGenerationCall
+    | LocalShellCall
+    | Program
+    | dict[str, Any]
+)
 """A type that represents a tool call item."""
 
 
@@ -358,14 +364,32 @@ class ToolCallItem(RunItemBase[Any]):
     title: str | None = None
     """Optional short display label if known at item creation time."""
 
+    tool_origin: ToolOrigin | None = None
+    """Optional metadata describing the source of a function-tool-backed item."""
 
-ToolCallOutputTypes: TypeAlias = Union[
-    FunctionCallOutput,
-    ComputerCallOutput,
-    LocalShellCallOutput,
-    ResponseFunctionShellToolCallOutput,
-    dict[str, Any],
-]
+    @property
+    def tool_name(self) -> str | None:
+        """Return the tool name from the raw item, if available."""
+        if isinstance(self.raw_item, dict):
+            return self.raw_item.get("name")
+        return getattr(self.raw_item, "name", None)
+
+    @property
+    def call_id(self) -> str | None:
+        """Return the call identifier from the raw item, if available."""
+        if isinstance(self.raw_item, dict):
+            return self.raw_item.get("call_id") or self.raw_item.get("id")
+        return getattr(self.raw_item, "call_id", None) or getattr(self.raw_item, "id", None)
+
+
+ToolCallOutputTypes: TypeAlias = (
+    FunctionCallOutput
+    | ComputerCallOutput
+    | LocalShellCallOutput
+    | ResponseFunctionShellToolCallOutput
+    | ProgramOutput
+    | dict[str, Any]
+)
 
 
 @dataclass
@@ -381,6 +405,24 @@ class ToolCallOutputItem(RunItemBase[Any]):
     """
 
     type: Literal["tool_call_output_item"] = "tool_call_output_item"
+
+    tool_origin: ToolOrigin | None = None
+    """Optional metadata describing the source of a function-tool-backed item."""
+
+    custom_data: dict[str, Any] | None = None
+    """SDK-only custom data attached to this tool output.
+
+    This data is not part of ``raw_item`` and is not sent back to the model when the output item is
+    replayed as input.
+    """
+
+    @property
+    def call_id(self) -> str | None:
+        """Return the call identifier from the raw item, if available."""
+        if isinstance(self.raw_item, dict):
+            cid = self.raw_item.get("call_id") or self.raw_item.get("id")
+            return str(cid) if cid is not None else None
+        return getattr(self.raw_item, "call_id", None) or getattr(self.raw_item, "id", None)
 
     def to_input_item(self) -> TResponseInputItem:
         """Converts the tool output into an input item for the next model turn.
@@ -464,13 +506,9 @@ class CompactionItem(RunItemBase[TResponseInputItem]):
 
 
 # Union type for tool approval raw items - supports function tools, hosted tools, shell tools, etc.
-ToolApprovalRawItem: TypeAlias = Union[
-    ResponseFunctionToolCall,
-    McpCall,
-    McpApprovalRequest,
-    LocalShellCall,
-    dict[str, Any],  # For flexibility with other tool types
-]
+ToolApprovalRawItem: TypeAlias = (
+    ResponseFunctionToolCall | McpCall | McpApprovalRequest | LocalShellCall | dict[str, Any]
+)
 
 
 @dataclass
@@ -492,6 +530,9 @@ class ToolApprovalItem(RunItemBase[Any]):
 
     tool_namespace: str | None = None
     """Optional Responses API namespace for function-tool approvals."""
+
+    tool_origin: ToolOrigin | None = None
+    """Optional metadata describing where the approved tool call came from."""
 
     tool_lookup_key: FunctionToolLookupKey | None = field(
         default=None,
@@ -601,21 +642,21 @@ class ToolApprovalItem(RunItemBase[Any]):
         )
 
 
-RunItem: TypeAlias = Union[
-    MessageOutputItem,
-    ToolSearchCallItem,
-    ToolSearchOutputItem,
-    HandoffCallItem,
-    HandoffOutputItem,
-    ToolCallItem,
-    ToolCallOutputItem,
-    ReasoningItem,
-    MCPListToolsItem,
-    MCPApprovalRequestItem,
-    MCPApprovalResponseItem,
-    CompactionItem,
-    ToolApprovalItem,
-]
+RunItem: TypeAlias = (
+    MessageOutputItem
+    | ToolSearchCallItem
+    | ToolSearchOutputItem
+    | HandoffCallItem
+    | HandoffOutputItem
+    | ToolCallItem
+    | ToolCallOutputItem
+    | ReasoningItem
+    | MCPListToolsItem
+    | MCPApprovalRequestItem
+    | MCPApprovalResponseItem
+    | CompactionItem
+    | ToolApprovalItem
+)
 """An item generated by an agent."""
 
 
@@ -656,8 +697,17 @@ class ItemHelpers:
             return ""
         last_content = message.content[-1]
         if isinstance(last_content, ResponseOutputText):
-            return last_content.text
+            # ``last_content.text`` is typed as ``str`` per the Responses API schema,
+            # but provider gateways (e.g. LiteLLM) and ``model_construct`` paths during
+            # streaming have been observed surfacing ``None``. Coerce so callers relying
+            # on the ``-> str`` return type don't see a ``None``. Same rationale as
+            # ``extract_text`` below.
+            return last_content.text or ""
         elif isinstance(last_content, ResponseOutputRefusal):
+            # Unlike output text, supported provider paths only create refusal parts after
+            # receiving refusal text. A ``None`` value requires bypassing model validation
+            # with ``model_construct``, so this intentionally does not mirror the fallback
+            # above.
             return last_content.refusal
         else:
             raise ModelBehaviorError(f"Unexpected content type: {type(last_content)}")
@@ -673,6 +723,39 @@ class ItemHelpers:
                 return last_content.text
 
         return None
+
+    @classmethod
+    def extract_text(cls, message: TResponseOutputItem) -> str | None:
+        """Extracts all text content from a message, if any. Ignores refusals."""
+        if not isinstance(message, ResponseOutputMessage):
+            return None
+
+        text = ""
+        for content_item in message.content:
+            if isinstance(content_item, ResponseOutputText):
+                # ``content_item.text`` is typed as ``str`` per the Responses
+                # API schema, but provider gateways (e.g. LiteLLM) and
+                # ``model_construct`` paths during streaming have been
+                # observed surfacing ``None``. Coerce so callers — including
+                # the SDK's own ``execute_tools_and_side_effects`` — don't
+                # crash with ``TypeError: can only concatenate str (not
+                # "NoneType") to str``.
+                text += content_item.text or ""
+
+        return text or None
+
+    @classmethod
+    def extract_refusal(cls, message: TResponseOutputItem) -> str | None:
+        """Extracts refusal content from a message, if any."""
+        if not isinstance(message, ResponseOutputMessage):
+            return None
+
+        refusal = ""
+        for content_item in message.content:
+            if isinstance(content_item, ResponseOutputRefusal):
+                refusal += content_item.refusal or ""
+
+        return refusal or None
 
     @classmethod
     def input_to_new_input_list(
@@ -703,12 +786,17 @@ class ItemHelpers:
         text = ""
         for item in message.raw_item.content:
             if isinstance(item, ResponseOutputText):
-                text += item.text
+                text += item.text or ""
         return text
 
     @classmethod
     def tool_call_output_item(
-        cls, tool_call: ResponseFunctionToolCall, output: Any
+        cls,
+        tool_call: ResponseFunctionToolCall,
+        output: Any,
+        *,
+        output_json_schema: dict[str, Any] | None = None,
+        output_type_adapter: pydantic.TypeAdapter[Any] | None = None,
     ) -> FunctionCallOutput:
         """Creates a tool call output item from a tool call and its output.
 
@@ -717,44 +805,133 @@ class ItemHelpers:
         provided as Pydantic models or dicts, or an iterable of such items.
         """
 
-        converted_output = cls._convert_tool_output(output)
+        converted_output: str | ResponseFunctionCallOutputItemListParam
+        if output_type_adapter is not None:
+            try:
+                validated_output = (
+                    output_type_adapter.validate_json(output)
+                    if isinstance(output, str)
+                    else output_type_adapter.validate_python(output)
+                )
+            except pydantic.ValidationError as error:
+                raise UserError(
+                    "Function tool output does not match its declared output schema."
+                ) from error
+            dumped_output = output_type_adapter.dump_python(
+                validated_output,
+                mode="json",
+                by_alias=True,
+            )
+            if not isinstance(dumped_output, Mapping):
+                raise UserError("Function tool output schema requires a JSON object.")
+            converted_output = json.dumps(
+                dict(dumped_output),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        elif output_json_schema is not None:
+            if isinstance(output, str):
+                try:
+                    dumped_output = json.loads(output)
+                except json.JSONDecodeError as error:
+                    raise UserError(
+                        "Function tool output schema requires a JSON object."
+                    ) from error
+            else:
+                dumped_output = _JSON_OUTPUT_ADAPTER.dump_python(output, mode="json")
+            if not isinstance(dumped_output, Mapping):
+                raise UserError("Function tool output schema requires a JSON object.")
+            converted_output = json.dumps(
+                dict(dumped_output),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        elif isinstance(output, str):
+            converted_output = output
+        elif _is_programmatic_tool_call(tool_call):
+            structured_output = cls._convert_tool_output_as_structured(output)
+            if structured_output is not None:
+                converted_output = structured_output
+            else:
+                try:
+                    converted_output = _JSON_OUTPUT_ADAPTER.dump_json(output).decode("utf-8")
+                except Exception as error:
+                    raise UserError(
+                        "Programmatic function tool outputs must be strings, structured tool "
+                        "outputs, or JSON-serializable values."
+                    ) from error
+        else:
+            converted_output = cls._convert_tool_output(output)
 
-        return {
+        output_item: FunctionCallOutput = {
             "call_id": tool_call.call_id,
             "output": converted_output,
             "type": "function_call_output",
         }
+        return cast(FunctionCallOutput, cls.copy_tool_call_caller(tool_call, output_item))
+
+    @classmethod
+    def copy_tool_call_caller(
+        cls,
+        tool_call: Any,
+        output_item: Any,
+    ) -> Any:
+        """Copy a program caller relationship from a tool call to its output item."""
+        caller = (
+            tool_call.get("caller")
+            if isinstance(tool_call, Mapping)
+            else getattr(tool_call, "caller", None)
+        )
+        if caller is not None:
+            model_dump = getattr(caller, "model_dump", None)
+            output_item["caller"] = (
+                model_dump(mode="json", exclude_none=True)
+                if callable(model_dump)
+                else _to_dump_compatible(caller)
+            )
+        return output_item
 
     @classmethod
     def _convert_tool_output(cls, output: Any) -> str | ResponseFunctionCallOutputItemListParam:
         """Converts a tool return value into an output acceptable by the Responses API."""
 
+        structured_output = cls._convert_tool_output_as_structured(output)
+        return structured_output if structured_output is not None else str(output)
+
+    @classmethod
+    def _convert_tool_output_as_structured(
+        cls,
+        output: Any,
+    ) -> ResponseFunctionCallOutputItemListParam | None:
+        """Convert known structured tool outputs without stringifying other values."""
+
         # If the output is either a single or list of the known structured output types, convert to
-        # ResponseFunctionCallOutputItemListParam. Else, just stringify.
-        if isinstance(output, (list, tuple)):
+        # ResponseFunctionCallOutputItemListParam.
+        if isinstance(output, list | tuple):
             maybe_converted_output_list = [
                 cls._maybe_get_output_as_structured_function_output(item) for item in output
             ]
-            if all(maybe_converted_output_list):
+            # An empty list/tuple has no structured items; ``all([])`` is ``True``,
+            # so guard against it to avoid emitting an empty structured-output list
+            # (which would drop the tool result) and stringify instead.
+            if maybe_converted_output_list and all(maybe_converted_output_list):
                 return [
                     cls._convert_single_tool_output_pydantic_model(item)
                     for item in maybe_converted_output_list
                     if item is not None
                 ]
-            else:
-                return str(output)
-        else:
-            maybe_converted_output = cls._maybe_get_output_as_structured_function_output(output)
-            if maybe_converted_output:
-                return [cls._convert_single_tool_output_pydantic_model(maybe_converted_output)]
-            else:
-                return str(output)
+            return None
+
+        maybe_converted_output = cls._maybe_get_output_as_structured_function_output(output)
+        if maybe_converted_output:
+            return [cls._convert_single_tool_output_pydantic_model(maybe_converted_output)]
+        return None
 
     @classmethod
     def _maybe_get_output_as_structured_function_output(
         cls, output: Any
     ) -> ValidToolOutputPydanticModels | None:
-        if isinstance(output, (ToolOutputText, ToolOutputImage, ToolOutputFileContent)):
+        if isinstance(output, ToolOutputText | ToolOutputImage | ToolOutputFileContent):
             return output
         elif isinstance(output, dict):
             # Require explicit 'type' field in dict to be considered a structured output
