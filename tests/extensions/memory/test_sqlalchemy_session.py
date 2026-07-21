@@ -15,7 +15,7 @@ from openai.types.responses.response_reasoning_item_param import (
     ResponseReasoningItemParam,
     Summary,
 )
-from sqlalchemy import select, text, update
+from sqlalchemy import insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.sql import Select
 
@@ -106,6 +106,51 @@ async def test_sqlalchemy_session_direct_ops(agent: Agent):
     assert len(retrieved_after_clear) == 0
 
 
+async def test_sqlalchemy_session_defaults_to_escaped_non_ascii_storage():
+    """Default storage keeps the historical escaped non-ASCII JSON representation."""
+    session = SQLAlchemySession.from_url("default_ascii_storage", url=DB_URL, create_tables=True)
+    item: TResponseInputItem = {"role": "user", "content": "café"}
+
+    await session.add_items([item])
+
+    async with session._session_factory() as sess:
+        rows = await sess.execute(
+            select(session._messages.c.message_data).where(
+                session._messages.c.session_id == session.session_id
+            )
+        )
+        stored = rows.scalar_one()
+
+    assert "\\u00e9" in stored
+    assert "café" not in stored
+    assert await session.get_items() == [item]
+
+
+async def test_sqlalchemy_session_can_store_non_ascii_without_escaping():
+    """ensure_ascii=False stores multilingual content readably while preserving round-trip data."""
+    session = SQLAlchemySession.from_url(
+        "non_ascii_storage",
+        url=DB_URL,
+        create_tables=True,
+        ensure_ascii=False,
+    )
+    item: TResponseInputItem = {"role": "user", "content": "café"}
+
+    await session.add_items([item])
+
+    async with session._session_factory() as sess:
+        rows = await sess.execute(
+            select(session._messages.c.message_data).where(
+                session._messages.c.session_id == session.session_id
+            )
+        )
+        stored = rows.scalar_one()
+
+    assert "café" in stored
+    assert "\\u00e9" not in stored
+    assert await session.get_items() == [item]
+
+
 async def test_runner_integration(agent: Agent):
     """Test that SQLAlchemySession works correctly with the agent Runner."""
     session_id = "runner_integration_test"
@@ -189,6 +234,43 @@ async def test_pop_from_empty_session():
     session = SQLAlchemySession.from_url("empty_session", url=DB_URL, create_tables=True)
     popped = await session.pop_item()
     assert popped is None
+
+
+async def test_pop_item_skips_corrupt_most_recent():
+    """pop_item skips corrupt newest rows and returns the next valid item."""
+    session = SQLAlchemySession.from_url("pop_corrupt", url=DB_URL, create_tables=True)
+
+    valid_item: TResponseInputItem = {"role": "user", "content": "valid"}
+    await session.add_items([valid_item])
+
+    await session._ensure_tables()
+    async with session._session_factory() as sess:
+        async with sess.begin():
+            await sess.execute(
+                insert(session._messages).values(
+                    {"session_id": session.session_id, "message_data": "not valid json {{{"}
+                )
+            )
+
+    assert await session.pop_item() == valid_item
+    assert await session.get_items() == []
+
+
+async def test_pop_item_returns_none_after_dropping_only_corrupt_rows():
+    """pop_item removes corrupt rows and returns None when no valid items remain."""
+    session = SQLAlchemySession.from_url("pop_only_corrupt", url=DB_URL, create_tables=True)
+
+    await session._ensure_tables()
+    async with session._session_factory() as sess:
+        async with sess.begin():
+            await sess.execute(
+                insert(session._messages).values(
+                    {"session_id": session.session_id, "message_data": "not valid json {{{"}
+                )
+            )
+
+    assert await session.pop_item() is None
+    assert await session.get_items() == []
 
 
 async def test_add_empty_items_list():

@@ -9,13 +9,22 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, TypeGuard, cast, get_args, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Literal,
+    TypedDict,
+    cast,
+    overload,
+)
 
 import httpx
 from openai import AsyncOpenAI, NotGiven, Omit, omit
 from openai.types import ChatModel
 from openai.types.responses import (
     ApplyPatchToolParam,
+    CustomToolParam,
     FileSearchToolParam,
     FunctionToolParam,
     Response,
@@ -29,6 +38,7 @@ from openai.types.responses import (
 )
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 from openai.types.responses.tool_param import LocalShell
+from typing_extensions import NotRequired
 
 from .. import _debug
 from .._tool_identity import (
@@ -37,7 +47,7 @@ from .._tool_identity import (
 )
 from ..agent_output import AgentOutputSchemaBase
 from ..computer import AsyncComputer, Computer
-from ..exceptions import UserError
+from ..exceptions import ModelBehaviorError, UserError
 from ..handoffs import Handoff
 from ..items import ItemHelpers, ModelResponse, TResponseInputItem
 from ..logger import logger
@@ -46,25 +56,35 @@ from ..tool import (
     ApplyPatchTool,
     CodeInterpreterTool,
     ComputerTool,
+    CustomTool,
     FileSearchTool,
     FunctionTool,
     HostedMCPTool,
     ImageGenerationTool,
     LocalShellTool,
+    ProgrammaticToolCallingTool,
     ShellTool,
     ShellToolEnvironment,
     Tool,
     ToolSearchTool,
     WebSearchTool,
     has_required_tool_search_surface,
+    validate_responses_programmatic_tool_calling_configuration,
     validate_responses_tool_search_configuration,
 )
 from ..tracing import SpanError, response_span
-from ..usage import Usage
+from ..usage import Usage, _response_usage_to_usage, model_usage_to_span_usage
 from ..util._json import _to_dump_compatible
 from ..version import __version__
+from ._openai_retry import get_openai_retry_advice
+from ._response_terminal import response_error_event_failure_error, response_terminal_failure_error
+from ._retry_runtime import (
+    should_disable_provider_managed_retries,
+    should_disable_websocket_pre_event_retries,
+)
 from .fake_id import FAKE_RESPONSES_ID
 from .interface import Model, ModelTracing
+from .openai_client_utils import is_official_openai_base_url, is_official_openai_client
 
 if TYPE_CHECKING:
     from ..model_settings import ModelSettings
@@ -76,9 +96,6 @@ _HEADERS = {"User-Agent": _USER_AGENT}
 # Override headers used by the Responses API.
 _HEADERS_OVERRIDE: ContextVar[dict[str, str] | None] = ContextVar(
     "openai_responses_headers_override", default=None
-)
-_RESPONSE_INCLUDABLE_VALUES = frozenset(
-    value for value in get_args(ResponseIncludable) if isinstance(value, str)
 )
 
 
@@ -107,7 +124,7 @@ def _json_dumps_default(value: Any) -> Any:
 
 
 def _is_openai_omitted_value(value: Any) -> bool:
-    return isinstance(value, (Omit, NotGiven))
+    return isinstance(value, Omit | NotGiven)
 
 
 def _require_responses_tool_param(value: object) -> ResponsesToolParam:
@@ -119,10 +136,6 @@ def _require_responses_tool_param(value: object) -> ResponsesToolParam:
         raise TypeError(f"Invalid Responses tool param payload: {value!r}")
 
     return cast(ResponsesToolParam, value)
-
-
-def _is_response_includable(value: object) -> TypeGuard[ResponseIncludable]:
-    return isinstance(value, str) and value in _RESPONSE_INCLUDABLE_VALUES
 
 
 def _coerce_response_includables(values: Sequence[str]) -> list[ResponseIncludable]:
@@ -182,10 +195,35 @@ class _WebsocketRequestTimeouts:
     recv: float | None
 
 
+class OpenAIResponsesWebSocketOptions(TypedDict):
+    """Low-level OpenAI Responses websocket connection options."""
+
+    ping_interval: NotRequired[float | None]
+    """Time in seconds between keepalive pings sent by the client.
+
+    The underlying ``websockets`` library usually defaults to 20.0. Set to ``None`` to
+    disable keepalive pings.
+    """
+
+    ping_timeout: NotRequired[float | None]
+    """Time in seconds to wait for a pong response before disconnecting.
+
+    Set to ``None`` to keep pings enabled but disable heartbeat timeouts during large latency
+    spikes.
+    """
+
+    max_size: NotRequired[int | None]
+    """Maximum size in bytes of an incoming websocket message.
+
+    The SDK defaults to ``None`` (no limit). Set an explicit byte limit to bound memory usage
+    for long-lived agent processes running behind proxies or in memory-constrained containers.
+    """
+
+
 class _ResponseStreamWithRequestId:
     """Wrap an SDK event stream and retain the originating request ID."""
 
-    _TERMINAL_EVENT_TYPES = {
+    _TERMINAL_EVENT_TYPES: ClassVar[set[str]] = {
         "response.completed",
         "response.failed",
         "response.incomplete",
@@ -261,7 +299,7 @@ class _ResponseStreamWithRequestId:
             await self._cleanup_once()
         except Exception as exc:
             if self._yielded_terminal_event:
-                logger.debug(f"Ignoring stream cleanup error after terminal event: {exc}")
+                logger.debug("Ignoring stream cleanup error after terminal event: %s", exc)
                 return
             raise
 
@@ -330,6 +368,12 @@ class OpenAIResponsesModel(Model):
     def _non_null_or_omit(self, value: Any) -> Any:
         return value if value is not None else omit
 
+    def _supports_default_prompt_cache_key(self) -> bool:
+        return is_official_openai_client(self._get_client())
+
+    def get_retry_advice(self, request: ModelRetryAdviceRequest) -> ModelRetryAdvice | None:
+        return get_openai_retry_advice(request)
+
     async def _maybe_aclose_async_iterator(self, iterator: Any) -> None:
         aclose = getattr(iterator, "aclose", None)
         if callable(aclose):
@@ -353,7 +397,7 @@ class OpenAIResponsesModel(Model):
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            logger.debug(f"Background stream cleanup failed after cancellation: {exc}")
+            logger.debug("Background stream cleanup failed after cancellation: %s", exc)
 
     async def get_response(
         self,
@@ -387,28 +431,17 @@ class OpenAIResponsesModel(Model):
                     logger.debug("LLM responded")
                 else:
                     logger.debug(
-                        "LLM resp:\n"
-                        f"""{
-                            json.dumps(
-                                [x.model_dump() for x in response.output],
-                                indent=2,
-                                ensure_ascii=False,
-                            )
-                        }\n"""
+                        "LLM resp:\n%s\n",
+                        json.dumps(
+                            [x.model_dump() for x in response.output],
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
                     )
 
-                usage = (
-                    Usage(
-                        requests=1,
-                        input_tokens=response.usage.input_tokens,
-                        output_tokens=response.usage.output_tokens,
-                        total_tokens=response.usage.total_tokens,
-                        input_tokens_details=response.usage.input_tokens_details,
-                        output_tokens_details=response.usage.output_tokens_details,
-                    )
-                    if response.usage
-                    else Usage()
-                )
+                usage = _response_usage_to_usage(response.usage) if response.usage else Usage()
+                if response.usage:
+                    span_response.span_data.usage = model_usage_to_span_usage(usage)
 
                 if tracing.include_data():
                     span_response.span_data.response = response
@@ -423,7 +456,7 @@ class OpenAIResponsesModel(Model):
                     )
                 )
                 request_id = getattr(e, "request_id", None)
-                logger.error(f"Error getting response: {e}. (request_id: {request_id})")
+                logger.error("Error getting response: %s. (request_id: %s)", e, request_id)
                 raise
 
         return ModelResponse(
@@ -465,6 +498,7 @@ class OpenAIResponsesModel(Model):
                 )
 
                 final_response: Response | None = None
+                terminal_failure_error: ModelBehaviorError | None = None
                 yielded_terminal_event = False
                 close_stream_in_background = False
                 try:
@@ -477,12 +511,22 @@ class OpenAIResponsesModel(Model):
                             "response.incomplete",
                         }:
                             terminal_response = getattr(chunk, "response", None)
-                            if isinstance(terminal_response, Response):
-                                final_response = terminal_response
+                            terminal_failure_error = response_terminal_failure_error(
+                                cast(str, chunk_type),
+                                terminal_response
+                                if isinstance(terminal_response, Response)
+                                else None,
+                            )
+                        elif chunk_type in {"error", "response.error"}:
+                            terminal_failure_error = response_error_event_failure_error(
+                                cast(str, chunk_type),
+                                chunk,
+                            )
                         if chunk_type in {
                             "response.completed",
                             "response.failed",
                             "response.incomplete",
+                            "error",
                             "response.error",
                         }:
                             yielded_terminal_event = True
@@ -498,14 +542,20 @@ class OpenAIResponsesModel(Model):
                         except Exception as exc:
                             if yielded_terminal_event:
                                 logger.debug(
-                                    f"Ignoring stream cleanup error after terminal event: {exc}"
+                                    "Ignoring stream cleanup error after terminal event: %s", exc
                                 )
                             else:
                                 raise
+                if terminal_failure_error is not None:
+                    raise terminal_failure_error
 
                 if final_response and tracing.include_data():
                     span_response.span_data.response = final_response
                     span_response.span_data.input = input
+                if final_response and final_response.usage:
+                    span_response.span_data.usage = model_usage_to_span_usage(
+                        _response_usage_to_usage(final_response.usage)
+                    )
 
             except Exception as e:
                 span_response.set_error(
@@ -516,7 +566,7 @@ class OpenAIResponsesModel(Model):
                         },
                     )
                 )
-                logger.error(f"Error streaming response: {e}")
+                logger.error("Error streaming response: %s", e)
                 raise
 
     @overload
@@ -691,14 +741,16 @@ class OpenAIResponsesModel(Model):
                 ensure_ascii=False,
             )
             logger.debug(
-                f"Calling LLM {self.model} with input:\n"
-                f"{input_json}\n"
-                f"Tools:\n{tools_json}\n"
-                f"Stream: {stream}\n"
-                f"Tool choice: {tool_choice_param}\n"
-                f"Response format: {response_format}\n"
-                f"Previous response id: {previous_response_id}\n"
-                f"Conversation id: {conversation_id}\n"
+                "Calling LLM %s with input:\n%s\nTools:\n%s\nStream: %s\nTool choice: %s\n"
+                "Response format: %s\nPrevious response id: %s\nConversation id: %s\n",
+                self.model,
+                input_json,
+                tools_json,
+                stream,
+                tool_choice_param,
+                response_format,
+                previous_response_id,
+                conversation_id,
             )
 
         extra_args = dict(model_settings.extra_args or {})
@@ -734,10 +786,16 @@ class OpenAIResponsesModel(Model):
             "text": response_format,
             "store": self._non_null_or_omit(model_settings.store),
             "prompt_cache_retention": self._non_null_or_omit(model_settings.prompt_cache_retention),
+            "prompt_cache_options": self._non_null_or_omit(model_settings.prompt_cache_options),
             "reasoning": self._non_null_or_omit(model_settings.reasoning),
             "metadata": self._non_null_or_omit(model_settings.metadata),
+            "context_management": self._non_null_or_omit(model_settings.context_management),
         }
-        duplicate_extra_arg_keys = sorted(set(create_kwargs).intersection(extra_args))
+        duplicate_extra_arg_keys = sorted(
+            k
+            for k in extra_args
+            if k in create_kwargs and not _is_openai_omitted_value(create_kwargs[k])
+        )
         if duplicate_extra_arg_keys:
             if len(duplicate_extra_arg_keys) == 1:
                 key = duplicate_extra_arg_keys[0]
@@ -824,9 +882,13 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
         openai_client: AsyncOpenAI,
         *,
         model_is_explicit: bool = True,
+        websocket_options: OpenAIResponsesWebSocketOptions | None = None,
     ) -> None:
         super().__init__(
             model=model, openai_client=openai_client, model_is_explicit=model_is_explicit
+        )
+        self._websocket_options = cast(
+            OpenAIResponsesWebSocketOptions, dict(websocket_options or {})
         )
         self._ws_connection: Any | None = None
         self._ws_connection_identity: tuple[str, tuple[tuple[str, str], ...]] | None = None
@@ -836,6 +898,68 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
             None
         )
         self._ws_client_close_generation = 0
+
+    def _supports_default_prompt_cache_key(self) -> bool:
+        if self._client.websocket_base_url is not None:
+            return is_official_openai_base_url(self._client.websocket_base_url, websocket=True)
+        return super()._supports_default_prompt_cache_key()
+
+    def get_retry_advice(self, request: ModelRetryAdviceRequest) -> ModelRetryAdvice | None:
+        stateful_request = bool(request.previous_response_id or request.conversation_id)
+        wrapped_replay_safety = _get_wrapped_websocket_replay_safety(request.error)
+        if wrapped_replay_safety == "unsafe":
+            if stateful_request or _did_start_websocket_response(request.error):
+                return ModelRetryAdvice(
+                    suggested=False,
+                    replay_safety="unsafe",
+                    reason=str(request.error),
+                )
+            return ModelRetryAdvice(
+                suggested=True,
+                reason=str(request.error),
+            )
+        if wrapped_replay_safety == "safe":
+            return ModelRetryAdvice(
+                suggested=True,
+                replay_safety="safe",
+                reason=str(request.error),
+            )
+        if _is_ambiguous_websocket_replay_error(request.error):
+            if stateful_request:
+                return ModelRetryAdvice(
+                    suggested=False,
+                    replay_safety="unsafe",
+                    reason=str(request.error),
+                )
+            return ModelRetryAdvice(
+                suggested=True,
+                reason=str(request.error),
+            )
+        timeout_phase = _get_websocket_timeout_phase(request.error)
+        if timeout_phase is not None:
+            if timeout_phase in {"request lock wait", "connect"}:
+                return ModelRetryAdvice(
+                    suggested=True,
+                    replay_safety="safe",
+                    reason=str(request.error),
+                )
+            if stateful_request:
+                return ModelRetryAdvice(
+                    suggested=False,
+                    replay_safety="unsafe",
+                    reason=str(request.error),
+                )
+            return ModelRetryAdvice(
+                suggested=True,
+                reason=str(request.error),
+            )
+        if _is_never_sent_websocket_error(request.error):
+            return ModelRetryAdvice(
+                suggested=True,
+                replay_safety="safe",
+                reason=str(request.error),
+            )
+        return super().get_retry_advice(request)
 
     def _get_ws_request_lock(self) -> asyncio.Lock:
         running_loop = asyncio.get_running_loop()
@@ -917,8 +1041,10 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
             elif event_type in {"response.incomplete", "response.failed"}:
                 terminal_event_type = cast(str, event_type)
                 terminal_response = getattr(event, "response", None)
-                if isinstance(terminal_response, Response):
-                    final_response = terminal_response
+                raise response_terminal_failure_error(
+                    terminal_event_type,
+                    terminal_response if isinstance(terminal_response, Response) else None,
+                )
 
         if final_response is None:
             terminal_event_hint = (
@@ -1084,7 +1210,7 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
                 recv=None if timeout.read is None else float(timeout.read),
             )
 
-        if isinstance(timeout, (int, float)):
+        if isinstance(timeout, int | float):
             timeout_seconds = float(timeout)
             return _WebsocketRequestTimeouts(
                 lock=timeout_seconds,
@@ -1170,10 +1296,18 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
 
     def _merge_websocket_headers(self, extra_headers: Mapping[str, Any]) -> dict[str, str]:
         headers: dict[str, str] = {}
-        for key, value in self._client.default_headers.items():
-            if _is_openai_omitted_value(value):
-                continue
-            headers[key] = str(value)
+        for source in (
+            getattr(self._client, "auth_headers", {}),
+            self._client.default_headers,
+        ):
+            for key, value in source.items():
+                if _is_openai_omitted_value(value):
+                    continue
+                header_key = str(key)
+                for existing_key in list(headers):
+                    if existing_key.lower() == header_key.lower():
+                        del headers[existing_key]
+                headers[header_key] = str(value)
 
         for key, value in extra_headers.items():
             if isinstance(value, NotGiven):
@@ -1368,12 +1502,22 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
                 "Install `websockets` or `openai[realtime]`."
             ) from exc
 
+        connect_kwargs: dict[str, Any] = {
+            "user_agent_header": None,
+            "additional_headers": dict(headers),
+            "max_size": None,
+            "open_timeout": connect_timeout,
+        }
+        if "ping_interval" in self._websocket_options:
+            connect_kwargs["ping_interval"] = self._websocket_options["ping_interval"]
+        if "ping_timeout" in self._websocket_options:
+            connect_kwargs["ping_timeout"] = self._websocket_options["ping_timeout"]
+        if "max_size" in self._websocket_options:
+            connect_kwargs["max_size"] = self._websocket_options["max_size"]
+
         return await connect(
             ws_url,
-            user_agent_header=None,
-            additional_headers=dict(headers),
-            max_size=None,
-            open_timeout=connect_timeout,
+            **connect_kwargs,
         )
 
 
@@ -1421,6 +1565,11 @@ class Converter:
             return "auto"
         elif tool_choice == "none":
             return "none"
+        elif tool_choice == "programmatic_tool_calling":
+            return cast(
+                response_create_params.ToolChoice,
+                {"type": "programmatic_tool_calling"},
+            )
         elif tool_choice == "file_search":
             return {
                 "type": "file_search",
@@ -1575,7 +1724,7 @@ class Converter:
     def _has_unresolved_computer_tool(cls, tools: Sequence[Tool] | None) -> bool:
         return any(
             isinstance(tool, ComputerTool)
-            and not isinstance(tool.computer, (Computer, AsyncComputer))
+            and not isinstance(tool.computer, Computer | AsyncComputer)
             for tool in tools or ()
         )
 
@@ -1585,7 +1734,9 @@ class Converter:
 
     @classmethod
     def _is_ga_computer_model(cls, model: str | ChatModel | None) -> bool:
-        return isinstance(model, str) and model.startswith("gpt-5.4")
+        return isinstance(model, str) and (
+            model.startswith("gpt-5.4") or model.startswith("gpt-5.5")
+        )
 
     @classmethod
     def resolve_computer_tool_model(
@@ -1679,6 +1830,11 @@ class Converter:
             tools,
             allow_opaque_search_surface=allow_opaque_tool_search_surface,
         )
+        validate_responses_programmatic_tool_calling_configuration(
+            tools,
+            tool_choice=tool_choice,
+            allow_opaque_tool_search_surface=allow_opaque_tool_search_surface,
+        )
 
         computer_tools = [tool for tool in tools if isinstance(tool, ComputerTool)]
         if len(computer_tools) > 1:
@@ -1757,12 +1913,16 @@ class Converter:
         }
         if include_defer_loading and tool.defer_loading:
             function_tool_param["defer_loading"] = True
+        if tool.allowed_callers is not None:
+            function_tool_param["allowed_callers"] = tool.allowed_callers
+        if tool.output_json_schema is not None:
+            function_tool_param["output_schema"] = tool.output_json_schema
         return function_tool_param, None
 
     @classmethod
     def _convert_preview_computer_tool(cls, tool: ComputerTool[Any]) -> ResponsesToolParam:
         computer = tool.computer
-        if not isinstance(computer, (Computer, AsyncComputer)):
+        if not isinstance(computer, Computer | AsyncComputer):
             raise UserError(
                 "Computer tool is not initialized for serialization. Call "
                 "resolve_computer({ tool, run_context }) with a run context first "
@@ -1831,18 +1991,29 @@ class Converter:
                 else _require_responses_tool_param({"type": "computer"}),
                 None,
             )
+        elif isinstance(tool, CustomTool):
+            custom_tool_param: CustomToolParam = tool.tool_config
+            return custom_tool_param, None
         elif isinstance(tool, HostedMCPTool):
             return tool.tool_config, None
         elif isinstance(tool, ApplyPatchTool):
-            return ApplyPatchToolParam(type="apply_patch"), None
+            tool_config = getattr(tool, "tool_config", None)
+            if tool_config is not None:
+                converted_tool_config = dict(tool_config)
+            else:
+                converted_tool_config = dict(ApplyPatchToolParam(type="apply_patch"))
+            if tool.allowed_callers is not None:
+                converted_tool_config["allowed_callers"] = tool.allowed_callers
+            return _require_responses_tool_param(converted_tool_config), None
         elif isinstance(tool, ShellTool):
+            shell_tool_config: dict[str, Any] = {
+                "type": "shell",
+                "environment": cls._convert_shell_environment(tool.environment),
+            }
+            if tool.allowed_callers is not None:
+                shell_tool_config["allowed_callers"] = tool.allowed_callers
             return (
-                _require_responses_tool_param(
-                    {
-                        "type": "shell",
-                        "environment": cls._convert_shell_environment(tool.environment),
-                    }
-                ),
+                _require_responses_tool_param(shell_tool_config),
                 None,
             )
         elif isinstance(tool, ImageGenerationTool):
@@ -1860,6 +2031,8 @@ class Converter:
             if tool.parameters is not None:
                 tool_search_tool_param["parameters"] = tool.parameters
             return tool_search_tool_param, None
+        elif isinstance(tool, ProgrammaticToolCallingTool):
+            return _require_responses_tool_param({"type": "programmatic_tool_calling"}), None
         else:
             raise UserError(f"Unknown tool type: {type(tool)}, tool")
 

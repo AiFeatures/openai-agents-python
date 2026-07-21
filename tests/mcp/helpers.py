@@ -17,7 +17,7 @@ from mcp.types import (
 
 from agents.mcp import MCPServer
 from agents.mcp.server import _UNSET, _MCPServerWithClientSession, _UnsetType
-from agents.mcp.util import MCPToolMetaResolver, ToolFilter
+from agents.mcp.util import MCPToolCustomDataExtractor, MCPToolMetaResolver, ToolFilter
 from agents.tool import ToolErrorFunction
 
 tee = shutil.which("tee") or ""
@@ -73,12 +73,14 @@ class FakeMCPServer(MCPServer):
         require_approval: object | None = None,
         failure_error_function: ToolErrorFunction | None | _UnsetType = _UNSET,
         tool_meta_resolver: MCPToolMetaResolver | None = None,
+        custom_data_extractor: MCPToolCustomDataExtractor | None = None,
     ):
         super().__init__(
             use_structured_content=False,
             require_approval=require_approval,  # type: ignore[arg-type]
             failure_error_function=failure_error_function,
             tool_meta_resolver=tool_meta_resolver,
+            custom_data_extractor=custom_data_extractor,
         )
         self.tools: list[MCPTool] = tools or []
         self.tool_calls: list[str] = []
@@ -87,6 +89,7 @@ class FakeMCPServer(MCPServer):
         self.tool_filter = tool_filter
         self._server_name = server_name
         self._custom_content: list[Content] | None = None
+        self._response_meta: dict[str, Any] | None = None
 
     def add_tool(self, name: str, input_schema: dict[str, Any]):
         self.tools.append(MCPTool(name=name, inputSchema=input_schema))
@@ -124,6 +127,7 @@ class FakeMCPServer(MCPServer):
 
         return CallToolResult(
             content=[TextContent(text=self.tool_results[-1], type="text")],
+            _meta=self._response_meta,
         )
 
     async def list_prompts(self, run_context=None, agent=None) -> ListPromptsResult:

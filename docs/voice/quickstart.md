@@ -47,7 +47,6 @@ graph LR
 First, let's set up some Agents. This should feel familiar to you if you've built any agents with this SDK. We'll have a couple of Agents, a handoff, and a tool.
 
 ```python
-import asyncio
 import random
 
 from agents import (
@@ -68,19 +67,19 @@ def get_weather(city: str) -> str:
 
 spanish_agent = Agent(
     name="Spanish",
-    handoff_description="A spanish speaking agent.",
+    handoff_description="A Spanish-speaking agent.",
     instructions=prompt_with_handoff_instructions(
         "You're speaking to a human, so be polite and concise. Speak in Spanish.",
     ),
-    model="gpt-5.4",
+    model="gpt-5.6-sol",
 )
 
 agent = Agent(
     name="Assistant",
     instructions=prompt_with_handoff_instructions(
-        "You're speaking to a human, so be polite and concise. If the user speaks in Spanish, handoff to the spanish agent.",
+        "You're speaking to a human, so be polite and concise. If the user speaks in Spanish, hand off to the Spanish agent.",
     ),
-    model="gpt-5.4",
+    model="gpt-5.6-sol",
     handoffs=[spanish_agent],
     tools=[get_weather],
 )
@@ -132,7 +131,6 @@ import sounddevice as sd
 from agents import (
     Agent,
     function_tool,
-    set_tracing_disabled,
 )
 from agents.voice import (
     AudioInput,
@@ -152,19 +150,19 @@ def get_weather(city: str) -> str:
 
 spanish_agent = Agent(
     name="Spanish",
-    handoff_description="A spanish speaking agent.",
+    handoff_description="A Spanish-speaking agent.",
     instructions=prompt_with_handoff_instructions(
         "You're speaking to a human, so be polite and concise. Speak in Spanish.",
     ),
-    model="gpt-5.4",
+    model="gpt-5.6-sol",
 )
 
 agent = Agent(
     name="Assistant",
     instructions=prompt_with_handoff_instructions(
-        "You're speaking to a human, so be polite and concise. If the user speaks in Spanish, handoff to the spanish agent.",
+        "You're speaking to a human, so be polite and concise. If the user speaks in Spanish, hand off to the Spanish agent.",
     ),
-    model="gpt-5.4",
+    model="gpt-5.6-sol",
     handoffs=[spanish_agent],
     tools=[get_weather],
 )

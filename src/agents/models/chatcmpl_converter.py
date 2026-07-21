@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
-from typing import Any, Literal, Union, cast
+from collections.abc import Iterable, Mapping
+from typing import Any, Literal, cast
 
 from openai import Omit, omit
 from openai.types.chat import (
@@ -47,6 +47,7 @@ from ..agent_output import AgentOutputSchemaBase
 from ..exceptions import AgentsException, UserError
 from ..handoffs import Handoff
 from ..items import TResponseInputItem, TResponseOutputItem
+from ..logger import logger
 from ..model_settings import MCPToolChoice
 from ..tool import (
     FunctionTool,
@@ -56,11 +57,11 @@ from ..tool import (
 )
 from .fake_id import FAKE_RESPONSES_ID
 
-ResponseInputContentWithAudioParam = Union[
-    ResponseInputContentParam,
-    ResponseInputAudioParam,
-    dict[str, Any],
-]
+ResponseInputContentWithAudioParam = (
+    ResponseInputContentParam | ResponseInputAudioParam | dict[str, Any]
+)
+
+_OMITTED_TOOL_OUTPUT_PLACEHOLDER = "[tool output omitted]"
 
 
 class Converter:
@@ -81,7 +82,7 @@ class Converter:
         else:
             ensure_tool_choice_supports_backend(
                 tool_choice,
-                backend_name="OpenAI Responses models",
+                backend_name="Chat Completions-compatible models",
             )
             return {
                 "type": "function",
@@ -111,6 +112,7 @@ class Converter:
         cls,
         message: ChatCompletionMessage,
         provider_data: dict[str, Any] | None = None,
+        strict_feature_validation: bool = False,
     ) -> list[TResponseOutputItem]:
         """
         Convert a ChatCompletionMessage to a list of response output items.
@@ -223,7 +225,10 @@ class Converter:
 
                     items.append(ResponseFunctionToolCall(**func_call_kwargs))
                 elif tool_call.type == "custom":
-                    pass
+                    if strict_feature_validation:
+                        raise UserError(
+                            "Custom tool calls are not supported by the Chat Completions converter"
+                        )
 
         return items
 
@@ -232,16 +237,18 @@ class Converter:
         if not isinstance(item, dict):
             return None
 
-        keys = item.keys()
-        # EasyInputMessageParam only has these two keys
-        if keys != {"content", "role"}:
+        keys = set(item)
+        if not {"content", "role"} <= keys:
+            return None
+        if not keys <= {"content", "role", "type", "phase"}:
+            return None
+        if "type" in item and item["type"] != "message":
+            return None
+        if item.get("phase") not in (None, "commentary", "final_answer"):
             return None
 
         role = item.get("role", None)
         if role not in ("user", "assistant", "system", "developer"):
-            return None
-
-        if "content" not in item:
             return None
 
         return cast(EasyInputMessageParam, item)
@@ -296,6 +303,7 @@ class Converter:
             isinstance(item, dict)
             and item.get("type") == "message"
             and item.get("role") == "assistant"
+            and {"id", "content"} <= set(item)
         ):
             return cast(ResponseOutputMessageParam, item)
         return None
@@ -338,7 +346,9 @@ class Converter:
             if not isinstance(text, str):
                 raise UserError(f"Only text content is supported here, got: {content_part}")
             # Cast the normalized dict because we are constructing a TypedDict alias by hand.
-            return cast(ResponseInputTextParam, {"type": "input_text", "text": text})
+            normalized_text: dict[str, Any] = {"type": "input_text", "text": text}
+            cls._copy_prompt_cache_breakpoint(content_part, normalized_text)
+            return cast(ResponseInputTextParam, normalized_text)
 
         if content_type != "image_url":
             return content_part
@@ -355,8 +365,15 @@ class Converter:
         detail = image_payload.get("detail")
         if detail is not None:
             normalized["detail"] = detail
+        cls._copy_prompt_cache_breakpoint(content_part, normalized)
         # Cast the normalized dict because we are constructing a TypedDict alias by hand.
         return cast(ResponseInputImageParam, normalized)
+
+    @staticmethod
+    def _copy_prompt_cache_breakpoint(source: Mapping[str, Any], target: dict[str, Any]) -> None:
+        prompt_cache_breakpoint = source.get("prompt_cache_breakpoint")
+        if prompt_cache_breakpoint is not None:
+            target["prompt_cache_breakpoint"] = prompt_cache_breakpoint
 
     @classmethod
     def extract_all_content(
@@ -370,12 +387,12 @@ class Converter:
             c = cls._normalize_input_content_part_alias(c)
             if isinstance(c, dict) and c.get("type") == "input_text":
                 casted_text_param = cast(ResponseInputTextParam, c)
-                out.append(
-                    ChatCompletionContentPartTextParam(
-                        type="text",
-                        text=casted_text_param["text"],
-                    )
-                )
+                text_part: dict[str, Any] = {
+                    "type": "text",
+                    "text": casted_text_param["text"],
+                }
+                cls._copy_prompt_cache_breakpoint(c, text_part)
+                out.append(cast(ChatCompletionContentPartTextParam, text_part))
             elif isinstance(c, dict) and c.get("type") == "input_image":
                 casted_image_param = cast(ResponseInputImageParam, c)
                 if "image_url" not in casted_image_param or not casted_image_param["image_url"]:
@@ -387,15 +404,15 @@ class Converter:
                     # Chat Completions only supports auto/low/high, so preserve the caller's
                     # highest-fidelity intent with the closest available value.
                     detail = "high"
-                out.append(
-                    ChatCompletionContentPartImageParam(
-                        type="image_url",
-                        image_url={
-                            "url": casted_image_param["image_url"],
-                            "detail": detail,
-                        },
-                    )
-                )
+                image_part: dict[str, Any] = {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": casted_image_param["image_url"],
+                        "detail": detail,
+                    },
+                }
+                cls._copy_prompt_cache_breakpoint(c, image_part)
+                out.append(cast(ChatCompletionContentPartImageParam, image_part))
             elif isinstance(c, dict) and c.get("type") == "video_url":
                 video_payload = c.get("video_url")
                 if not isinstance(video_payload, dict) or not video_payload.get("url"):
@@ -426,15 +443,15 @@ class Converter:
                     raise UserError(
                         f"input_audio requires both data and format {casted_audio_param}"
                     )
-                out.append(
-                    ChatCompletionContentPartInputAudioParam(
-                        type="input_audio",
-                        input_audio={
-                            "data": audio_data,
-                            "format": audio_format,
-                        },
-                    )
-                )
+                audio_part: dict[str, Any] = {
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": audio_data,
+                        "format": audio_format,
+                    },
+                }
+                cls._copy_prompt_cache_breakpoint(c, audio_part)
+                out.append(cast(ChatCompletionContentPartInputAudioParam, audio_part))
             elif isinstance(c, dict) and c.get("type") == "input_file":
                 casted_file_param = cast(ResponseInputFileParam, c)
                 if "file_data" not in casted_file_param or not casted_file_param["file_data"]:
@@ -446,7 +463,9 @@ class Converter:
                 if "filename" in casted_file_param and casted_file_param["filename"]:
                     filedata["filename"] = casted_file_param["filename"]
 
-                out.append(File(type="file", file=filedata))
+                file_part: dict[str, Any] = {"type": "file", "file": filedata}
+                cls._copy_prompt_cache_breakpoint(c, file_part)
+                out.append(cast(File, file_part))
             else:
                 raise UserError(f"Unknown content: {c}")
         return out
@@ -458,6 +477,9 @@ class Converter:
         model: str | None = None,
         preserve_thinking_blocks: bool = False,
         preserve_tool_output_all_content: bool = False,
+        base_url: str | None = None,
+        should_replay_reasoning_content: ShouldReplayReasoningContent | None = None,
+        strict_feature_validation: bool = False,
     ) -> list[ChatCompletionMessageParam]:
         """
         Convert a sequence of 'Item' objects into a list of ChatCompletionMessageParam.
@@ -477,6 +499,14 @@ class Converter:
                 When True, all content types including images are preserved. This is useful
                 for model providers (e.g. Anthropic via LiteLLM) that support processing
                 non-text content in tool results.
+            base_url: The request base URL, if the caller knows the concrete endpoint.
+                This is used by reasoning-content replay hooks to distinguish direct
+                provider calls from proxy or gateway requests.
+            should_replay_reasoning_content: Optional hook that decides whether a
+                reasoning item should be replayed into the next assistant message as
+                `reasoning_content`.
+            strict_feature_validation: Whether to raise a UserError for Responses-only
+                features that Chat Completions cannot faithfully represent.
 
         Rules:
         - EasyInputMessage or InputMessage (role=user) => ChatCompletionUserMessageParam
@@ -709,7 +739,7 @@ class Converter:
             elif func_output := cls.maybe_function_tool_call_output(item):
                 flush_assistant_message()
                 output_content = cast(
-                    Union[str, Iterable[ResponseInputContentWithAudioParam]], func_output["output"]
+                    str | Iterable[ResponseInputContentWithAudioParam], func_output["output"]
                 )
                 if preserve_tool_output_all_content:
                     tool_result_content = cls.extract_all_content(output_content)
@@ -723,6 +753,19 @@ class Converter:
                             for c in all_output_content
                             if c.get("type") == "text"
                         ]
+                        if not tool_result_content:
+                            message = (
+                                "Chat Completions tool outputs cannot be empty or contain only "
+                                "non-text content unless preserve_tool_output_all_content=True."
+                            )
+                            if strict_feature_validation:
+                                raise UserError(message)
+                            logger.warning(
+                                "%s Replacing the tool output with a placeholder; enable strict "
+                                "feature validation to raise an error instead.",
+                                message,
+                            )
+                            tool_result_content = _OMITTED_TOOL_OUTPUT_PLACEHOLDER
                 msg: ChatCompletionToolMessageParam = {
                     "role": "tool",
                     "tool_call_id": func_output["call_id"],

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from openai import AsyncOpenAI
 
-from . import _config
+from . import _config, sandbox
 from .agent import (
     Agent,
     AgentBase,
@@ -21,7 +21,9 @@ from .exceptions import (
     AgentsException,
     InputGuardrailTripwireTriggered,
     MaxTurnsExceeded,
+    MCPToolCancellationError,
     ModelBehaviorError,
+    ModelRefusalError,
     OutputGuardrailTripwireTriggered,
     RunErrorDetails,
     ToolInputGuardrailTripwireTriggered,
@@ -56,6 +58,7 @@ from .items import (
     ItemHelpers,
     MCPApprovalRequestItem,
     MCPApprovalResponseItem,
+    MCPListToolsItem,
     MessageOutputItem,
     ModelResponse,
     ReasoningItem,
@@ -63,6 +66,8 @@ from .items import (
     ToolApprovalItem,
     ToolCallItem,
     ToolCallOutputItem,
+    ToolSearchCallItem,
+    ToolSearchOutputItem,
     TResponseInputItem,
 )
 from .lifecycle import AgentHooks, RunHooks
@@ -79,9 +84,14 @@ from .memory import (
 from .model_settings import ModelSettings
 from .models.interface import Model, ModelProvider, ModelTracing
 from .models.multi_provider import MultiProvider
+from .models.openai_agent_registration import OpenAIAgentRegistrationConfig
 from .models.openai_chatcompletions import OpenAIChatCompletionsModel
 from .models.openai_provider import OpenAIProvider
-from .models.openai_responses import OpenAIResponsesModel, OpenAIResponsesWSModel
+from .models.openai_responses import (
+    OpenAIResponsesModel,
+    OpenAIResponsesWebSocketOptions,
+    OpenAIResponsesWSModel,
+)
 from .prompts import DynamicPromptFunction, GenerateDynamicPromptData, Prompt
 from .repl import run_demo_loop
 from .responses_websocket_session import ResponsesWebSocketSession, responses_websocket_session
@@ -92,6 +102,8 @@ from .run import (
     Runner,
     ToolErrorFormatter,
     ToolErrorFormatterArgs,
+    ToolExecutionConfig,
+    ToolNotFoundBehavior,
 )
 from .run_context import AgentHookContext, RunContextWrapper, TContext
 from .run_error_handlers import (
@@ -110,11 +122,20 @@ from .stream_events import (
 )
 from .tool import (
     ApplyPatchTool,
+    ApplyPatchToolCustomDataContext,
+    ApplyPatchToolCustomDataExtractor,
     CodeInterpreterTool,
     ComputerProvider,
     ComputerTool,
+    ComputerToolCustomDataContext,
+    ComputerToolCustomDataExtractor,
+    CustomTool,
+    CustomToolCustomDataContext,
+    CustomToolCustomDataExtractor,
     FileSearchTool,
     FunctionTool,
+    FunctionToolCustomDataContext,
+    FunctionToolCustomDataExtractor,
     FunctionToolResult,
     HostedMCPTool,
     ImageGenerationTool,
@@ -124,6 +145,7 @@ from .tool import (
     MCPToolApprovalFunction,
     MCPToolApprovalFunctionResult,
     MCPToolApprovalRequest,
+    ProgrammaticToolCallingTool,
     ShellActionRequest,
     ShellCallData,
     ShellCallOutcome,
@@ -147,6 +169,9 @@ from .tool import (
     ShellToolLocalSkill,
     ShellToolSkillReference,
     Tool,
+    ToolCaller,
+    ToolOrigin,
+    ToolOriginType,
     ToolOutputFileContent,
     ToolOutputFileContentDict,
     ToolOutputImage,
@@ -180,14 +205,17 @@ from .tracing import (
     GuardrailSpanData,
     HandoffSpanData,
     MCPListToolsSpanData,
+    ResponseSpanData,
     Span,
     SpanData,
     SpanError,
     SpeechGroupSpanData,
     SpeechSpanData,
+    TaskSpanData,
     Trace,
     TracingProcessor,
     TranscriptionSpanData,
+    TurnSpanData,
     add_trace_processor,
     agent_span,
     custom_span,
@@ -201,14 +229,17 @@ from .tracing import (
     guardrail_span,
     handoff_span,
     mcp_tools_span,
+    response_span,
     set_trace_processors,
     set_trace_provider,
     set_tracing_disabled,
     set_tracing_export_api_key,
     speech_group_span,
     speech_span,
+    task_span,
     trace,
     transcription_span,
+    turn_span,
 )
 from .usage import Usage
 from .version import __version__
@@ -271,6 +302,25 @@ def set_default_openai_responses_transport(transport: Literal["http", "websocket
     _config.set_default_openai_responses_transport(transport)
 
 
+def set_default_openai_agent_registration(
+    config: OpenAIAgentRegistrationConfig | None,
+) -> None:
+    """Set the default OpenAI agent registration config.
+
+    This controls the agent harness ID that OpenAI providers resolve from SDK configuration. If
+    this is not set, providers fall back to the ``OPENAI_AGENT_HARNESS_ID`` environment variable.
+    """
+    _config.set_default_openai_agent_registration(config)
+
+
+def set_default_openai_harness(harness_id: str | None) -> None:
+    """Set the default OpenAI agent harness ID for SDK-managed OpenAI providers.
+
+    Passing ``None`` clears the default and restores environment variable fallback.
+    """
+    _config.set_default_openai_harness(harness_id)
+
+
 def enable_verbose_stdout_logging():
     """Enables verbose logging to stdout. This is useful for debugging."""
     logger = logging.getLogger("openai.agents")
@@ -300,6 +350,7 @@ __all__ = [
     "OpenAIChatCompletionsModel",
     "MultiProvider",
     "OpenAIProvider",
+    "OpenAIAgentRegistrationConfig",
     "OpenAIResponsesModel",
     "OpenAIResponsesWSModel",
     "AgentOutputSchema",
@@ -317,7 +368,9 @@ __all__ = [
     "GenerateDynamicPromptData",
     "Prompt",
     "MaxTurnsExceeded",
+    "MCPToolCancellationError",
     "ModelBehaviorError",
+    "ModelRefusalError",
     "ToolTimeoutError",
     "UserError",
     "InputGuardrail",
@@ -349,8 +402,13 @@ __all__ = [
     "ToolApprovalItem",
     "MCPApprovalRequestItem",
     "MCPApprovalResponseItem",
+    "MCPListToolsItem",
     "ToolCallItem",
     "ToolCallOutputItem",
+    "ToolSearchCallItem",
+    "ToolSearchOutputItem",
+    "ToolOrigin",
+    "ToolOriginType",
     "ReasoningItem",
     "ItemHelpers",
     "RunHooks",
@@ -380,17 +438,26 @@ __all__ = [
     "ResponsesWebSocketSession",
     "RunConfig",
     "ReasoningItemIdPolicy",
+    "ToolExecutionConfig",
     "ToolErrorFormatter",
     "ToolErrorFormatterArgs",
+    "ToolNotFoundBehavior",
     "RunState",
     "RawResponsesStreamEvent",
     "RunItemStreamEvent",
     "AgentUpdatedStreamEvent",
     "StreamEvent",
     "FunctionTool",
+    "FunctionToolCustomDataContext",
+    "FunctionToolCustomDataExtractor",
     "FunctionToolResult",
     "ComputerTool",
+    "ComputerToolCustomDataContext",
+    "ComputerToolCustomDataExtractor",
     "ComputerProvider",
+    "CustomTool",
+    "CustomToolCustomDataContext",
+    "CustomToolCustomDataExtractor",
     "FileSearchTool",
     "CodeInterpreterTool",
     "ImageGenerationTool",
@@ -423,7 +490,11 @@ __all__ = [
     "ApplyPatchOperation",
     "ApplyPatchResult",
     "ApplyPatchTool",
+    "ApplyPatchToolCustomDataContext",
+    "ApplyPatchToolCustomDataExtractor",
+    "ProgrammaticToolCallingTool",
     "Tool",
+    "ToolCaller",
     "WebSearchTool",
     "HostedMCPTool",
     "MCPToolApprovalFunction",
@@ -451,6 +522,7 @@ __all__ = [
     "get_current_trace",
     "guardrail_span",
     "handoff_span",
+    "response_span",
     "set_trace_processors",
     "set_trace_provider",
     "set_tracing_disabled",
@@ -458,7 +530,9 @@ __all__ = [
     "transcription_span",
     "speech_span",
     "mcp_tools_span",
+    "task_span",
     "trace",
+    "turn_span",
     "Trace",
     "TracingProcessor",
     "SpanError",
@@ -473,16 +547,23 @@ __all__ = [
     "SpeechGroupSpanData",
     "SpeechSpanData",
     "MCPListToolsSpanData",
+    "ResponseSpanData",
+    "TaskSpanData",
     "TranscriptionSpanData",
+    "TurnSpanData",
     "set_default_openai_key",
     "set_default_openai_client",
     "set_default_openai_api",
     "set_default_openai_responses_transport",
+    "OpenAIResponsesWebSocketOptions",
+    "set_default_openai_harness",
+    "set_default_openai_agent_registration",
     "responses_websocket_session",
     "set_tracing_export_api_key",
     "enable_verbose_stdout_logging",
     "gen_trace_id",
     "gen_span_id",
     "default_tool_error_function",
+    "sandbox",
     "__version__",
 ]

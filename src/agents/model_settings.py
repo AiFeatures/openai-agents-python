@@ -3,16 +3,16 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 from dataclasses import fields, replace
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal, TypeAlias, cast
 
 from openai import Omit as _Omit
 from openai._types import Body, Query
 from openai.types.responses import ResponseIncludable
+from openai.types.responses.response_create_params import ContextManagement, PromptCacheOptions
 from openai.types.shared import Reasoning
 from pydantic import BaseModel, GetCoreSchemaHandler
 from pydantic.dataclasses import dataclass
 from pydantic_core import core_schema
-from typing_extensions import TypeAlias
 
 
 class _OmitTypeAnnotation:
@@ -51,8 +51,30 @@ class MCPToolChoice:
 
 
 Omit = Annotated[_Omit, _OmitTypeAnnotation]
-Headers: TypeAlias = Mapping[str, Union[str, Omit]]
-ToolChoice: TypeAlias = Union[Literal["auto", "required", "none"], str, MCPToolChoice, None]
+Headers: TypeAlias = Mapping[str, str | Omit]
+ToolChoice: TypeAlias = Literal["auto", "required", "none"] | str | MCPToolChoice | None
+
+_TRACEABLE_MODEL_SETTING_FIELDS = (
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "tool_choice",
+    "parallel_tool_calls",
+    "truncation",
+    "max_tokens",
+    "reasoning",
+    "verbosity",
+    "metadata",
+    "store",
+    "prompt_cache_retention",
+    "include_usage",
+    "response_include",
+    "top_logprobs",
+    "retry",
+    "context_management",
+    "prompt_cache_options",
+)
 
 
 @dataclass
@@ -154,6 +176,23 @@ class ModelSettings:
     These will be passed directly to the underlying model provider's API.
     Use with caution as not all models support all parameters."""
 
+    retry: ModelRetrySettings | None = None
+    """Opt-in runner-managed retry settings for model calls."""
+
+    context_management: list[ContextManagement] | None = None
+    """Context management entries for OpenAI Responses API requests.
+
+    For example, use ``[{"type": "compaction", "compact_threshold": 200000}]``
+    to enable server-side compaction when the rendered context crosses a token threshold.
+    """
+
+    prompt_cache_options: PromptCacheOptions | None = None
+    """Prompt-cache configuration for OpenAI API requests.
+
+    Use ``{"mode": "explicit", "ttl": "30m"}`` with content-part cache breakpoints to
+    control which prompt prefixes are eligible for caching.
+    """
+
     def resolve(self, override: ModelSettings | None) -> ModelSettings:
         """Produce a new ModelSettings by overlaying any non-None values from the
         override on top of this instance."""
@@ -180,7 +219,11 @@ class ModelSettings:
     def to_json_dict(self) -> dict[str, Any]:
         dataclass_dict = dataclasses.asdict(self)
 
-        json_dict: dict[str, Any] = {}
+    def to_traceable_dict(self) -> dict[str, Any]:
+        """Serialize settings for tracing without provider-specific request extras."""
+        payload = self.to_json_dict()
+        return {key: payload[key] for key in _TRACEABLE_MODEL_SETTING_FIELDS if key in payload}
+
 
         for field_name, value in dataclass_dict.items():
             if isinstance(value, BaseModel):

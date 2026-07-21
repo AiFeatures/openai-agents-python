@@ -1,17 +1,31 @@
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from openai.types.responses import ResponseFunctionToolCall
 from openai.types.responses.response_output_item import McpCall, McpListTools, McpListToolsTool
 
+import agents.run_internal.oai_conversation as oai_conversation
 from agents import Agent, HostedMCPTool
-from agents.items import MCPListToolsItem, ModelResponse, RunItem, ToolCallItem, TResponseInputItem
+from agents.items import (
+    MCPListToolsItem,
+    ModelResponse,
+    RunItem,
+    ToolApprovalItem,
+    ToolCallItem,
+    ToolCallOutputItem,
+    TResponseInputItem,
+)
 from agents.lifecycle import RunHooks
 from agents.models.fake_id import FAKE_RESPONSES_ID
 from agents.result import RunResultStreaming
 from agents.run_config import ModelInputData, RunConfig
 from agents.run_context import RunContextWrapper
+from agents.run_internal.agent_bindings import bind_public_agent
+from agents.run_internal.agent_runner_helpers import get_unsent_tool_call_ids_for_interrupted_state
 from agents.run_internal.oai_conversation import OpenAIServerConversationTracker
 from agents.run_internal.run_loop import get_new_response, run_single_turn_streamed
+from agents.run_internal.run_steps import NextStepInterruption
 from agents.run_internal.tool_use_tracker import AgentToolUseTracker
 from agents.stream_events import RunItemStreamEvent
 from agents.usage import Usage
@@ -84,6 +98,118 @@ def test_prepare_input_filters_items_seen_by_server_and_tool_calls() -> None:
     assert tracker.remaining_initial_input is None
 
 
+def test_hydrate_from_state_preserves_unsent_outputs_from_interrupted_turn() -> None:
+    agent = Agent(name="test")
+    cleanup1_call = ResponseFunctionToolCall(
+        id="fc_001",
+        type="function_call",
+        call_id="call_CLEANUP1",
+        name="run_cleanup",
+        arguments='{"target": "temp_files"}',
+        status="completed",
+    )
+    diagnostic_call = ResponseFunctionToolCall(
+        id="fc_002",
+        type="function_call",
+        call_id="call_DIAG",
+        name="run_diagnostic",
+        arguments='{"check_name": "thermal"}',
+        status="completed",
+    )
+    cleanup2_call = ResponseFunctionToolCall(
+        id="fc_003",
+        type="function_call",
+        call_id="call_CLEANUP2",
+        name="run_cleanup",
+        arguments='{"target": "winsxs_cache"}',
+        status="completed",
+    )
+    model_response = ModelResponse(
+        output=[cleanup1_call, diagnostic_call, cleanup2_call],
+        usage=Usage(),
+        response_id="resp_002",
+    )
+    diagnostic_output = ToolCallOutputItem(
+        agent=agent,
+        raw_item={
+            "type": "function_call_output",
+            "call_id": "call_DIAG",
+            "output": "Diagnostic completed.",
+        },
+        output="Diagnostic completed.",
+    )
+    generated_items: list[RunItem] = [
+        ToolCallItem(agent=agent, raw_item=cleanup1_call),
+        ToolCallItem(agent=agent, raw_item=diagnostic_call),
+        ToolCallItem(agent=agent, raw_item=cleanup2_call),
+        diagnostic_output,
+        ToolApprovalItem(agent=agent, raw_item=cleanup1_call, tool_name="run_cleanup"),
+        ToolApprovalItem(agent=agent, raw_item=cleanup2_call, tool_name="run_cleanup"),
+    ]
+    interrupted_state = SimpleNamespace(
+        _current_step=NextStepInterruption(interruptions=[]),
+        _last_processed_response=SimpleNamespace(
+            handoffs=[],
+            functions=[
+                SimpleNamespace(tool_call=cleanup1_call),
+                SimpleNamespace(tool_call=diagnostic_call),
+                SimpleNamespace(tool_call=cleanup2_call),
+            ],
+            computer_actions=[],
+            custom_tool_calls=[],
+            local_shell_calls=[],
+            shell_calls=[],
+            apply_patch_calls=[],
+        ),
+    )
+
+    tracker = OpenAIServerConversationTracker(previous_response_id="resp_002")
+    tracker.hydrate_from_state(
+        original_input="Run cleanup, diagnostics, and cleanup.",
+        generated_items=generated_items,
+        model_responses=[model_response],
+        unsent_tool_call_ids=get_unsent_tool_call_ids_for_interrupted_state(
+            cast(Any, interrupted_state)
+        ),
+    )
+
+    assert "call_DIAG" not in tracker.server_tool_call_ids
+
+    prepared = tracker.prepare_input(
+        "Run cleanup, diagnostics, and cleanup.",
+        [
+            ToolCallItem(agent=agent, raw_item=cleanup1_call),
+            ToolCallItem(agent=agent, raw_item=diagnostic_call),
+            ToolCallItem(agent=agent, raw_item=cleanup2_call),
+            diagnostic_output,
+            ToolCallOutputItem(
+                agent=agent,
+                raw_item={
+                    "type": "function_call_output",
+                    "call_id": "call_CLEANUP1",
+                    "output": "Tool call not approved.",
+                },
+                output="Tool call not approved.",
+            ),
+            ToolCallOutputItem(
+                agent=agent,
+                raw_item={
+                    "type": "function_call_output",
+                    "call_id": "call_CLEANUP2",
+                    "output": "Tool call not approved.",
+                },
+                output="Tool call not approved.",
+            ),
+        ],
+    )
+
+    assert [
+        item.get("call_id")
+        for item in prepared
+        if isinstance(item, dict) and item.get("type") == "function_call_output"
+    ] == ["call_DIAG", "call_CLEANUP1", "call_CLEANUP2"]
+
+
 def test_hydrate_from_state_does_not_track_string_initial_input_by_object_identity() -> None:
     tracker = OpenAIServerConversationTracker(
         conversation_id="conv-init-string", previous_response_id=None
@@ -95,7 +221,7 @@ def test_hydrate_from_state_does_not_track_string_initial_input_by_object_identi
         model_responses=[],
     )
 
-    assert tracker.sent_items == set()
+    assert tracker.sent_items == []
     assert tracker.sent_initial_input is True
     assert tracker.remaining_initial_input is None
     assert len(tracker.sent_item_fingerprints) == 1
@@ -113,7 +239,7 @@ def test_hydrate_from_state_does_not_track_list_initial_input_by_object_identity
         model_responses=[],
     )
 
-    assert tracker.sent_items == set()
+    assert tracker.sent_items == []
     assert tracker.sent_initial_input is True
     assert tracker.remaining_initial_input is None
     assert len(tracker.sent_item_fingerprints) == 1
@@ -134,8 +260,24 @@ def test_mark_input_as_sent_and_rewind_input_respects_remaining_initial_input() 
     assert tracker.remaining_initial_input == [pending_1]
 
 
-def test_mark_input_as_sent_uses_raw_generated_source_for_rebuilt_filtered_item() -> None:
+def test_mark_input_as_sent_ignores_stale_id_for_rebuilt_filtered_item(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     tracker = OpenAIServerConversationTracker(conversation_id="conv2b", previous_response_id=None)
+    stale_raw_item = {
+        "type": "function_call_output",
+        "call_id": "call-stale",
+        "output": "stale",
+    }
+    stale_generated_items = [
+        DummyRunItem(stale_raw_item, type="function_call_output_item"),
+    ]
+    stale_prepared = tracker.prepare_input(
+        original_input=[],
+        generated_items=cast(list[Any], stale_generated_items),
+    )
+    stale_prepared_id = id(stale_prepared[0])
+
     raw_generated_item = {
         "type": "function_call_output",
         "call_id": "call-2b",
@@ -149,12 +291,23 @@ def test_mark_input_as_sent_uses_raw_generated_source_for_rebuilt_filtered_item(
         original_input=[],
         generated_items=cast(list[Any], generated_items),
     )
+    assert stale_prepared_id not in tracker.prepared_item_sources
+
     rebuilt_filtered_item = cast(TResponseInputItem, dict(cast(dict[str, Any], prepared[0])))
+    real_id = id
+
+    def _id_with_stale_collision(item: Any) -> int:
+        if item is rebuilt_filtered_item:
+            return stale_prepared_id
+        return real_id(item)
+
+    monkeypatch.setattr(oai_conversation, "id", _id_with_stale_collision, raising=False)
 
     tracker.mark_input_as_sent([rebuilt_filtered_item])
 
-    assert id(raw_generated_item) in tracker.sent_items
-    assert id(rebuilt_filtered_item) not in tracker.sent_items
+    assert any(item is raw_generated_item for item in tracker.sent_items)
+    assert all(item is not stale_raw_item for item in tracker.sent_items)
+    assert all(item is not rebuilt_filtered_item for item in tracker.sent_items)
 
     prepared_again = tracker.prepare_input(
         original_input=[],
@@ -681,7 +834,7 @@ async def test_get_new_response_marks_filtered_input_as_sent() -> None:
     run_config = RunConfig(call_model_input_filter=_filter_input)
 
     await get_new_response(
-        agent,
+        bind_public_agent(agent),
         None,
         [item_1, item_2],
         None,
@@ -696,8 +849,8 @@ async def test_get_new_response_marks_filtered_input_as_sent() -> None:
     )
 
     assert model.last_turn_args["input"] == [item_1]
-    assert id(item_1) in tracker.sent_items
-    assert id(item_2) not in tracker.sent_items
+    assert any(item is item_1 for item in tracker.sent_items)
+    assert all(item is not item_2 for item in tracker.sent_items)
 
 
 @pytest.mark.asyncio
@@ -740,7 +893,7 @@ async def test_run_single_turn_streamed_marks_filtered_input_as_sent() -> None:
 
     await run_single_turn_streamed(
         streamed_result,
-        agent,
+        bind_public_agent(agent),
         RunHooks(),
         context_wrapper,
         run_config,
@@ -815,7 +968,7 @@ async def test_run_single_turn_streamed_seeds_hosted_mcp_metadata_from_pre_step_
 
     await run_single_turn_streamed(
         streamed_result,
-        agent,
+        bind_public_agent(agent),
         RunHooks(),
         context_wrapper,
         run_config,
@@ -840,3 +993,64 @@ async def test_run_single_turn_streamed_seeds_hosted_mcp_metadata_from_pre_step_
     assert len(tool_call_events) == 1
     assert tool_call_events[0].description == "Search the docs."
     assert tool_call_events[0].title == "Search Docs"
+
+
+@pytest.mark.parametrize("stale_collection_name", ["sent_items", "server_items"])
+def test_prepare_input_keeps_fresh_tool_output_when_stale_identity_matches(
+    stale_collection_name: str,
+) -> None:
+    """Tracked object identity must not become a stale address-based dedupe key."""
+    tracker = OpenAIServerConversationTracker(previous_response_id="resp-1")
+
+    output_raw_item: dict[str, Any] = {
+        "type": "function_call_output",
+        "call_id": "call_FRESH",
+        "output": "42",
+    }
+    tracked_items = getattr(tracker, stale_collection_name)
+    if isinstance(tracked_items, set):
+        tracked_items.add(id(output_raw_item))
+    else:
+        old_item = {"type": "message", "content": "already tracked"}
+        tracked_items.append(old_item)
+
+    generated_items = [DummyRunItem(output_raw_item, type="function_call_output_item")]
+
+    prepared = tracker.prepare_input(
+        original_input=[],
+        generated_items=cast(list[Any], generated_items),
+    )
+
+    prepared_output_call_ids = [
+        item.get("call_id")
+        for item in prepared
+        if isinstance(item, dict) and item.get("type") == "function_call_output"
+    ]
+    assert "call_FRESH" in prepared_output_call_ids
+
+
+def test_prepare_input_dedupes_same_delivered_tool_output_object() -> None:
+    """Identity dedupe still skips the exact source object after it is delivered."""
+    tracker = OpenAIServerConversationTracker(previous_response_id="resp-1")
+
+    output_raw_item: dict[str, Any] = {
+        "type": "function_call_output",
+        "call_id": "call_X",
+        "output": "42",
+    }
+    generated_items = [DummyRunItem(output_raw_item, type="function_call_output_item")]
+
+    first = tracker.prepare_input(
+        original_input=[],
+        generated_items=cast(list[Any], generated_items),
+    )
+    assert any(isinstance(item, dict) and item.get("call_id") == "call_X" for item in first)
+
+    tracker.mark_input_as_sent(first)
+    assert any(item is output_raw_item for item in tracker.sent_items)
+
+    second = tracker.prepare_input(
+        original_input=[],
+        generated_items=cast(list[Any], generated_items),
+    )
+    assert all(not (isinstance(item, dict) and item.get("call_id") == "call_X") for item in second)

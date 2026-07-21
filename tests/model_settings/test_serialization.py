@@ -65,6 +65,17 @@ def test_all_fields_serialization() -> None:
         extra_body={"foo": "bar"},
         extra_headers={"foo": "bar"},
         extra_args={"custom_param": "value", "another_param": 42},
+        retry=ModelRetrySettings(
+            max_retries=2,
+            backoff=ModelRetryBackoffSettings(
+                initial_delay=0.1,
+                max_delay=1.0,
+                multiplier=2.0,
+                jitter=False,
+            ),
+        ),
+        context_management=[{"type": "compaction", "compact_threshold": 200000}],
+        prompt_cache_options={"mode": "explicit", "ttl": "30m"},
     )
 
     # Verify that every single field is set to a non-None value
@@ -75,6 +86,28 @@ def test_all_fields_serialization() -> None:
 
     # Now, lets serialize the ModelSettings instance to a JSON string
     verify_serialization(model_settings)
+
+
+def test_gpt_5_6_reasoning_and_prompt_cache_serialization() -> None:
+    model_settings = ModelSettings(
+        reasoning=Reasoning(mode="pro", effort="max", context="all_turns"),
+        prompt_cache_options={"mode": "explicit", "ttl": "30m"},
+    )
+
+    serialized_reasoning = model_settings.to_json_dict()["reasoning"]
+    assert serialized_reasoning["context"] == "all_turns"
+    assert serialized_reasoning["effort"] == "max"
+    assert serialized_reasoning["mode"] == "pro"
+    assert model_settings.to_traceable_dict()["prompt_cache_options"] == {
+        "mode": "explicit",
+        "ttl": "30m",
+    }
+
+
+def test_prompt_cache_options_is_appended_to_public_field_order() -> None:
+    field_names = [field.name for field in fields(ModelSettings)]
+
+    assert field_names[-2:] == ["context_management", "prompt_cache_options"]
 
 
 def test_extra_args_serialization() -> None:
@@ -93,6 +126,29 @@ def test_extra_args_serialization() -> None:
 
     # Verify serialization works
     verify_serialization(model_settings)
+
+
+def test_traceable_serialization_omits_request_extras() -> None:
+    model_settings = ModelSettings(
+        temperature=0.5,
+        extra_headers={"Authorization": "Bearer provider-token"},
+        extra_query={"api-key": "query-token"},
+        extra_body={"secret": "body-token"},
+        extra_args={"api_key": "arg-token"},
+    )
+
+    json_dict = model_settings.to_json_dict()
+    assert json_dict["extra_headers"] == {"Authorization": "Bearer provider-token"}
+    assert json_dict["extra_query"] == {"api-key": "query-token"}
+    assert json_dict["extra_body"] == {"secret": "body-token"}
+    assert json_dict["extra_args"] == {"api_key": "arg-token"}
+
+    traceable = model_settings.to_traceable_dict()
+    assert traceable["temperature"] == 0.5
+    assert "extra_headers" not in traceable
+    assert "extra_query" not in traceable
+    assert "extra_body" not in traceable
+    assert "extra_args" not in traceable
 
 
 def test_extra_args_resolve() -> None:

@@ -10,13 +10,14 @@ The OpenAI Agents SDK is a lightweight yet powerful framework for building multi
 ### Core concepts:
 
 1. [**Agents**](https://openai.github.io/openai-agents-python/agents): LLMs configured with instructions, tools, guardrails, and handoffs
+1. [**Sandbox Agents**](https://openai.github.io/openai-agents-python/sandbox_agents): Agents preconfigured to work with a container to perform work over long time horizons.
 1. **[Agents as tools](https://openai.github.io/openai-agents-python/tools/#agents-as-tools) / [Handoffs](https://openai.github.io/openai-agents-python/handoffs/)**: Delegating to other agents for specific tasks
 1. [**Tools**](https://openai.github.io/openai-agents-python/tools/): Various Tools let agents take actions (functions, MCP, hosted tools)
 1. [**Guardrails**](https://openai.github.io/openai-agents-python/guardrails/): Configurable safety checks for input and output validation
 1. [**Human in the loop**](https://openai.github.io/openai-agents-python/human_in_the_loop/): Built-in mechanisms for involving humans across agent runs
 1. [**Sessions**](https://openai.github.io/openai-agents-python/sessions/): Automatic conversation history management across agent runs
 1. [**Tracing**](https://openai.github.io/openai-agents-python/tracing/): Built-in tracking of agent runs, allowing you to view, debug and optimize your workflows
-1. [**Realtime Agents**](https://openai.github.io/openai-agents-python/realtime/quickstart/): Build powerful voice agents with full features
+1. [**Realtime Agents**](https://openai.github.io/openai-agents-python/realtime/quickstart/): Build powerful voice agents with `gpt-realtime-2.1` and full agent features
 
 Explore the [examples](https://github.com/openai/openai-agents-python/tree/main/examples) directory to see the SDK in action, and read our [documentation](https://openai.github.io/openai-agents-python/) for more details.
 
@@ -45,7 +46,40 @@ uv add openai-agents
 
 For voice support, install with the optional `voice` group: `uv add 'openai-agents[voice]'`. For Redis session support, install with the optional `redis` group: `uv add 'openai-agents[redis]'`.
 
-## Run your first agent
+## Run your first agents
+
+The SDK supports three primary ways to run agents. Set the `OPENAI_API_KEY` environment variable before running any of these examples.
+
+### Run a sandbox agent
+
+Use a [`SandboxAgent`](https://openai.github.io/openai-agents-python/sandbox_agents) when the agent needs to inspect files, run commands, apply patches, or preserve workspace state across longer tasks.
+
+This example uses `UnixLocalSandboxClient`, which is supported on macOS and Linux. On Windows, use `DockerSandboxClient` with the `openai-agents[docker]` extra or a hosted sandbox client instead; see [Sandbox clients](https://openai.github.io/openai-agents-python/sandbox/clients/) for setup details.
+
+```python
+from agents import Runner
+from agents.run import RunConfig
+from agents.sandbox import Manifest, SandboxAgent, SandboxRunConfig
+from agents.sandbox.entries import GitRepo
+from agents.sandbox.sandboxes import UnixLocalSandboxClient
+
+agent = SandboxAgent(
+    name="Workspace Assistant",
+    instructions="Inspect the sandbox workspace before answering.",
+    default_manifest=Manifest(entries={"repo": GitRepo(repo="openai/openai-agents-python", ref="main")}),
+)
+
+result = Runner.run_sync(
+    agent,
+    "Inspect the repo README and summarize what this project does.",
+    run_config=RunConfig(sandbox=SandboxRunConfig(client=UnixLocalSandboxClient())),
+)
+print(result.final_output)
+```
+
+### Run a text agent
+
+Use a text `Agent` for workflows that do not need a persistent realtime connection or a sandbox workspace.
 
 ```python
 from agents import Agent, Runner
@@ -60,9 +94,35 @@ print(result.final_output)
 # Infinite loop's dance.
 ```
 
-(_If running this, ensure you set the `OPENAI_API_KEY` environment variable_)
-
 (_For Jupyter notebook users, see [hello_world_jupyter.ipynb](https://github.com/openai/openai-agents-python/blob/main/examples/basic/hello_world_jupyter.ipynb)_)
+
+### Run a realtime agent
+
+Use a [`RealtimeAgent`](https://openai.github.io/openai-agents-python/realtime/quickstart/) for low-latency, server-side voice and multimodal experiences over WebSocket.
+
+```python
+import asyncio
+from agents.realtime import RealtimeAgent, RealtimeRunner
+
+async def main() -> None:
+    agent = RealtimeAgent(name="Assistant", instructions="You are a helpful voice assistant. Keep responses short.")
+    runner = RealtimeRunner(starting_agent=agent)
+    session = await runner.run()
+
+    async with session:
+        await session.send_message("Say hello in one short sentence.")
+        async for event in session:
+            if event.type == "audio":
+                # Forward or play event.audio.data.
+                pass
+            elif event.type == "history_added":
+                print(event.item)
+            elif event.type == "agent_end":
+                break
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
 
 Explore the [examples](https://github.com/openai/openai-agents-python/tree/main/examples) directory to see the SDK in action, and read our [documentation](https://openai.github.io/openai-agents-python/) for more details.
 
@@ -84,27 +144,4 @@ We're committed to continuing to build the Agents SDK as an open source framewor
 
 > This section is maintained by the iAiFy enterprise and documents what the AiFeatures fork actually supports. If this contradicts upstream text above, this section wins for iAiFy operators.
 
-**Status:** Active fork (maintained).
-**Enterprise:** iAiFy (Stockholm).
-**Upstream sync:** Managed via [Ai-road-4-You/fork-sync](https://github.com/Ai-road-4-You) — upstream changes are reviewed before merge; divergence is intentional where documented.
-**Support scope:** Only the build/run paths documented below are supported internally. Other upstream surfaces are best-effort.
-
-### Supported commands
-
-Run only the commands verified in this repo's current manifest (see `package.json` / `pyproject.toml` / `Cargo.toml` for the authoritative list).
-
-### CI/CD
-
-This repo uses (or is migrating to) the shared enterprise CI/CD:
-
-- Reusable workflows: [Ai-road-4-You/enterprise-ci-cd@v1](https://github.com/Ai-road-4-You/enterprise-ci-cd)
-- Governance: [Ai-road-4-You/governance](https://github.com/Ai-road-4-You/governance)
-- Documentation standard: [`docs/documentation-standard.md`](https://github.com/Ai-road-4-You/governance/blob/main/docs/documentation-standard.md)
-
-### Contributing
-
-Internal contributors follow the iAiFy governance rules: conventional commits, PR review required, no force-push to `main`. See [Ai-road-4-You/governance](https://github.com/Ai-road-4-You/governance).
-
-### License
-
-See `LICENSE` in this repo. iAiFy-originated changes are MIT unless the upstream license requires otherwise.
+We're committed to continuing to build the Agents SDK as an open source framework so others in the community can expand on our approach.

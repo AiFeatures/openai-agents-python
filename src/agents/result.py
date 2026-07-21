@@ -5,7 +5,7 @@ import asyncio
 import copy
 import weakref
 from collections.abc import AsyncIterator
-from dataclasses import InitVar, dataclass, field
+from dataclasses import InitVar, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from pydantic import GetCoreSchemaHandler
@@ -18,6 +18,7 @@ from .exceptions import (
     InputGuardrailTripwireTriggered,
     MaxTurnsExceeded,
     RunErrorDetails,
+    _should_drain_stream_events_before_raising,
 )
 from .guardrail import InputGuardrailResult, OutputGuardrailResult
 from .items import (
@@ -29,7 +30,14 @@ from .items import (
 )
 from .logger import logger
 from .run_context import RunContextWrapper
-from .run_internal.items import run_item_to_input_item
+from .run_internal.items import (
+    NestedHistoryOwnedItemRef,
+    digest_input_item,
+    filter_nested_history_owned_item_refs_for_input,
+    rebase_nested_history_owned_item_refs,
+    resolve_nested_history_owned_item_indexes,
+    run_items_to_input_items,
+)
 from .run_internal.run_steps import (
     NextStepInterruption,
     ProcessedResponse,
@@ -46,7 +54,9 @@ from .util._pretty_print import (
 )
 
 if TYPE_CHECKING:
-    pass
+    from collections.abc import Awaitable, Callable
+
+    from .sandbox.session.base_sandbox_session import BaseSandboxSession
 
 T = TypeVar("T")
 
@@ -65,6 +75,33 @@ class AgentToolInvocation:
     """The raw JSON arguments for the nested invocation."""
 
 
+def _reconciled_result_owned_item_refs(
+    result: RunResultBase,
+    public_input: str | list[TResponseInputItem],
+) -> list[NestedHistoryOwnedItemRef]:
+    """Retain ownership only for the exact public-input occurrences."""
+    owned_item_refs = getattr(result, "_nested_history_owned_session_item_refs", [])
+    return filter_nested_history_owned_item_refs_for_input(
+        public_input,
+        owned_item_refs,
+    )
+
+
+def _state_snapshot_owned_item_refs(
+    result: RunResultBase,
+    state_input: str | list[TResponseInputItem],
+) -> list[NestedHistoryOwnedItemRef]:
+    """Rebind validated ownership coordinates to the input snapshot stored in RunState."""
+    if isinstance(state_input, str):
+        return []
+    return [
+        replace(item_ref, input_item=state_input[item_ref.input_index])
+        for item_ref in getattr(result, "_nested_history_owned_session_item_refs", [])
+        if 0 <= item_ref.input_index < len(state_input)
+        and digest_input_item(state_input[item_ref.input_index]) == item_ref.digest
+    ]
+
+
 def _populate_state_from_result(
     state: RunState[Any],
     result: RunResultBase,
@@ -78,12 +115,20 @@ def _populate_state_from_result(
     auto_previous_response_id: bool = False,
 ) -> RunState[Any]:
     """Populate a RunState with common fields from a RunResult."""
+    state._current_agent = result.last_agent
     model_input_items = getattr(result, "_model_input_items", None)
     if isinstance(model_input_items, list):
         state._generated_items = list(model_input_items)
     else:
         state._generated_items = result.new_items
     state._session_items = list(result.new_items)
+    snapshot_refs = _state_snapshot_owned_item_refs(result, state._original_input)
+    live_refs = rebase_nested_history_owned_item_refs(
+        state._original_input,
+        state._session_items,
+        snapshot_refs,
+    )
+    state._nested_history_owned_session_item_refs = live_refs
     state._model_responses = result.raw_responses
     state._input_guardrail_results = result.input_guardrail_results
     state._output_guardrail_results = result.output_guardrail_results
@@ -96,6 +141,11 @@ def _populate_state_from_result(
     state._conversation_id = conversation_id
     state._previous_response_id = previous_response_id
     state._auto_previous_response_id = auto_previous_response_id
+    source_state = getattr(result, "_state", None)
+    if isinstance(source_state, RunState):
+        state._generated_prompt_cache_key = source_state._generated_prompt_cache_key
+    else:
+        state._generated_prompt_cache_key = getattr(result, "_generated_prompt_cache_key", None)
     state._reasoning_item_id_policy = getattr(result, "_reasoning_item_id_policy", None)
 
     interruptions = list(getattr(result, "interruptions", []))
@@ -106,8 +156,90 @@ def _populate_state_from_result(
     if trace_state is None:
         trace_state = TraceState.from_trace(getattr(result, "trace", None))
     state._trace_state = copy.deepcopy(trace_state) if trace_state else None
+    sandbox_resume_state = getattr(result, "_sandbox_resume_state", None)
+    if isinstance(sandbox_resume_state, dict):
+        state._sandbox = copy.deepcopy(sandbox_resume_state)
+    else:
+        state._sandbox = None
 
     return state
+
+
+ToInputListMode = Literal["preserve_all", "normalized"]
+
+
+def _preserve_all_session_items(
+    result: RunResultBase,
+    reasoning_item_id_policy: Literal["preserve", "omit"] | None,
+    public_input: str | list[TResponseInputItem],
+    owned_item_refs: list[NestedHistoryOwnedItemRef],
+) -> list[TResponseInputItem]:
+    """Avoid replaying session items already moved into ordered nested history."""
+    retained_refs = filter_nested_history_owned_item_refs_for_input(
+        public_input,
+        owned_item_refs,
+    )
+    excluded = resolve_nested_history_owned_item_indexes(
+        result.new_items,
+        retained_refs,
+    )
+    if not excluded:
+        return run_items_to_input_items(result.new_items, reasoning_item_id_policy)
+
+    filtered_items = [item for index, item in enumerate(result.new_items) if index not in excluded]
+    return run_items_to_input_items(filtered_items, reasoning_item_id_policy)
+
+
+def _input_items_for_result(
+    result: RunResultBase,
+    *,
+    mode: ToInputListMode,
+    reasoning_item_id_policy: Literal["preserve", "omit"] | None,
+    public_input: str | list[TResponseInputItem],
+    owned_item_refs: list[NestedHistoryOwnedItemRef],
+) -> list[TResponseInputItem]:
+    """Return input items for the requested result view.
+
+    ``preserve_all`` keeps the full converted history from ``new_items``. ``normalized`` returns
+    the canonical continuation input when handoff filtering rewrote model history, otherwise it
+    falls back to the same converted history.
+    """
+    if mode == "preserve_all":
+        return _preserve_all_session_items(
+            result,
+            reasoning_item_id_policy,
+            public_input,
+            owned_item_refs,
+        )
+    if mode != "normalized":
+        raise ValueError(f"Unsupported to_input_list mode: {mode}")
+    session_items = run_items_to_input_items(result.new_items, reasoning_item_id_policy)
+    if not getattr(result, "_replay_from_model_input_items", False):
+        # Most runs never rewrite continuation history, so normalized stays identical to the
+        # historical preserve-all view unless the runner explicitly marked a divergence.
+        return session_items
+
+    model_input_items = getattr(result, "_model_input_items", None)
+    if not isinstance(model_input_items, list):
+        return session_items
+
+    # When the runner marks a divergence, generated_items already reflect the continuation input
+    # chosen for the next local run after applying handoff/input filtering.
+    return run_items_to_input_items(model_input_items, reasoning_item_id_policy)
+
+
+def _starting_agent_for_state(result: RunResultBase) -> Agent[Any]:
+    """Return the root agent graph that should seed RunState identity resolution."""
+    state = getattr(result, "_state", None)
+    starting_agent = getattr(state, "_starting_agent", None)
+    if isinstance(starting_agent, Agent):
+        return starting_agent
+
+    stored_starting_agent = getattr(result, "_starting_agent_for_state", None)
+    if isinstance(stored_starting_agent, Agent):
+        return stored_starting_agent
+
+    return result.last_agent
 
 
 @dataclass
@@ -145,6 +277,26 @@ class RunResultBase(abc.ABC):
 
     _trace_state: TraceState | None = field(default=None, init=False, repr=False)
     """Serialized trace metadata captured during the run."""
+    _replay_from_model_input_items: bool = field(default=False, init=False, repr=False)
+    """Whether replay helpers should prefer `_model_input_items` over `new_items`.
+
+    This is only set when the runner preserved extra session history items that should not be
+    replayed into the next local run, such as nested handoff history or filtered handoff input.
+    """
+    _nested_history_owned_session_item_refs: list[NestedHistoryOwnedItemRef] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+    )
+    """Session item occurrences already represented verbatim in SDK-default nested history."""
+    _sandbox_resume_state: dict[str, object] | None = field(default=None, init=False, repr=False)
+    """Serialized sandbox session state captured during the run."""
+    _sandbox_session: BaseSandboxSession | None = field(default=None, init=False, repr=False)
+    """Live sandbox session attached to this run result when sandbox execution is enabled."""
+    _starting_agent_for_state: Agent[Any] | None = field(default=None, init=False, repr=False)
+    """Root agent graph used when converting the result back into RunState."""
+    _generated_prompt_cache_key: str | None = field(default=None, init=False, repr=False)
+    """SDK-generated prompt cache key captured during the run."""
 
     @classmethod
     def __get_pydantic_core_schema__(
@@ -208,18 +360,29 @@ class RunResultBase(abc.ABC):
 
         return cast(T, self.final_output)
 
-    def to_input_list(self) -> list[TResponseInputItem]:
-        """Creates a new input list, merging the original input with all the new items generated."""
-        original_items: list[TResponseInputItem] = ItemHelpers.input_to_new_input_list(self.input)
-        new_items: list[TResponseInputItem] = []
-        reasoning_item_id_policy = getattr(self, "_reasoning_item_id_policy", None)
-        for item in self.new_items:
-            converted = run_item_to_input_item(item, reasoning_item_id_policy)
-            if converted is None:
-                continue
-            new_items.append(converted)
+    def to_input_list(
+        self,
+        *,
+        mode: ToInputListMode = "preserve_all",
+    ) -> list[TResponseInputItem]:
+        """Create an input-item view of this run.
 
-        return original_items + new_items
+        ``mode="preserve_all"`` keeps the historical behavior of converting ``new_items`` into a
+        full plain-item history. ``mode="normalized"`` prefers the canonical continuation input
+        when handoff filtering rewrote model history, while remaining identical for ordinary runs.
+        """
+        public_input = self.input
+        owned_item_refs = _reconciled_result_owned_item_refs(self, public_input)
+        original_items = ItemHelpers.input_to_new_input_list(public_input)
+        reasoning_item_id_policy = getattr(self, "_reasoning_item_id_policy", None)
+        replay_items = _input_items_for_result(
+            self,
+            mode=mode,
+            reasoning_item_id_policy=reasoning_item_id_policy,
+            public_input=public_input,
+            owned_item_refs=owned_item_refs,
+        )
+        return original_items + replay_items
 
     @property
     def agent_tool_invocation(self) -> AgentToolInvocation | None:
@@ -279,8 +442,8 @@ class RunResult(RunResultBase):
         default=None, init=False, repr=False
     )
     """How reasoning IDs should be represented when converting to input history."""
-    max_turns: int = 10
-    """The maximum number of turns allowed for this run."""
+    max_turns: int | None = 10
+    """The maximum number of turns allowed for this run, or ``None`` for no limit."""
     interruptions: list[ToolApprovalItem] = field(default_factory=list)
     """Pending tool approval requests (interruptions) for this run."""
 
@@ -338,7 +501,7 @@ class RunResult(RunResultBase):
             original_input=original_input_for_state
             if original_input_for_state is not None
             else self.input,
-            starting_agent=self.last_agent,
+            starting_agent=_starting_agent_for_state(self),
             max_turns=self.max_turns,
         )
 
@@ -374,8 +537,8 @@ class RunResultStreaming(RunResultBase):
     current_turn: int
     """The current turn number."""
 
-    max_turns: int
-    """The maximum number of turns the agent can run for."""
+    max_turns: int | None
+    """The maximum number of turns the agent can run for, or ``None`` for no limit."""
 
     final_output: Any
     """The final output of the agent. This is None until the agent has finished running."""
@@ -407,6 +570,7 @@ class RunResultStreaming(RunResultBase):
     # Store the asyncio tasks that we're waiting on
     run_loop_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     _input_guardrails_task: asyncio.Task[Any] | None = field(default=None, repr=False)
+    _triggered_input_guardrail_result: InputGuardrailResult | None = field(default=None, repr=False)
     _output_guardrails_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     _stored_exception: Exception | None = field(default=None, repr=False)
     _cancel_mode: Literal["none", "immediate", "after_turn"] = field(default="none", repr=False)
@@ -423,7 +587,7 @@ class RunResultStreaming(RunResultBase):
     _stream_input_persisted: bool = False
     """Whether the input has been persisted to the session. Prevents double-saving."""
 
-    _original_input_for_persistence: list[TResponseInputItem] = field(default_factory=list)
+    _original_input_for_persistence: list[TResponseInputItem] | None = None
     """Original turn input before session history was merged, used for
     persistence (matches JS sessionInputOriginalSnapshot)."""
 
@@ -446,6 +610,13 @@ class RunResultStreaming(RunResultBase):
     )
     """How reasoning IDs should be represented when converting to input history."""
     _run_impl_task: InitVar[asyncio.Task[Any] | None] = None
+    _sandbox_cleanup: Callable[[], Awaitable[None]] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _sandbox_cleanup_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    _sandbox_cleanup_callback_registered: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self, _run_impl_task: asyncio.Task[Any] | None) -> None:
         self._current_agent_ref = weakref.ref(self.current_agent)
@@ -477,6 +648,82 @@ class RunResultStreaming(RunResultBase):
         self._current_agent_ref = weakref.ref(agent)
         # Preserve dataclass field so repr/asdict continue to succeed.
         self.__dict__["current_agent"] = None
+
+    async def _run_sandbox_cleanup(self) -> None:
+        sandbox_cleanup = self._sandbox_cleanup
+        if sandbox_cleanup is None:
+            return
+
+        task = self._sandbox_cleanup_task
+        if task is None:
+
+            async def _cleanup_once() -> None:
+                try:
+                    await sandbox_cleanup()
+                except Exception as error:
+                    logger.warning(
+                        "Failed to clean up sandbox resources after streamed run: %s", error
+                    )
+
+            task = asyncio.create_task(_cleanup_once())
+            self._sandbox_cleanup_task = task
+
+        await task
+
+    def ensure_sandbox_cleanup_on_completion(self) -> None:
+        if (
+            self._sandbox_cleanup is None
+            or self.run_loop_task is None
+            or self._sandbox_cleanup_callback_registered
+        ):
+            return
+
+        original_task = self.run_loop_task
+        self._sandbox_cleanup_callback_registered = True
+        original_task.add_done_callback(
+            lambda _task: asyncio.create_task(self._run_sandbox_cleanup())
+        )
+
+        async def _await_run_and_cleanup() -> Any:
+            try:
+                result = await original_task
+            except asyncio.CancelledError:
+                if not original_task.done():
+                    original_task.cancel()
+                raise
+            except Exception:
+                await self._run_sandbox_cleanup()
+                raise
+
+            await self._run_sandbox_cleanup()
+            return result
+
+        self.run_loop_task = asyncio.create_task(_await_run_and_cleanup())
+
+    @property
+    def run_loop_exception(self) -> BaseException | None:
+        """The exception raised by the background run loop, if any.
+
+        When the run loop fails before producing stream events (for example during early
+        sandbox initialisation), the exception may not be re-raised through
+        :meth:`stream_events`. This property gives callers a reliable way to check for
+        silent failures after consuming the stream:
+
+        .. code-block:: python
+
+            result = Runner.run_streamed(agent, "hello")
+            async for event in result.stream_events():
+                pass
+            if result.run_loop_exception:
+                raise result.run_loop_exception
+
+        Returns ``None`` if the run loop completed without error, has not yet finished,
+        or was cancelled.
+        """
+        task = self.run_loop_task
+        if task is None or not task.done() or task.cancelled():
+            return None
+        return task.exception()
 
     def cancel(self, mode: Literal["immediate", "after_turn"] = "immediate") -> None:
         """Cancel the streaming run.
@@ -539,7 +786,12 @@ class RunResultStreaming(RunResultBase):
         try:
             while True:
                 self._check_errors()
-                should_drain_queued_events = isinstance(self._stored_exception, MaxTurnsExceeded)
+                should_drain_queued_events = isinstance(
+                    self._stored_exception, MaxTurnsExceeded
+                ) or (
+                    self._stored_exception is not None
+                    and _should_drain_stream_events_before_raising(self._stored_exception)
+                )
                 if self._stored_exception and (
                     not should_drain_queued_events or self._event_queue.empty()
                 ):
@@ -575,24 +827,33 @@ class RunResultStreaming(RunResultBase):
                 yield item
                 self._event_queue.task_done()
         finally:
-            if cancelled:
-                # Cancellation should return promptly, so avoid waiting on long-running tasks.
-                # Tasks have already been cancelled above.
-                self._cleanup_tasks()
-            else:
-                # Ensure main execution completes before cleanup to avoid race conditions
-                # with session operations
-                await self._await_task_safely(self.run_loop_task)
-                # Safely terminate all background tasks after main execution has finished
-                self._cleanup_tasks()
+            try:
+                if cancelled:
+                    # Cancellation should return promptly, so avoid waiting on long-running tasks.
+                    # Tasks have already been cancelled above.
+                    self._cleanup_tasks()
+                else:
+                    # Ensure main execution completes before cleanup to avoid race conditions
+                    # with session operations.
+                    await self._await_task_safely(self.run_loop_task)
+                    # Re-check for exceptions now that the run loop has fully settled.
+                    # _await_task_safely swallows exceptions; without this call, a run-loop
+                    # failure that races past the sentinel (e.g. early sandbox failures) would
+                    # be silently lost instead of surfaced via _stored_exception.
+                    self._check_errors()
+                    # Safely terminate all background tasks after main execution has finished.
+                    self._cleanup_tasks()
 
-            # Allow any pending callbacks (e.g., cancellation handlers) to enqueue their
-            # completion sentinels before we clear the queues for observability.
-            await asyncio.sleep(0)
+                if not cancelled:
+                    await self._run_sandbox_cleanup()
+            finally:
+                # Allow any pending callbacks (e.g., cancellation handlers) to enqueue their
+                # completion sentinels before we clear the queues for observability.
+                await asyncio.sleep(0)
 
-            # Drain queues so callers observing internal state see them empty after completion.
-            self._drain_event_queue()
-            self._drain_input_guardrail_queue()
+                # Drain queues so callers observing internal state see them empty after completion.
+                self._drain_event_queue()
+                self._drain_input_guardrail_queue()
 
         if self._stored_exception:
             raise self._stored_exception
@@ -610,7 +871,11 @@ class RunResultStreaming(RunResultBase):
         )
 
     def _check_errors(self):
-        if self.current_turn > self.max_turns and not self._max_turns_handled:
+        if (
+            self.max_turns is not None
+            and self.current_turn > self.max_turns
+            and not self._max_turns_handled
+        ):
             max_turns_exc = MaxTurnsExceeded(f"Max turns ({self.max_turns}) exceeded")
             max_turns_exc.run_data = self._create_error_details()
             self._stored_exception = max_turns_exc
@@ -734,7 +999,7 @@ class RunResultStreaming(RunResultBase):
         state = RunState(
             context=self.context_wrapper,
             original_input=self._original_input if self._original_input is not None else self.input,
-            starting_agent=self.last_agent,
+            starting_agent=_starting_agent_for_state(self),
             max_turns=self.max_turns,
         )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic
 
@@ -207,6 +208,102 @@ class RunContextWrapper(Generic[TContext]):
         # Per-call approvals are scoped to the exact call ID, so other calls require a new decision.
         return None
 
+    @staticmethod
+    def _clear_rejection_message(record: _ApprovalRecord, call_id: str | None) -> None:
+        if call_id is None:
+            return
+        record.rejection_messages.pop(call_id, None)
+
+    @staticmethod
+    def _get_rejection_message_for_key(record: _ApprovalRecord, call_id: str) -> str | None:
+        if record.rejected is True:
+            if call_id in record.rejection_messages:
+                return record.rejection_messages[call_id]
+            return record.sticky_rejection_message
+        if isinstance(record.rejected, list) and call_id in record.rejected:
+            return record.rejection_messages.get(call_id)
+        return None
+
+    @staticmethod
+    def _restore_approval_value(value: Any) -> bool | list[str]:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, str)]
+        return []
+
+    def get_rejection_message(
+        self,
+        tool_name: str,
+        call_id: str,
+        *,
+        tool_namespace: str | None = None,
+        existing_pending: ToolApprovalItem | None = None,
+        tool_lookup_key: FunctionToolLookupKey | None = None,
+    ) -> str | None:
+        """Return a stored rejection message for a tool call if one exists."""
+        candidates: list[str] = []
+        explicit_namespace = (
+            tool_namespace if isinstance(tool_namespace, str) and tool_namespace else None
+        )
+        pending_namespace = (
+            self._resolve_tool_namespace(existing_pending) if existing_pending is not None else None
+        )
+        pending_key = self._resolve_approval_key(existing_pending) if existing_pending else None
+        pending_tool_name = self._resolve_tool_name(existing_pending) if existing_pending else None
+        pending_keys = (
+            list(self._resolve_approval_keys(existing_pending))
+            if existing_pending is not None
+            else []
+        )
+
+        if existing_pending and pending_key is not None:
+            candidates.append(pending_key)
+        explicit_keys = (
+            list(
+                get_function_tool_approval_keys(
+                    tool_name=tool_name,
+                    tool_namespace=explicit_namespace,
+                    tool_lookup_key=tool_lookup_key,
+                    include_legacy_deferred_key=True,
+                )
+            )
+            if explicit_namespace is not None or tool_lookup_key is not None
+            else []
+        )
+        for explicit_key in explicit_keys:
+            if explicit_key not in candidates:
+                candidates.append(explicit_key)
+        if not explicit_keys and pending_namespace and pending_key is not None:
+            if pending_key not in candidates:
+                candidates.append(pending_key)
+        if (
+            explicit_namespace is None
+            and tool_lookup_key is None
+            and existing_pending is None
+            and tool_name not in candidates
+        ):
+            candidates.append(tool_name)
+        if existing_pending:
+            for pending_candidate in pending_keys:
+                if pending_candidate not in candidates:
+                    candidates.append(pending_candidate)
+            if (
+                pending_namespace is None
+                and pending_tool_name is not None
+                and pending_tool_name not in candidates
+            ):
+                candidates.append(pending_tool_name)
+
+        for candidate in candidates:
+            approval_entry = self._approvals.get(candidate)
+            if not approval_entry:
+                continue
+            message = self._get_rejection_message_for_key(approval_entry, call_id)
+            if message is not None:
+                return message
+        return None
+
     def _apply_approval_decision(
         self, approval_item: ToolApprovalItem, *, always: bool, approve: bool
     ) -> None:
@@ -319,13 +416,27 @@ class RunContextWrapper(Generic[TContext]):
                 break
         return status
 
-    def _rebuild_approvals(self, approvals: dict[str, dict[str, Any]]) -> None:
+    def _rebuild_approvals(self, approvals: Any) -> None:
         """Restore approvals from serialized state."""
         self._approvals = {}
+        if not isinstance(approvals, Mapping):
+            return
         for tool_name, record_dict in approvals.items():
+            if not isinstance(tool_name, str) or not isinstance(record_dict, dict):
+                continue
             record = _ApprovalRecord()
-            record.approved = record_dict.get("approved", [])
-            record.rejected = record_dict.get("rejected", [])
+            record.approved = self._restore_approval_value(record_dict.get("approved", []))
+            record.rejected = self._restore_approval_value(record_dict.get("rejected", []))
+            rejection_messages = record_dict.get("rejection_messages", {})
+            if isinstance(rejection_messages, dict):
+                record.rejection_messages = {
+                    str(call_id): message
+                    for call_id, message in rejection_messages.items()
+                    if isinstance(message, str)
+                }
+            sticky_rejection_message = record_dict.get("sticky_rejection_message")
+            if isinstance(sticky_rejection_message, str):
+                record.sticky_rejection_message = sticky_rejection_message
             self._approvals[tool_name] = record
 
     def _fork_with_tool_input(self, tool_input: Any) -> RunContextWrapper[TContext]:

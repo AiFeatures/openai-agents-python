@@ -4,11 +4,10 @@ import dataclasses
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from inspect import isawaitable
-from typing import Any
+from typing import Any, TypeAlias
 
 from pydantic import Field
 from pydantic.dataclasses import dataclass as pydantic_dataclass
-from typing_extensions import TypeAlias
 
 from .util._types import MaybeAwaitable
 
@@ -17,13 +16,13 @@ from .util._types import MaybeAwaitable
 class ModelRetryBackoffSettings:
     """Backoff configuration for runner-managed model retries."""
 
-    initial_delay: float | None = None
+    initial_delay: float | None = Field(default=None, ge=0)
     """Delay in seconds before the first retry attempt."""
 
-    max_delay: float | None = None
+    max_delay: float | None = Field(default=None, ge=0)
     """Maximum delay in seconds between retry attempts."""
 
-    multiplier: float | None = None
+    multiplier: float | None = Field(default=None, ge=0)
     """Multiplier applied after each retry attempt."""
 
     jitter: bool | None = None
@@ -146,8 +145,8 @@ def _mark_retry_capabilities(
     retries_safe_transport_errors: bool,
     retries_all_transient_errors: bool,
 ) -> RetryPolicy:
-    setattr(policy, _RETRIES_SAFE_TRANSPORT_ERRORS_ATTR, retries_safe_transport_errors)  # noqa: B010
-    setattr(policy, _RETRIES_ALL_TRANSIENT_ERRORS_ATTR, retries_all_transient_errors)  # noqa: B010
+    setattr(policy, _RETRIES_SAFE_TRANSPORT_ERRORS_ATTR, retries_safe_transport_errors)
+    setattr(policy, _RETRIES_ALL_TRANSIENT_ERRORS_ATTR, retries_all_transient_errors)
     return policy
 
 

@@ -54,7 +54,7 @@ from ...memory.session_settings import SessionSettings, resolve_session_limit
 
 
 class SQLAlchemySession(SessionABC):
-    """SQLAlchemy implementation of :pyclass:`agents.memory.session.Session`."""
+    """SQLAlchemy implementation of [`Session`][agents.memory.session.Session]."""
 
     _table_init_locks: ClassVar[dict[tuple[str, str, str], threading.Lock]] = {}
     _table_init_locks_guard: ClassVar[threading.Lock] = threading.Lock()
@@ -136,6 +136,7 @@ class SQLAlchemySession(SessionABC):
         sessions_table: str = "agent_sessions",
         messages_table: str = "agent_messages",
         session_settings: SessionSettings | None = None,
+        ensure_ascii: bool = True,
     ):
         """Initializes a new SQLAlchemySession.
 
@@ -150,10 +151,13 @@ class SQLAlchemySession(SessionABC):
             sessions_table (str, optional): Override the default table name for sessions if needed.
             messages_table (str, optional): Override the default table name for messages if needed.
             session_settings (SessionSettings | None, optional): Session configuration settings
+            ensure_ascii (bool, optional): Whether to escape non-ASCII characters when serializing
+                session items to JSON. Defaults to True to preserve the historical storage format.
         """
         self.session_id = session_id
         self.session_settings = session_settings or SessionSettings()
         self._engine = engine
+        self._ensure_ascii = ensure_ascii
         self._configure_sqlite_engine(engine)
         self._init_lock = (
             self._get_table_init_lock(engine, sessions_table, messages_table)
@@ -245,7 +249,7 @@ class SQLAlchemySession(SessionABC):
 
     async def _serialize_item(self, item: TResponseInputItem) -> str:
         """Serialize an item to JSON string. Can be overridden by subclasses."""
-        return json.dumps(item, separators=(",", ":"))
+        return json.dumps(item, ensure_ascii=self._ensure_ascii, separators=(",", ":"))
 
     async def _deserialize_item(self, item: str) -> TResponseInputItem:
         """Deserialize a JSON string to an item. Can be overridden by subclasses."""
@@ -260,7 +264,7 @@ class SQLAlchemySession(SessionABC):
             return
 
         assert self._init_lock is not None
-        while not self._init_lock.acquire(blocking=False):
+        while not self._init_lock.acquire(blocking=False):  # noqa: ASYNC110
             # Poll without handing lock acquisition to a background thread so
             # cancellation cannot strand the shared init lock in the acquired state.
             await asyncio.sleep(0.01)
@@ -385,33 +389,34 @@ class SQLAlchemySession(SessionABC):
         await self._ensure_tables()
         async with self._session_factory() as sess:
             async with sess.begin():
-                # Fallback for all dialects - get ID first, then delete
-                subq = (
-                    select(self._messages.c.id)
-                    .where(self._messages.c.session_id == self.session_id)
-                    .order_by(
-                        self._messages.c.created_at.desc(),
-                        self._messages.c.id.desc(),
+                while True:
+                    # Fallback for all dialects - get ID first, then delete
+                    subq = (
+                        select(self._messages.c.id)
+                        .where(self._messages.c.session_id == self.session_id)
+                        .order_by(
+                            self._messages.c.created_at.desc(),
+                            self._messages.c.id.desc(),
+                        )
+                        .limit(1)
                     )
-                    .limit(1)
-                )
-                res = await sess.execute(subq)
-                row_id = res.scalar_one_or_none()
-                if row_id is None:
-                    return None
-                # Fetch data before deleting
-                res_data = await sess.execute(
-                    select(self._messages.c.message_data).where(self._messages.c.id == row_id)
-                )
-                row = res_data.scalar_one_or_none()
-                await sess.execute(delete(self._messages).where(self._messages.c.id == row_id))
+                    res = await sess.execute(subq)
+                    row_id = res.scalar_one_or_none()
+                    if row_id is None:
+                        return None
+                    # Fetch data before deleting
+                    res_data = await sess.execute(
+                        select(self._messages.c.message_data).where(self._messages.c.id == row_id)
+                    )
+                    row = res_data.scalar_one_or_none()
+                    await sess.execute(delete(self._messages).where(self._messages.c.id == row_id))
 
-                if row is None:
-                    return None
-                try:
-                    return await self._deserialize_item(row)
-                except json.JSONDecodeError:
-                    return None
+                    if row is None:
+                        continue
+                    try:
+                        return await self._deserialize_item(row)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
 
     async def clear_session(self) -> None:
         """Clear all items for this session."""
