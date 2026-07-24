@@ -33,6 +33,7 @@ import modal
 from modal.config import config as modal_config
 from modal.container_process import ContainerProcess
 
+from ....logger import log_tool_action_warning
 from ....sandbox.config import DEFAULT_PYTHON_SANDBOX_IMAGE
 from ....sandbox.entries import Mount
 from ....sandbox.errors import (
@@ -1327,8 +1328,9 @@ class ModalSandboxSession(BaseSandboxSession):
             if not rm_out.ok():
                 cleanup_restore_error = await restore_ephemeral_paths()
                 if cleanup_restore_error is not None:
-                    logger.warning(
-                        "Failed to restore Modal ephemeral paths after cleanup failure: %s",
+                    log_tool_action_warning(
+                        logger,
+                        "Failed to restore Modal ephemeral paths after cleanup failure",
                         cleanup_restore_error,
                     )
                 raise WorkspaceArchiveReadError(
@@ -1352,8 +1354,9 @@ class ModalSandboxSession(BaseSandboxSession):
         except Exception as e:
             restore_error = await restore_ephemeral_paths()
             if restore_error is not None:
-                logger.warning(
-                    "Failed to restore Modal ephemeral paths after snapshot failure: %s",
+                log_tool_action_warning(
+                    logger,
+                    "Failed to restore Modal ephemeral paths after snapshot failure",
                     restore_error,
                 )
             raise WorkspaceArchiveReadError(
@@ -1652,7 +1655,11 @@ class ModalSandboxSession(BaseSandboxSession):
 
         excludes: list[str] = []
         for rel in sorted(skip, key=lambda p: p.as_posix()):
-            excludes.extend(["--exclude", f"./{rel.as_posix().lstrip('./')}"])
+            # Strip a leading "./" prefix only. `lstrip("./")` strips a *set* of
+            # characters, which would eat leading dots of dot-prefixed skip paths
+            # (e.g. ".venv" -> "venv"), producing a wrong exclude pattern. Match the
+            # Cloudflare backend, which uses removeprefix here.
+            excludes.extend(["--exclude", f"./{rel.as_posix().removeprefix('./')}"])
 
         cmd: list[str] = [
             "tar",
