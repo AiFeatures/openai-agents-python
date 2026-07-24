@@ -199,7 +199,9 @@ def _server_event_validation_summary(error: BaseException) -> str:
     if isinstance(error, pydantic.ValidationError):
         return f"{error.error_count()} validation error(s)"
 
-    return error.__class__.__name__
+    if not _debug.DONT_LOG_MODEL_DATA:
+        return type(error).__name__
+    return "validation failed"
 
 
 def _server_event_identity(event: Any) -> tuple[Any, Any]:
@@ -720,6 +722,8 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
                     )
                 else:
                     await self._send_raw_message(converted)
+            elif _debug.DONT_LOG_MODEL_DATA:
+                logger.error("Failed to convert raw message type=%s", event.message.get("type"))
             else:
                 logger.error("Failed to convert raw message: %s", event)
         elif isinstance(event, RealtimeModelSendUserInput):
