@@ -52,6 +52,8 @@ from ...models.chatcmpl_stream_handler import ChatCmplStreamHandler
 from ...models.fake_id import FAKE_RESPONSES_ID
 from ...models.interface import Model, ModelTracing
 from ...models.openai_responses import Converter as OpenAIResponsesConverter
+from ...models.reasoning_content_replay import ShouldReplayReasoningContent
+from ...retry import ModelRetryAdvice, ModelRetryAdviceRequest
 from ...tool import Tool
 from ...tracing import generation_span
 from ...tracing.span_data import GenerationSpanData
@@ -143,7 +145,7 @@ class InternalToolCall(ChatCompletionMessageFunctionToolCall):
 
 
 class LitellmModel(Model):
-    """This class enables using any model via LiteLLM. LiteLLM allows you to acess OpenAPI,
+    """This class enables using any model via LiteLLM. LiteLLM allows you to access OpenAPI,
     Anthropic, Gemini, Mistral, and many other models.
     See supported models here: [litellm models](https://docs.litellm.ai/docs/providers).
     """
@@ -153,10 +155,17 @@ class LitellmModel(Model):
         model: str,
         base_url: str | None = None,
         api_key: str | None = None,
+        should_replay_reasoning_content: ShouldReplayReasoningContent | None = None,
     ):
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
+        self.should_replay_reasoning_content = should_replay_reasoning_content
+
+    def get_retry_advice(self, request: ModelRetryAdviceRequest) -> ModelRetryAdvice | None:
+        # LiteLLM exceptions mirror OpenAI-style status/header fields.
+        # Reuse the same normalization to expose retry-after and explicit retry/no-retry hints.
+        return get_openai_retry_advice(request)
 
     def _get_reasoning_effort(self, model_settings: ModelSettings) -> Any | None:
         """
@@ -509,9 +518,11 @@ class LitellmModel(Model):
 
         converted_messages = Converter.items_to_messages(
             input,
+            base_url=self.base_url,
             preserve_thinking_blocks=preserve_thinking_blocks,
             preserve_tool_output_all_content=True,
             model=self.model,
+            should_replay_reasoning_content=self.should_replay_reasoning_content,
         )
 
         # Fix message ordering: reorder to ensure tool_use comes before tool_result.
@@ -579,7 +590,7 @@ class LitellmModel(Model):
         if stream and model_settings.include_usage is not None:
             stream_options = {"include_usage": model_settings.include_usage}
 
-        extra_kwargs = {}
+        extra_kwargs: dict[str, Any] = {}
         if model_settings.extra_query:
             extra_kwargs["extra_query"] = copy(model_settings.extra_query)
         if model_settings.metadata:

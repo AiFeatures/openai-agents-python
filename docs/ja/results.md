@@ -46,7 +46,7 @@ search:
 
 これらのインターフェースは、それぞれ異なる目的に対応します。
 
-| プロパティまたはヘルパー | 含まれるもの | 最適な用途 |
+| プロパティまたはヘルパー | 含まれる内容 | 最適な用途 |
 | --- | --- | --- |
 | [`input`][agents.result.RunResultBase.input] | この実行セグメントの基本入力です。ハンドオフ入力フィルターによって履歴が書き換えられた場合は、実行の継続に使用されたフィルター適用後の入力が反映されます。 | この実行で実際に使用された入力の監査 |
 | [`to_input_list()`][agents.result.RunResultBase.to_input_list] | 実行の入力項目ビューです。デフォルトの `mode="preserve_all"` では、`new_items` から変換された履歴が維持されます。ただし、SDK デフォルトのネストされたハンドオフ履歴へすでに移されたセッション項目と完全に同一の出現箇所が、再度追加されることはありません。`mode="normalized"` では、ハンドオフのフィルタリングによってモデル履歴が書き換えられた場合、正規の継続入力が優先されます。 | 手動のチャットループ、クライアント管理の会話状態、プレーン項目による履歴の確認 |
@@ -208,7 +208,7 @@ Python では、ストリーミング用の独立した `completed` Promise や 
 
 [`raw_responses`][agents.result.RunResultBase.raw_responses] には、実行中に収集された raw なモデルレスポンスが含まれます。複数ステップの実行では、ハンドオフやモデル、ツール、モデルというサイクルの繰り返しなどにより、複数のレスポンスが生成される場合があります。
 
-[`last_response_id`][agents.result.RunResultBase.last_response_id] は、`raw_responses` の最後のエントリーの ID にすぎません。
+[`last_response_id`][agents.result.RunResultBase.last_response_id] は、`raw_responses` の最後のエントリの ID にすぎません。
 
 各 [`ModelResponse`][agents.items.ModelResponse] は、その個別のモデル呼び出しに適用される次の 2 つの診断情報も公開します。
 

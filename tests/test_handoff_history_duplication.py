@@ -10,6 +10,7 @@ import json
 from copy import deepcopy
 from typing import Any, cast
 
+import pytest
 from openai.types.responses import (
     ResponseFunctionToolCall,
     ResponseOutputMessage,

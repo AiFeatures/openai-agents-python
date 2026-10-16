@@ -4304,6 +4304,7 @@ async def test_execute_tools_emits_hosted_mcp_rejection_response():
     assert responses, "Rejection should emit an MCP approval response."
     assert responses[0].raw_item["approve"] is False
     assert responses[0].raw_item["approval_request_id"] == "mcp-approval-reject"
+    assert "reason" not in responses[0].raw_item
     assert not isinstance(result.next_step, NextStepInterruption)
 
 

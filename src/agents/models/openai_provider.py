@@ -24,7 +24,7 @@ from .openai_responses import (
     OpenAIResponsesWSModel,
 )
 
-# This is kept for backward compatiblity but using get_default_model() method is recommended.
+# This is kept for backward compatibility but using get_default_model() method is recommended.
 DEFAULT_MODEL: str = "gpt-4o"
 
 
