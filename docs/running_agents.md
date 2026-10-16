@@ -9,6 +9,7 @@ You can run agents via the [`Runner`][agents.run.Runner] class. You have 3 optio
 ```python
 from agents import Agent, Runner
 
+
 async def main():
     agent = Agent(name="Assistant", instructions="You are a helpful assistant")
 
@@ -25,18 +26,18 @@ Read more in the [results guide](results.md).
 
 ### The agent loop
 
-When you use the run method in `Runner`, you pass in a starting agent and input. The input can be:
+When you call any of the three `Runner` methods above, you pass in a starting agent and input. The input can be:
 
 -   a string (treated as a user message),
 -   a list of input items in the OpenAI Responses API format, or
--   a [`RunState`][agents.run_state.RunState] when resuming an interrupted run.
+-   a [`RunState`][agents.run_state.RunState] when resuming a paused run or a run stopped with `cancel(mode="after_turn")`. The state can also carry [input staged for the next resumed model call](results.md#add-input-before-resuming).
 
 The runner then runs a loop:
 
 1. We call the LLM for the current agent, with the current input.
 2. The LLM produces its output.
-    1. If the LLM returns a `final_output`, the loop ends and we return the result.
-    2. If the LLM does a handoff, we update the current agent and input, and re-run the loop.
+    1. If the runner classifies the LLM's output as final output, the loop ends and we return the result.
+    2. If the LLM requests a handoff, we update the current agent and input, and re-run the loop.
     3. If the LLM produces tool calls, we run those tool calls, append the results, and re-run the loop.
 3. If we exceed the `max_turns` passed, we raise a [`MaxTurnsExceeded`][agents.exceptions.MaxTurnsExceeded] exception. Pass `max_turns=None` to disable this turn limit.
 
@@ -83,6 +84,8 @@ asyncio.run(main())
 
 This pattern is fine for single runs. If you call `Runner.run()` / `Runner.run_streamed()` repeatedly, each run may reconnect unless you manually reuse the same `RunConfig` / provider instance.
 
+The Runner owns the model provider only when `run_config` is omitted or when a `dict`-based config omits `model_provider`. The Runner closes that implicitly created provider after a non-streaming run returns or after a streamed run settles, including error and cancellation paths. If you pass a `RunConfig` instance or a `dict` that contains `model_provider`, your application owns that provider; the Runner leaves it open so you can reuse it, and your application must eventually call its `aclose()` method.
+
 ##### Pattern 2: Use `responses_websocket_session()` (recommended for multi-turn reuse)
 
 Use [`responses_websocket_session()`][agents.responses_websocket_session] when you want a shared websocket-capable provider and `RunConfig` across multiple runs (including nested agent-as-tool calls that inherit the same `run_config`).
@@ -117,6 +120,8 @@ asyncio.run(main())
 
 Finish consuming streamed results before the context exits. Exiting the context while a websocket request is still in flight may force-close the shared connection.
 
+The service processes one response at a time on each websocket connection and limits a connection to 60 minutes. The helper reuses the connection but does not remove those constraints. After a reconnect, `store=False` and ZDR flows cannot recover an uncached `previous_response_id`; start a new chain with full input context or rebuild it from locally managed session state. See the [Responses WebSocket transport notes](models/index.md#responses-websocket-transport) for the full recovery behavior.
+
 If long reasoning turns hit websocket keepalive timeouts, increase `ping_timeout` or set `ping_timeout=None` to disable heartbeat timeouts. Use HTTP/SSE transport for runs where reliability matters more than websocket latency.
 
 ### Run config
@@ -133,14 +138,14 @@ Use `RunConfig` to override behavior for a single run without changing each agen
 -   [`model_provider`][agents.run.RunConfig.model_provider]: A model provider for looking up model names, which defaults to OpenAI.
 -   [`model_settings`][agents.run.RunConfig.model_settings]: Overrides agent-specific settings. For example, you can set a global `temperature` or `top_p`.
 -   [`session_settings`][agents.run.RunConfig.session_settings]: Overrides session-level defaults (for example, `SessionSettings(limit=...)`) when retrieving history during a run.
--   [`session_input_callback`][agents.run.RunConfig.session_input_callback]: Customize how new user input is merged with session history before each turn when using Sessions. The callback can be sync or async.
+-   [`session_input_callback`][agents.run.RunConfig.session_input_callback]: Customize how new user input is merged with session history before each `Runner` run when using Sessions. The callback can be sync or async.
 
 ##### Guardrails, handoffs, and model input shaping
 
 -   [`input_guardrails`][agents.run.RunConfig.input_guardrails], [`output_guardrails`][agents.run.RunConfig.output_guardrails]: A list of input or output guardrails to include on all runs.
 -   [`handoff_input_filter`][agents.run.RunConfig.handoff_input_filter]: A global input filter to apply to all handoffs, if the handoff doesn't already have one. The input filter allows you to edit the inputs that are sent to the new agent. See the documentation in [`Handoff.input_filter`][agents.handoffs.Handoff.input_filter] for more details.
--   [`nest_handoff_history`][agents.run.RunConfig.nest_handoff_history]: Opt-in beta that collapses the prior transcript into a single assistant message before invoking the next agent. This is disabled by default while we stabilize nested handoffs; set to `True` to enable or leave `False` to pass through the raw transcript. All [Runner methods][agents.run.Runner] automatically create a `RunConfig` when you do not pass one, so the quickstarts and examples keep the default off, and any explicit [`Handoff.input_filter`][agents.handoffs.Handoff.input_filter] callbacks continue to override it. Individual handoffs can override this setting via [`Handoff.nest_handoff_history`][agents.handoffs.Handoff.nest_handoff_history].
--   [`handoff_history_mapper`][agents.run.RunConfig.handoff_history_mapper]: Optional callable that receives the normalized transcript (history + handoff items) whenever you opt in to `nest_handoff_history`. It must return the exact list of input items to forward to the next agent, allowing you to replace the built-in summary without writing a full handoff filter.
+-   [`nest_handoff_history`][agents.run.RunConfig.nest_handoff_history]: Opt-in beta that compacts summarizable history into ordered assistant summary segments while preserving lossless message items in their original positions before invoking the next agent. This is disabled by default while we stabilize nested handoffs; set to `True` to enable or leave `False` to pass through the raw transcript. Sessions, `RunState`, and `RunResult.to_input_list()` avoid appending an exact message occurrence twice when the SDK-default nested history already owns it, while preserving separate identical messages. All [Runner methods][agents.run.Runner] automatically create a `RunConfig` when you do not pass one, so the quickstarts and examples keep the default off, and any explicit [`Handoff.input_filter`][agents.handoffs.Handoff.input_filter] callbacks continue to override it. Individual handoffs can override this setting via [`Handoff.nest_handoff_history`][agents.handoffs.Handoff.nest_handoff_history].
+-   [`handoff_history_mapper`][agents.run.RunConfig.handoff_history_mapper]: Optional callable that receives the normalized transcript (history + handoff items) whenever you opt in to `nest_handoff_history`. It must return the exact list of input items to forward to the next agent, replacing the built-in ordered summary segments without writing a full handoff filter.
 -   [`call_model_input_filter`][agents.run.RunConfig.call_model_input_filter]: Hook to edit the fully prepared model input (instructions and input items) immediately before the model call, e.g., to trim history or inject a system prompt.
 -   [`reasoning_item_id_policy`][agents.run.RunConfig.reasoning_item_id_policy]: Control whether reasoning item IDs are preserved or omitted when the runner converts prior outputs into next-turn model input.
 
@@ -154,11 +159,12 @@ Use `RunConfig` to override behavior for a single run without changing each agen
 
 ##### Tool execution, approval, and tool error behavior
 
--   [`tool_execution`][agents.run.RunConfig.tool_execution]: Configure SDK-side execution behavior for local tool calls, such as limiting how many function tools run at once.
--   [`tool_not_found_behavior`][agents.run.RunConfig.tool_not_found_behavior]: Configure how the runner handles unresolved function tool calls emitted by the model. The default raises `ModelBehaviorError`; opt in to return a model-visible error output instead.
+-   [`tool_execution`][agents.run.RunConfig.tool_execution]: Configure SDK-side execution behavior for local tool calls, such as limiting how many local function tool calls run at once.
+-   [`tool_not_found_behavior`][agents.run.RunConfig.tool_not_found_behavior]: Configure how the runner handles model-emitted function tool calls whose tool name does not match any function tool available to the current agent. The default raises `ModelBehaviorError`; opt in to return a model-visible error output instead.
+-   [`tool_name_collision_policy`][agents.run.RunConfig.tool_name_collision_policy]: Configure how the runner handles unnamespaced function-tool and handoff names that collide. The default, `"warn"`, logs an actionable warning and exposes only the current dispatch winner; `"error"` raises `UserError` before the model is called. Strict validation for namespaced and deferred-loading tools is unchanged.
 -   [`tool_error_formatter`][agents.run.RunConfig.tool_error_formatter]: Customize model-visible tool error messages, such as approval rejections and opt-in tool-not-found outputs.
 
-Nested handoffs are available as an opt-in beta. Enable the collapsed-transcript behavior by passing `RunConfig(nest_handoff_history=True)` or set `handoff(..., nest_handoff_history=True)` to turn it on for a specific handoff. If you prefer to keep the raw transcript (the default), leave the flag unset or provide a `handoff_input_filter` (or `handoff_history_mapper`) that forwards the conversation exactly as you need. To change the wrapper text used in the generated summary without writing a custom mapper, call [`set_conversation_history_wrappers`][agents.handoffs.set_conversation_history_wrappers] (and [`reset_conversation_history_wrappers`][agents.handoffs.reset_conversation_history_wrappers] to restore the defaults).
+Nested handoffs are available as an opt-in beta. Enable ordered transcript compaction by passing `RunConfig(nest_handoff_history=True)` or set `handoff(..., nest_handoff_history=True)` to turn it on for a specific handoff. The built-in mapper places generated assistant summary segments around lossless message items instead of collapsing the whole transcript into one message. If you prefer to keep the raw transcript (the default), leave the flag unset or provide a `handoff_input_filter` (or `handoff_history_mapper`) that forwards the conversation exactly as you need. To change the wrapper text used in generated summary segments without writing a custom mapper, call [`set_conversation_history_wrappers`][agents.handoffs.set_conversation_history_wrappers] (and [`reset_conversation_history_wrappers`][agents.handoffs.reset_conversation_history_wrappers] to restore the defaults).
 
 #### Run config details
 
@@ -183,7 +189,7 @@ result = await Runner.run(
 )
 ```
 
-`max_function_tool_concurrency=None` preserves the default behavior: when a model emits multiple function tool calls in a turn, the SDK starts all emitted local function tool calls. Set an integer value to cap how many of those local function tools run at once.
+`max_function_tool_concurrency=None` preserves the default behavior: when a model emits multiple function tool calls in a turn, the SDK starts all emitted local function tool calls. Set an integer value to cap how many of those local function tool calls run at once.
 
 This is separate from provider-side [`ModelSettings.parallel_tool_calls`][agents.model_settings.ModelSettings.parallel_tool_calls]. `parallel_tool_calls` controls whether the model is allowed to emit multiple tool calls in a single response. `tool_execution.max_function_tool_concurrency` controls how the SDK executes local function tool calls after the model has emitted them.
 
@@ -207,7 +213,7 @@ result = await Runner.run(
 )
 ```
 
-This option currently applies to unresolved function tool calls only. Other invalid tool payloads continue to use their existing error behavior.
+This option currently applies only to function tool calls that fail tool-name lookup. Other invalid tool payloads continue to use their existing error behavior.
 
 ##### `tool_error_formatter`
 
@@ -303,6 +309,7 @@ You can manually manage conversation history using the [`RunResultBase.to_input_
 ```python
 from agents import Agent, Runner, trace
 
+
 async def main():
     agent = Agent(name="Assistant", instructions="Reply very concisely.")
 
@@ -326,6 +333,7 @@ For a simpler approach, you can use [Sessions](sessions/index.md) to automatical
 
 ```python
 from agents import Agent, Runner, SQLiteSession, trace
+
 
 async def main():
     agent = Agent(name="Assistant", instructions="Reply very concisely.")
@@ -371,6 +379,7 @@ from openai import AsyncOpenAI
 
 client = AsyncOpenAI()
 
+
 async def main():
     agent = Agent(name="Assistant", instructions="Reply very concisely.")
 
@@ -390,6 +399,7 @@ Another option is **response chaining**, where each turn links explicitly to the
 
 ```python
 from agents import Agent, Runner
+
 
 async def main():
     agent = Agent(name="Assistant", instructions="Reply very concisely.")
@@ -437,10 +447,12 @@ The return value must be a [`ModelInputData`][agents.run.ModelInputData] object.
 from agents import Agent, Runner, RunConfig
 from agents.run import CallModelData, ModelInputData
 
+
 def drop_old_messages(data: CallModelData[None]) -> ModelInputData:
     # Keep only the last 5 items and preserve existing instructions.
     trimmed = data.model_data.input[-5:]
     return ModelInputData(input=trimmed, instructions=data.model_data.instructions)
+
 
 agent = Agent(name="Assistant", instructions="Answer concisely.")
 result = Runner.run_sync(
@@ -523,7 +535,7 @@ result = Runner.run_sync(
 print(result.final_output)
 ```
 
-Set `include_in_history=False` when you do not want the fallback output appended to conversation history.
+`RunErrorHandlerResult.include_in_history` defaults to `True`. For a max-turns handler, this appends the synthesized fallback output to conversation history and persists it to the configured session. Set `include_in_history=False` when you want the fallback returned to the caller without adding it to result history or session storage.
 
 Use `"model_refusal"` when a model refusal should produce an application-specific fallback instead of ending the run with `ModelRefusalError`.
 
@@ -563,7 +575,7 @@ For tool approval pause/resume patterns, start with the dedicated [Human-in-the-
 
 ### Dapr
 
-You can use the Agents SDK [Dapr](https://dapr.io) Diagrid integration to run durable, long running agents that automatically recover from failures with human-in-the-loop support. Dapr is a vendor-neutral, [CNCF](https://cncf.io) workflow orchestrator. Get started with Dapr and OpenAI agents [here](https://docs.diagrid.io/getting-started/quickstarts/ai-agents/?agentframework=openai).
+You can use the Agents SDK [Dapr](https://dapr.io) Diagrid integration to run durable, long-running agents that automatically recover from failures and support human-in-the-loop workflows. Dapr is a vendor-neutral, [CNCF](https://cncf.io) workflow orchestrator. Get started with Dapr and OpenAI agents [here](https://docs.diagrid.io/getting-started/quickstarts/ai-agents/?agentframework=openai).
 
 ### Temporal
 
@@ -581,11 +593,13 @@ You can use the Agents SDK [DBOS](https://dbos.dev/) integration to run reliable
 
 The SDK raises exceptions in certain cases. The full list is in [`agents.exceptions`][]. As an overview:
 
--   [`AgentsException`][agents.exceptions.AgentsException]: This is the base class for all exceptions raised within the SDK. It serves as a generic type from which all other specific exceptions are derived.
--   [`MaxTurnsExceeded`][agents.exceptions.MaxTurnsExceeded]: This exception is raised when the agent's run exceeds the `max_turns` limit passed to the `Runner.run`, `Runner.run_sync`, or `Runner.run_streamed` methods. It indicates that the agent could not complete its task within the specified number of interaction turns. Set `max_turns=None` to disable the limit.
+-   [`AgentsException`][agents.exceptions.AgentsException]: This is the base class for all exceptions that the SDK raises. It serves as a generic type from which all other specific exceptions are derived.
+-   [`MaxTurnsExceeded`][agents.exceptions.MaxTurnsExceeded]: This exception is raised when the agent's run exceeds the `max_turns` limit passed to the `Runner.run`, `Runner.run_sync`, or `Runner.run_streamed` methods. It indicates that the agent could not complete its task within the specified number of agent-loop turns (LLM calls). Set `max_turns=None` to disable the limit.
+-   [`ModelTimeoutError`][agents.exceptions.ModelTimeoutError]: This exception is raised when a model-call attempt exceeds [`ModelSettings.timeout`][agents.model_settings.ModelSettings.timeout]. See [Model-call timeouts](models/index.md#model-call-timeouts) for scope and retry behavior.
 -   [`ModelBehaviorError`][agents.exceptions.ModelBehaviorError]: This exception occurs when the underlying model (LLM) produces unexpected or invalid outputs. This can include:
     -   Malformed JSON: When the model provides a malformed JSON structure for tool calls or in its direct output, especially if a specific `output_type` is defined.
     -   Unexpected tool-related failures: When the model fails to use tools in an expected manner
+    -   Failed or incomplete non-streaming Responses calls: `OpenAIResponsesModel` and the Responses path in `AnyLLMModel` raise this exception when the returned response has terminal status `failed` or `incomplete`. The exception identifies the terminal status and includes available error or incomplete details from the response.
 -   [`ToolTimeoutError`][agents.exceptions.ToolTimeoutError]: This exception is raised when a function tool call exceeds its configured timeout and the tool uses `timeout_behavior="raise_exception"`.
 -   [`UserError`][agents.exceptions.UserError]: This exception is raised when you (the person writing code using the SDK) make an error while using the SDK. This typically results from incorrect code implementation, invalid configuration, or misuse of the SDK's API.
--   [`InputGuardrailTripwireTriggered`][agents.exceptions.InputGuardrailTripwireTriggered], [`OutputGuardrailTripwireTriggered`][agents.exceptions.OutputGuardrailTripwireTriggered]: This exception is raised when the conditions of an input guardrail or output guardrail are met, respectively. Input guardrails check incoming messages before processing, while output guardrails check the agent's final response before delivery.
+-   [`InputGuardrailTripwireTriggered`][agents.exceptions.InputGuardrailTripwireTriggered], [`OutputGuardrailTripwireTriggered`][agents.exceptions.OutputGuardrailTripwireTriggered]: `InputGuardrailTripwireTriggered` is raised when an input guardrail's conditions are met, and `OutputGuardrailTripwireTriggered` is raised when an output guardrail's conditions are met. Input guardrails check incoming messages before processing, while output guardrails check the agent's final response before delivery.

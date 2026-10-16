@@ -1,4 +1,5 @@
 import json
+from dataclasses import dataclass
 
 import pytest
 from inline_snapshot import snapshot
@@ -6,20 +7,20 @@ from pydantic import BaseModel
 
 from agents import Agent, RunContextWrapper, RunErrorDetails, Runner, RunResult
 from agents.agent_output import _WRAPPER_DICT_KEY
+from agents.testing import ScriptedModel
 from agents.util._pretty_print import (
     pretty_print_result,
     pretty_print_run_error_details,
     pretty_print_run_result_streaming,
 )
-from tests.fake_model import FakeModel
 
 from .test_responses import get_final_output_message, get_text_message
 
 
 @pytest.mark.asyncio
 async def test_pretty_result():
-    model = FakeModel()
-    model.set_next_output([get_text_message("Hi there")])
+    model = ScriptedModel()
+    model.enqueue([get_text_message("Hi there")])
 
     agent = Agent(name="test_agent", model=model)
     result = await Runner.run(agent, input="Hello")
@@ -84,14 +85,16 @@ RunErrorDetails:
 - 0 raw response(s)
 - 0 input guardrail result(s)
 - 0 output guardrail result(s)
+- 0 tool input guardrail result(s)
+- 0 tool output guardrail result(s)
 (See `RunErrorDetails` for more details)\
 """)
 
 
 @pytest.mark.asyncio
 async def test_pretty_run_result_streaming():
-    model = FakeModel()
-    model.set_next_output([get_text_message("Hi there")])
+    model = ScriptedModel()
+    model.enqueue([get_text_message("Hi there")])
 
     agent = Agent(name="test_agent", model=model)
     result = Runner.run_streamed(agent, input="Hello")
@@ -118,10 +121,85 @@ class Foo(BaseModel):
     bar: str
 
 
+@dataclass
+class TextOutput:
+    text: str
+
+    def __str__(self) -> str:
+        return self.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("output_kind", ["text", "model", "dataclass"])
+async def test_result_str_escapes_terminal_controls(streaming, output_kind):
+    payload = (
+        "Hello\x1b[2J\x1b]0;title\x07\x08\x00\x7f\x9b31m\x9d0;title\x9c\x0b\x0c\x1c\x1d\x1e\x85"
+    )
+    escaped = (
+        r"Hello\x1b[2J\x1b]0;title\x07\x08\x00\x7f\x9b31m\x9d0;title\x9c\x0b\x0c\x1c\x1d\x1e\x85"
+    )
+    model = ScriptedModel()
+    if output_kind == "model":
+        output_type = Foo
+        response = Foo(bar=payload).model_dump_json()
+    elif output_kind == "dataclass":
+        output_type = TextOutput
+        response = json.dumps({_WRAPPER_DICT_KEY: {"text": payload}})
+    else:
+        output_type = None
+        response = payload
+    model.enqueue([get_text_message(response)])
+    agent = Agent(name="agent\x1b[2J\x9b31m", model=model, output_type=output_type)
+
+    if streaming:
+        result = Runner.run_streamed(agent, input="Hello")
+        async for _ in result.stream_events():
+            pass
+    else:
+        result = await Runner.run(agent, input="Hello")
+
+    rendered = str(result)
+    assert r'Agent(name="agent\x1b[2J\x9b31m", ...)' in rendered
+    if output_kind == "model":
+        assert result.final_output.bar == payload
+        # JSON already escapes C0 controls; the diagnostic printer must also escape C1.
+        assert r"\u001b[2J" in rendered
+        assert r"\x9b31m\x9d0;title\x9c" in rendered
+        assert r"\x85" in rendered
+    elif output_kind == "dataclass":
+        assert result.final_output.text == payload
+        assert escaped in rendered
+    else:
+        assert result.final_output == payload
+        assert escaped in rendered
+    assert agent.name == "agent\x1b[2J\x9b31m"
+    assert all(char >= " " or char in "\n\t" for char in rendered)
+    assert not any("\x7f" <= char <= "\x9f" for char in rendered)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_result_str_preserves_readable_multiline_output(streaming):
+    payload = "Hello, 世界 👋\r\n\tCafé\n\nlast line"
+    model = ScriptedModel()
+    model.enqueue([get_text_message(payload)])
+    agent = Agent(name="test_agent", model=model)
+    if streaming:
+        result = Runner.run_streamed(agent, input="Hello")
+        async for _ in result.stream_events():
+            pass
+    else:
+        result = await Runner.run(agent, input="Hello")
+
+    assert "    Hello, 世界 👋\n    \tCafé\n    \n    last line\n- 1 new item(s)" in str(result)
+    assert result.final_output == payload
+
+
 @pytest.mark.asyncio
 async def test_pretty_run_result_structured_output():
-    model = FakeModel()
-    model.set_next_output(
+    model = ScriptedModel()
+    model.enqueue(
         [
             get_text_message("Test"),
             get_final_output_message(Foo(bar="Hi there").model_dump_json()),
@@ -148,8 +226,8 @@ RunResult:
 
 @pytest.mark.asyncio
 async def test_pretty_run_result_streaming_structured_output():
-    model = FakeModel()
-    model.set_next_output(
+    model = ScriptedModel()
+    model.enqueue(
         [
             get_text_message("Test"),
             get_final_output_message(Foo(bar="Hi there").model_dump_json()),
@@ -182,8 +260,8 @@ RunResultStreaming:
 
 @pytest.mark.asyncio
 async def test_pretty_run_result_list_structured_output():
-    model = FakeModel()
-    model.set_next_output(
+    model = ScriptedModel()
+    model.enqueue(
         [
             get_text_message("Test"),
             get_final_output_message(
@@ -217,8 +295,8 @@ RunResult:
 
 @pytest.mark.asyncio
 async def test_pretty_run_result_streaming_list_structured_output():
-    model = FakeModel()
-    model.set_next_output(
+    model = ScriptedModel()
+    model.enqueue(
         [
             get_text_message("Test"),
             get_final_output_message(

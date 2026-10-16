@@ -24,7 +24,7 @@ from ..errors import (
 )
 from ..materialization import MaterializedFile, gather_in_order
 from ..types import ExecResult, User
-from ..workspace_paths import SandboxPathGrant
+from ..workspace_paths import SandboxPathGrant, sandbox_path_grant_host_path, sandbox_path_str
 from .base import BaseEntry
 
 if TYPE_CHECKING:
@@ -276,7 +276,7 @@ class LocalDir(BaseEntry):
         source_grants: tuple[SandboxPathGrant, ...],
     ) -> SandboxPathGrant | None:
         for grant in source_grants:
-            grant_root = _absolute_without_symlink_resolution(Path(grant.path))
+            grant_root = _absolute_without_symlink_resolution(sandbox_path_grant_host_path(grant))
             try:
                 src_input.relative_to(grant_root)
                 return grant
@@ -794,7 +794,7 @@ class GitRepo(BaseEntry):
             # Copy into destination in the container.
             await session.mkdir(dest, parents=True)
             copy = await session.exec(
-                "cp", "-R", "--", f"{git_src_root}/.", f"{dest}/", shell=False
+                "cp", "-R", "--", f"{git_src_root}/.", f"{sandbox_path_str(dest)}/", shell=False
             )
             if not copy.ok():
                 raise GitCopyError(

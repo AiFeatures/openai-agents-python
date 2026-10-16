@@ -23,6 +23,7 @@ import os
 import shlex
 import time
 import uuid
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -34,6 +35,11 @@ from modal.config import config as modal_config
 from modal.container_process import ContainerProcess
 
 from ....logger import log_tool_action_warning
+from ....sandbox._mount_security import (
+    _manifest_has_configured_mount_authority,
+    _mark_mount_validation_error,
+    redact_mount_error_data,
+)
 from ....sandbox.config import DEFAULT_PYTHON_SANDBOX_IMAGE
 from ....sandbox.entries import Mount
 from ....sandbox.errors import (
@@ -53,6 +59,13 @@ from ....sandbox.session import SandboxSession, SandboxSessionState
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
 from ....sandbox.session.dependencies import Dependencies
 from ....sandbox.session.manager import Instrumentation
+from ....sandbox.session.mount_lifecycle import (
+    _mount_transition_error,
+    _restore_detached_mounts_settled,
+    _settle_mount_transition,
+    _terminate_ambiguous_mount_session,
+)
+from ....sandbox.session.pty_output import collect_pty_output
 from ....sandbox.session.pty_types import (
     PTY_PROCESSES_MAX,
     PTY_PROCESSES_WARNING,
@@ -61,7 +74,6 @@ from ....sandbox.session.pty_types import (
     clamp_pty_yield_time_ms,
     process_id_to_prune_from_meta,
     resolve_pty_write_yield_time_ms,
-    truncate_text_by_tokens,
 )
 from ....sandbox.session.runtime_helpers import RESOLVE_WORKSPACE_PATH_HELPER, RuntimeHelperScript
 from ....sandbox.session.sandbox_client import BaseSandboxClient, BaseSandboxClientOptions
@@ -285,6 +297,8 @@ class ModalSandboxClientOptions(BaseSandboxClientOptions):
     use_sleep_cmd: bool = True
     image_builder_version: str | None = _DEFAULT_IMAGE_BUILDER_VERSION
     idle_timeout: int | None = None
+    cpu: float | tuple[float, float] | None = None
+    memory: int | tuple[int, int] | None = None
 
     def __init__(
         self,
@@ -300,6 +314,8 @@ class ModalSandboxClientOptions(BaseSandboxClientOptions):
         image_builder_version: str | None = _DEFAULT_IMAGE_BUILDER_VERSION,
         idle_timeout: int | None = None,
         *,
+        cpu: float | tuple[float, float] | None = None,
+        memory: int | tuple[int, int] | None = None,
         type: Literal["modal"] = "modal",
     ) -> None:
         super().__init__(
@@ -315,6 +331,8 @@ class ModalSandboxClientOptions(BaseSandboxClientOptions):
             use_sleep_cmd=use_sleep_cmd,
             image_builder_version=image_builder_version,
             idle_timeout=idle_timeout,
+            cpu=cpu,
+            memory=memory,
         )
 
 
@@ -449,6 +467,18 @@ class ModalSandboxSessionState(SandboxSessionState):
     use_sleep_cmd: bool = True
     image_builder_version: str | None = _DEFAULT_IMAGE_BUILDER_VERSION
     idle_timeout: int | None = None
+    cpu: float | tuple[float, float] | None = None
+    memory: int | tuple[int, int] | None = None
+
+    def _sanitize_persisted_provider_identity(
+        self,
+        data: dict[str, Any],
+        *,
+        mount_authority_redacted: bool,
+    ) -> None:
+        if mount_authority_redacted:
+            data["sandbox_id"] = None
+            data["workspace_root_ready"] = False
 
 
 @dataclass
@@ -460,6 +490,12 @@ class _ModalPtyProcessEntry:
     stderr_iter: AsyncIterator[object] | None = None
     stdout_read_task: asyncio.Task[object] | None = None
     stderr_read_task: asyncio.Task[object] | None = None
+    stdout_closed: bool = False
+    stderr_closed: bool = False
+    output_chunks: deque[bytes] = field(default_factory=deque)
+    output_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    output_notify: asyncio.Event = field(default_factory=asyncio.Event)
+    output_closed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class ModalSandboxSession(BaseSandboxSession):
@@ -679,7 +715,7 @@ class ModalSandboxSession(BaseSandboxSession):
             create_if_missing=True,
             call_timeout=10.0,
         )
-        if not self._image:
+        if self._image is None:
             image_id = self.state.image_id
             if image_id:
                 self._image = modal.Image.from_id(image_id)
@@ -709,6 +745,8 @@ class ModalSandboxSession(BaseSandboxSession):
             encrypted_ports=self.state.exposed_ports,
             volumes=volumes,
             gpu=self.state.gpu,
+            cpu=self.state.cpu,
+            memory=self.state.memory,
             timeout=self.state.timeout,
             idle_timeout=self.state.idle_timeout,
         )
@@ -876,7 +914,7 @@ class ModalSandboxSession(BaseSandboxSession):
             )
 
         yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
+        output, original_token_count, output_closed = await self._collect_pty_output(
             entry=entry,
             yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
             max_output_tokens=max_output_tokens,
@@ -886,6 +924,7 @@ class ModalSandboxSession(BaseSandboxSession):
             entry=entry,
             output=output,
             original_token_count=original_token_count,
+            output_closed=output_closed,
         )
 
     async def pty_write_stdin(
@@ -909,7 +948,7 @@ class ModalSandboxSession(BaseSandboxSession):
             await asyncio.sleep(0.1)
 
         yield_time_ms = 250 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
+        output, original_token_count, output_closed = await self._collect_pty_output(
             entry=entry,
             yield_time_ms=resolve_pty_write_yield_time_ms(
                 yield_time_ms=yield_time_ms, input_empty=chars == ""
@@ -922,6 +961,7 @@ class ModalSandboxSession(BaseSandboxSession):
             entry=entry,
             output=output,
             original_token_count=original_token_count,
+            output_closed=output_closed,
         )
 
     async def pty_terminate_all(self) -> None:
@@ -950,56 +990,80 @@ class ModalSandboxSession(BaseSandboxSession):
         entry: _ModalPtyProcessEntry,
         yield_time_ms: int,
         max_output_tokens: int | None,
-    ) -> tuple[bytes, int | None]:
-        deadline = time.monotonic() + (yield_time_ms / 1000)
-        chunks = bytearray()
+    ) -> tuple[bytes, int | None, bool]:
+        async def poll_output(
+            *,
+            deadline: float | None,
+            allow_new_read: bool,
+            check_exit: bool,
+        ) -> None:
+            for stream_name in ("stdout", "stderr"):
+                chunk = await self._read_modal_stream(
+                    entry=entry,
+                    stream_name=stream_name,
+                    allow_new_read=allow_new_read,
+                    deadline=deadline,
+                )
+                if chunk:
+                    # Commit consumed bytes before another provider call can suspend.
+                    entry.output_chunks.append(chunk)
+                    entry.output_notify.set()
 
-        while True:
-            stdout_chunk = await self._read_modal_stream(entry=entry, stream_name="stdout")
-            stderr_chunk = await self._read_modal_stream(entry=entry, stream_name="stderr")
-            if stdout_chunk:
-                chunks.extend(stdout_chunk)
-            if stderr_chunk:
-                chunks.extend(stderr_chunk)
+            if (
+                check_exit
+                and deadline is not None
+                and time.monotonic() < deadline
+                and await self._peek_exit_code(entry.process) is not None
+            ):
+                await self._drain_modal_stream(entry=entry, stream_name="stdout", deadline=deadline)
+                await self._drain_modal_stream(entry=entry, stream_name="stderr", deadline=deadline)
+                if entry.stdout_closed and entry.stderr_closed:
+                    entry.output_closed.set()
 
-            if time.monotonic() >= deadline:
-                break
+        async def wait_for_output(remaining_s: float) -> None:
+            await asyncio.sleep(min(_PTY_POLL_INTERVAL_S, remaining_s))
 
-            exit_code = await self._peek_exit_code(entry.process)
-            if exit_code is not None:
-                stdout_chunks = await self._drain_modal_stream(entry=entry, stream_name="stdout")
-                stderr_chunks = await self._drain_modal_stream(entry=entry, stream_name="stderr")
-                chunks.extend(stdout_chunks)
-                chunks.extend(stderr_chunks)
-                break
+        async def settle_output() -> None:
+            # The deadline path may only collect already-started reads. Checking
+            # process status here would add a slow provider RPC after the caller's
+            # requested yield window has already elapsed.
+            await poll_output(deadline=None, allow_new_read=False, check_exit=False)
 
-            if not stdout_chunk and not stderr_chunk:
-                remaining_s = deadline - time.monotonic()
-                if remaining_s <= 0:
-                    break
-                await asyncio.sleep(min(_PTY_POLL_INTERVAL_S, remaining_s))
-
-        text = chunks.decode("utf-8", errors="replace")
-        truncated_text, original_token_count = truncate_text_by_tokens(text, max_output_tokens)
-        return truncated_text.encode("utf-8", errors="replace"), original_token_count
+        return await collect_pty_output(
+            output_chunks=entry.output_chunks,
+            output_lock=entry.output_lock,
+            output_notify=entry.output_notify,
+            is_done=entry.output_closed.is_set,
+            yield_time_ms=yield_time_ms,
+            max_output_tokens=max_output_tokens,
+            poll_output=lambda deadline: poll_output(
+                deadline=deadline,
+                allow_new_read=True,
+                check_exit=True,
+            ),
+            settle_output=settle_output,
+            wait_for_output=wait_for_output,
+        )
 
     async def _drain_modal_stream(
         self,
         *,
         entry: _ModalPtyProcessEntry,
         stream_name: Literal["stdout", "stderr"],
-    ) -> bytes:
-        chunks = bytearray()
+        deadline: float,
+    ) -> None:
         while True:
             chunk = await self._read_modal_stream(
                 entry=entry,
                 stream_name=stream_name,
                 await_pending=True,
+                settle_after_exit=True,
+                deadline=deadline,
             )
             if not chunk:
                 break
-            chunks.extend(chunk)
-        return bytes(chunks)
+            entry.output_chunks.append(chunk)
+            entry.output_notify.set()
 
     async def _read_modal_stream(
         self,
@@ -1007,13 +1071,25 @@ class ModalSandboxSession(BaseSandboxSession):
         entry: _ModalPtyProcessEntry,
         stream_name: Literal["stdout", "stderr"],
         await_pending: bool = False,
+        allow_new_read: bool = True,
+        settle_after_exit: bool = False,
+        deadline: float | None = None,
     ) -> bytes:
         stream = entry.process.stdout if stream_name == "stdout" else entry.process.stderr
+        closed_attr = "stdout_closed" if stream_name == "stdout" else "stderr_closed"
+        if getattr(entry, closed_attr):
+            return b""
         if stream is None:
+            setattr(entry, closed_attr, True)
             return b""
 
         iter_attr = "stdout_iter" if stream_name == "stdout" else "stderr_iter"
         task_attr = "stdout_read_task" if stream_name == "stdout" else "stderr_read_task"
+        task = getattr(entry, task_attr)
+        remaining_s = max(0.0, deadline - time.monotonic()) if deadline is not None else 0.0
+        if task is None and (not allow_new_read or remaining_s <= 0):
+            return b""
+
         stream_iter = getattr(entry, iter_attr)
         if stream_iter is None:
             aiter_method = getattr(stream, "__aiter__", None)
@@ -1025,13 +1101,12 @@ class ModalSandboxSession(BaseSandboxSession):
                 else:
                     setattr(entry, iter_attr, stream_iter)
 
-        task = getattr(entry, task_attr)
         if task is None and stream_iter is not None:
             task = asyncio.create_task(stream_iter.__anext__())
             setattr(entry, task_attr, task)
 
         if task is not None:
-            wait_timeout = 0.2 if await_pending else 0
+            wait_timeout = min(0.2, remaining_s) if await_pending else 0
             done, _pending = await asyncio.wait({task}, timeout=wait_timeout)
             if not done:
                 return b""
@@ -1041,9 +1116,12 @@ class ModalSandboxSession(BaseSandboxSession):
                 value = task.result()
             except StopAsyncIteration:
                 setattr(entry, iter_attr, None)
+                setattr(entry, closed_attr, True)
                 return b""
             except Exception:
                 setattr(entry, iter_attr, None)
+                if settle_after_exit:
+                    setattr(entry, closed_attr, True)
                 return b""
 
             return self._coerce_modal_stream_chunk(value)
@@ -1053,13 +1131,23 @@ class ModalSandboxSession(BaseSandboxSession):
             return b""
 
         try:
-            value = await self._call_modal(read, 16_384, call_timeout=0.2)
+            value = await self._call_modal(read, 16_384, call_timeout=min(0.2, remaining_s))
+        except asyncio.TimeoutError:
+            # Reaching this window's deadline is not evidence of stream EOF.
+            return b""
         except TypeError:
+            if settle_after_exit:
+                setattr(entry, closed_attr, True)
             return b""
         except Exception:
+            if settle_after_exit:
+                setattr(entry, closed_attr, True)
             return b""
 
-        return self._coerce_modal_stream_chunk(value)
+        chunk = self._coerce_modal_stream_chunk(value)
+        if not chunk and settle_after_exit:
+            setattr(entry, closed_attr, True)
+        return chunk
 
     def _coerce_modal_stream_chunk(self, value: object) -> bytes:
         if value is None:
@@ -1079,8 +1167,9 @@ class ModalSandboxSession(BaseSandboxSession):
         entry: _ModalPtyProcessEntry,
         output: bytes,
         original_token_count: int | None,
+        output_closed: bool,
     ) -> PtyExecUpdate:
-        exit_code = await self._peek_exit_code(entry.process)
+        exit_code = await self._peek_exit_code(entry.process) if output_closed else None
         live_process_id: int | None = process_id
         if exit_code is not None:
             async with self._pty_lock:
@@ -1103,8 +1192,7 @@ class ModalSandboxSession(BaseSandboxSession):
 
         meta: list[tuple[int, float, bool]] = []
         for process_id, entry in self._pty_processes.items():
-            exit_code = await self._peek_exit_code(entry.process)
-            meta.append((process_id, entry.last_used, exit_code is not None))
+            meta.append((process_id, entry.last_used, entry.output_closed.is_set()))
         process_id_to_prune = process_id_to_prune_from_meta(meta)
         if process_id_to_prune is None:
             return None
@@ -1159,6 +1247,39 @@ class ModalSandboxSession(BaseSandboxSession):
                 ),
                 return_exceptions=True,
             )
+
+    async def _read_bounded(self, path: Path, *, max_bytes: int) -> bytes:
+        try:
+            workspace_path = await self._validate_path_access(path)
+            await self._ensure_sandbox()
+            assert self._sandbox is not None
+            # Each read starts a remote operation. Use Modal's 100 MiB per-read
+            # ceiling while respecting the caller's remaining byte budget.
+            stream = await self._sandbox.open.aio(sandbox_path_str(workspace_path), "rb")
+            completed = False
+            try:
+                result = bytearray()
+                while len(result) < max_bytes:
+                    chunk = await stream.read.aio(min(100 * 1024 * 1024, max_bytes - len(result)))
+                    if not chunk:
+                        break
+                    result.extend(chunk)
+                payload = bytes(result)
+                completed = True
+                return payload
+            finally:
+                try:
+                    await asyncio.wait_for(stream.close.aio(), timeout=5.0)
+                except Exception:
+                    # Preserve an active read failure or cancellation. A close failure
+                    # still fails a read that would otherwise have completed.
+                    if completed:
+                        raise
+        except (FileNotFoundError, SandboxError):
+            raise
+        except Exception as error:
+            retryable, _ = _modal_provider_retryability(error)
+            raise WorkspaceArchiveReadError(path=path, retryable=retryable) from None
 
     async def read(self, path: Path, *, user: str | User | None = None) -> io.IOBase:
         if user is not None:
@@ -1246,6 +1367,7 @@ class ModalSandboxSession(BaseSandboxSession):
         except Exception:
             return False
 
+    @redact_mount_error_data
     async def persist_workspace(self) -> io.IOBase:
         if self.state.workspace_persistence == _WORKSPACE_PERSISTENCE_SNAPSHOT_FILESYSTEM:
             return await self._persist_workspace_via_snapshot_filesystem()
@@ -1253,6 +1375,7 @@ class ModalSandboxSession(BaseSandboxSession):
             return await self._persist_workspace_via_snapshot_directory()
         return await self._persist_workspace_via_tar()
 
+    @redact_mount_error_data
     async def hydrate_workspace(self, data: io.IOBase) -> None:
         if self.state.workspace_persistence == _WORKSPACE_PERSISTENCE_SNAPSHOT_FILESYSTEM:
             return await self._hydrate_workspace_via_snapshot_filesystem(data)
@@ -1395,6 +1518,8 @@ class ModalSandboxSession(BaseSandboxSession):
         self._modal_snapshot_ephemeral_backup = None
         self._modal_snapshot_ephemeral_backup_path = None
         detached_mounts: list[tuple[Mount, Path]] = []
+        caller_cancelled = False
+        teardown_transition_ambiguous = False
 
         async def restore_ephemeral_paths() -> WorkspaceArchiveReadError | None:
             backup_path = self._modal_snapshot_ephemeral_backup_path
@@ -1422,34 +1547,13 @@ class ModalSandboxSession(BaseSandboxSession):
                 )
             return None
 
-        async def restore_detached_mounts() -> WorkspaceArchiveReadError | None:
-            remount_error: WorkspaceArchiveReadError | None = None
-            for mount_entry, mount_path in reversed(detached_mounts):
-                try:
-                    await mount_entry.mount_strategy.restore_after_snapshot(
-                        mount_entry,
-                        self,
-                        mount_path,
-                    )
-                except Exception as e:
-                    current_error = WorkspaceArchiveReadError(path=error_root, cause=e)
-                    if remount_error is None:
-                        remount_error = current_error
-                    else:
-                        additional_remount_errors = remount_error.context.setdefault(
-                            "additional_remount_errors", []
-                        )
-                        assert isinstance(additional_remount_errors, list)
-                        additional_remount_errors.append(
-                            {
-                                "message": current_error.message,
-                                "cause_type": type(e).__name__,
-                                "cause": str(e),
-                            }
-                        )
-            return remount_error
+        async def restore_ephemeral_paths_or_raise() -> None:
+            restore_error = await restore_ephemeral_paths()
+            if restore_error is not None:
+                raise restore_error
 
         snapshot_error: WorkspaceArchiveReadError | None = None
+        cleanup_error: WorkspaceArchiveReadError | None = None
         snapshot_id: str | None = None
         try:
             if skip_abs:
@@ -1496,24 +1600,40 @@ class ModalSandboxSession(BaseSandboxSession):
                     )
 
             for mount_entry, mount_path in self._snapshot_directory_mount_targets_to_restore(root):
-                await mount_entry.mount_strategy.teardown_for_snapshot(
-                    mount_entry,
+                transition_error, transition_cancelled = await _settle_mount_transition(
                     self,
-                    mount_path,
+                    mount_entry.mount_strategy.teardown_for_snapshot(
+                        mount_entry,
+                        self,
+                        mount_path,
+                    ),
                 )
+                caller_cancelled = caller_cancelled or transition_cancelled
+                if transition_error is not None:
+                    snapshot_error = WorkspaceArchiveReadError(
+                        path=error_root,
+                        cause=transition_error,
+                    )
+                    teardown_transition_ambiguous = True
+                    break
                 detached_mounts.append((mount_entry, mount_path))
+                if caller_cancelled:
+                    break
 
-            snapshot_sandbox = await self._refresh_sandbox_handle_for_snapshot()
-            snap_coro = snapshot_sandbox.snapshot_directory.aio(root.as_posix())
-            if self.state.snapshot_filesystem_timeout_s is None:
-                snap = await snap_coro
-            else:
-                snap = await asyncio.wait_for(
-                    snap_coro, timeout=self.state.snapshot_filesystem_timeout_s
+            if snapshot_error is None and not caller_cancelled:
+                snapshot_sandbox = await self._refresh_sandbox_handle_for_snapshot()
+                snap_coro = snapshot_sandbox.snapshot_directory.aio(root.as_posix())
+                if self.state.snapshot_filesystem_timeout_s is None:
+                    snap = await snap_coro
+                else:
+                    snap = await asyncio.wait_for(
+                        snap_coro, timeout=self.state.snapshot_filesystem_timeout_s
+                    )
+                snapshot_id, snapshot_error = self._extract_modal_snapshot_id(
+                    snap=snap, root=root, snapshot_kind="snapshot_directory"
                 )
-            snapshot_id, snapshot_error = self._extract_modal_snapshot_id(
-                snap=snap, root=root, snapshot_kind="snapshot_directory"
-            )
+        except asyncio.CancelledError:
+            caller_cancelled = True
         except WorkspaceArchiveReadError as e:
             snapshot_error = e
         except Exception as e:
@@ -1521,8 +1641,34 @@ class ModalSandboxSession(BaseSandboxSession):
                 path=error_root, context={"reason": "snapshot_directory_failed"}, cause=e
             )
         finally:
-            remount_error = await restore_detached_mounts()
-            restore_error = await restore_ephemeral_paths()
+            remount_result, remount_cancelled = await _restore_detached_mounts_settled(
+                self,
+                detached_mounts,
+                error_path=error_root,
+                error_cls=WorkspaceArchiveReadError,
+            )
+            remount_error = cast(WorkspaceArchiveReadError | None, remount_result)
+            caller_cancelled = caller_cancelled or remount_cancelled
+
+            restore_error: WorkspaceArchiveReadError | None
+            if remount_error is None:
+                restore_transition_error, restore_cancelled = await _settle_mount_transition(
+                    self,
+                    restore_ephemeral_paths_or_raise(),
+                )
+                caller_cancelled = caller_cancelled or restore_cancelled
+                if isinstance(restore_transition_error, WorkspaceArchiveReadError):
+                    restore_error = restore_transition_error
+                elif restore_transition_error is not None:
+                    restore_error = WorkspaceArchiveReadError(
+                        path=error_root,
+                        cause=restore_transition_error,
+                    )
+                else:
+                    restore_error = None
+            else:
+                restore_error = None
+
             cleanup_error = remount_error
             if restore_error is not None:
                 if cleanup_error is None:
@@ -1549,7 +1695,23 @@ class ModalSandboxSession(BaseSandboxSession):
                     cleanup_error.context["snapshot_error_before_restore_corruption"] = {
                         "message": snapshot_error.message
                     }
-                raise cleanup_error
+
+            if teardown_transition_ambiguous and remount_error is None:
+                termination_error, termination_cancelled = await _terminate_ambiguous_mount_session(
+                    self
+                )
+                caller_cancelled = caller_cancelled or termination_cancelled
+                if termination_error is not None and not caller_cancelled:
+                    cleanup_error = cleanup_error or WorkspaceArchiveReadError(
+                        path=error_root,
+                        context={"reason": "snapshot_directory_terminal_cleanup_failed"},
+                        cause=termination_error,
+                    )
+
+        if caller_cancelled:
+            raise asyncio.CancelledError() from None
+        if cleanup_error is not None:
+            raise cleanup_error
 
         if snapshot_error is not None:
             raise snapshot_error
@@ -1773,6 +1935,8 @@ class ModalSandboxSession(BaseSandboxSession):
                 encrypted_ports=self.state.exposed_ports,
                 volumes=self._modal_cloud_bucket_mounts_for_manifest(),
                 gpu=self.state.gpu,
+                cpu=self.state.cpu,
+                memory=self.state.memory,
                 timeout=self.state.timeout,
                 idle_timeout=self.state.idle_timeout,
             )
@@ -1806,21 +1970,49 @@ class ModalSandboxSession(BaseSandboxSession):
         sandbox = self._sandbox
 
         async def _run_restore() -> None:
+            caller_cancelled = False
+            transition_error: BaseException | None = None
             image = modal.Image.from_id(snapshot_id)
-            await self._call_modal(
-                sandbox.mount_image,
-                root.as_posix(),
-                image,
-                call_timeout=self.state.snapshot_filesystem_restore_timeout_s,
+            image_error, image_cancelled = await _settle_mount_transition(
+                self,
+                self._call_modal(
+                    sandbox.mount_image,
+                    root.as_posix(),
+                    image,
+                    call_timeout=self.state.snapshot_filesystem_restore_timeout_s,
+                ),
             )
-            for mount_entry, mount_path in reversed(
-                self._snapshot_directory_mount_targets_to_restore(root)
-            ):
-                await mount_entry.mount_strategy.restore_after_snapshot(
-                    mount_entry,
+            caller_cancelled = image_cancelled
+            if image_error is not None:
+                if isinstance(image_error, asyncio.CancelledError):
+                    transition_error = _mount_transition_error(
+                        WorkspaceArchiveWriteError,
+                        error_path=root,
+                        transition_error=image_error,
+                        reason="mount_image_cancelled",
+                    )
+                else:
+                    transition_error = image_error
+                (
+                    _termination_error,
+                    termination_cancelled,
+                ) = await _terminate_ambiguous_mount_session(self)
+                caller_cancelled = caller_cancelled or termination_cancelled
+            else:
+                remount_error, remount_cancelled = await _restore_detached_mounts_settled(
                     self,
-                    mount_path,
+                    self._snapshot_directory_mount_targets_to_restore(root),
+                    error_path=root,
+                    error_cls=WorkspaceArchiveWriteError,
                 )
+                caller_cancelled = caller_cancelled or remount_cancelled
+                if remount_error is not None:
+                    transition_error = remount_error
+
+            if caller_cancelled:
+                raise asyncio.CancelledError() from None
+            if transition_error is not None:
+                raise transition_error
 
         try:
             await asyncio.wait_for(
@@ -1858,9 +2050,15 @@ class ModalSandboxSession(BaseSandboxSession):
             raise WorkspaceArchiveWriteError(path=root, context={"reason": "non_bytes_tar_payload"})
 
         try:
+            # `raw` is handed to `tar xf -` unchanged below, so validation cannot drop
+            # a member: whatever it waves through, the extractor writes. Skipping the
+            # ephemeral paths would therefore let a member under one of them past
+            # member-type and link validation and still create it, so reject them
+            # instead. The producing side already excludes these paths via
+            # `_persist_workspace_skip_relpaths()`.
             validate_tar_bytes(
                 bytes(raw),
-                skip_rel_paths=self.state.manifest.ephemeral_persistence_paths(),
+                reject_rel_paths=self.state.manifest.ephemeral_persistence_paths(),
                 allow_external_symlink_targets=False,
             )
         except UnsafeTarMemberError as e:
@@ -1941,7 +2139,9 @@ class ModalSandboxClient(BaseSandboxClient[ModalSandboxClientOptions]):
     ) -> None:
         self._default_image = image
         self._default_sandbox = sandbox
-        self._instrumentation = instrumentation or Instrumentation()
+        self._instrumentation = (
+            instrumentation if instrumentation is not None else Instrumentation()
+        )
         self._dependencies = dependencies
 
     def _validate_manifest_for_workspace_persistence(
@@ -1970,6 +2170,7 @@ class ModalSandboxClient(BaseSandboxClient[ModalSandboxClientOptions]):
                     },
                 )
 
+    @redact_mount_error_data
     async def create(
         self,
         *,
@@ -1991,12 +2192,15 @@ class ModalSandboxClient(BaseSandboxClient[ModalSandboxClientOptions]):
           (async timeout for snapshot restore call)
         - timeout: int (maximum sandbox lifetime in seconds, default 300)
         - idle_timeout: int | None (maximum sandbox inactivity in seconds, default None)
+        - cpu: float | tuple[float, float] | None (CPU request or request/limit pair)
+        - memory: int | tuple[int, int] | None (memory request or request/limit pair in MiB)
         - image_builder_version: str | None (Modal image builder version, default "2025.06")
         """
 
         if options is None:
             raise ValueError("ModalSandboxClient.create requires options with app_name")
-        manifest = manifest or Manifest()
+        manifest = manifest if manifest is not None else Manifest()
+        self._validate_manifest_for_create(manifest)
         app_name = options.app_name
         if not app_name:
             raise ValueError("ModalSandboxClient.create requires a valid app_name")
@@ -2113,6 +2317,8 @@ class ModalSandboxClient(BaseSandboxClient[ModalSandboxClientOptions]):
             use_sleep_cmd=options.use_sleep_cmd,
             image_builder_version=image_builder_version,
             idle_timeout=options.idle_timeout,
+            cpu=options.cpu,
+            memory=options.memory,
         )
         if sandbox_create_timeout_s is not None:
             state.sandbox_create_timeout_s = float(sandbox_create_timeout_s)
@@ -2165,12 +2371,31 @@ class ModalSandboxClient(BaseSandboxClient[ModalSandboxClientOptions]):
 
         return session
 
+    @redact_mount_error_data
     async def resume(
         self,
         state: SandboxSessionState,
     ) -> SandboxSession:
         if not isinstance(state, ModalSandboxSessionState):
             raise TypeError("ModalSandboxClient.resume expects a ModalSandboxSessionState")
+        state.assert_path_grants_rebound()
+        if _manifest_has_configured_mount_authority(state.manifest) and not (
+            state.mount_authority_rebound
+        ):
+            error = MountConfigError(
+                message=(
+                    "Modal sandbox sessions with protected volume configuration cannot "
+                    "be resumed; create a new session so the volume is created from the "
+                    "current trusted configuration"
+                ),
+                context={"backend": "modal"},
+            )
+            _mark_mount_validation_error(error)
+            raise error
+        if state.mount_authority_rebound:
+            state.sandbox_id = None
+            state.session_id = uuid.uuid4()
+            state.workspace_root_ready = False
         inner = ModalSandboxSession.from_state(state)
         reconnected = await inner._ensure_sandbox()
         if reconnected:
@@ -2178,4 +2403,4 @@ class ModalSandboxClient(BaseSandboxClient[ModalSandboxClientOptions]):
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
     def deserialize_session_state(self, payload: dict[str, object]) -> SandboxSessionState:
-        return ModalSandboxSessionState.model_validate(payload)
+        return self._deserialize_session_state_payload(payload, ModalSandboxSessionState)

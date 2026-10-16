@@ -34,6 +34,7 @@ from runloop_api_client.types.shared.launch_parameters import (
     UserParameters as _RunloopSdkUserParameters,
 )
 
+from ....sandbox._mount_security import redact_mount_error_data
 from ....sandbox.entries import Mount
 from ....sandbox.errors import (
     ExecTimeoutError,
@@ -47,6 +48,7 @@ from ....sandbox.errors import (
 from ....sandbox.manifest import Manifest
 from ....sandbox.session import SandboxSession, SandboxSessionState
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
+from ....sandbox.session.bounded_read import collect_bounded
 from ....sandbox.session.dependencies import Dependencies
 from ....sandbox.session.manager import Instrumentation
 from ....sandbox.session.runtime_helpers import RESOLVE_WORKSPACE_PATH_HELPER, RuntimeHelperScript
@@ -421,6 +423,16 @@ class RunloopMcpSpec(BaseModel):
     secret: str = Field(min_length=1)
 
 
+class RunloopExistingSecret(BaseModel):
+    """A `managed_secrets` entry that is already stored on the Runloop account.
+
+    Used in place of a secret value to attach an account secret to the devbox by name,
+    leaving the stored value untouched.
+    """
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+
 def _normalize_runloop_user_parameters(
     user_parameters: RunloopUserParameters | dict[str, object] | None,
 ) -> RunloopUserParameters | None:
@@ -474,7 +486,7 @@ class RunloopSandboxClientOptions(BaseSandboxClientOptions):
     gateways: dict[str, RunloopGatewaySpec] | None = None
     mcp: dict[str, RunloopMcpSpec] | None = None
     metadata: dict[str, str] | None = None
-    managed_secrets: dict[str, str] | None = None
+    managed_secrets: dict[str, str | RunloopExistingSecret] | None = None
 
     def __init__(
         self,
@@ -491,7 +503,7 @@ class RunloopSandboxClientOptions(BaseSandboxClientOptions):
         gateways: dict[str, RunloopGatewaySpec] | None = None,
         mcp: dict[str, RunloopMcpSpec] | None = None,
         metadata: dict[str, str] | None = None,
-        managed_secrets: dict[str, str] | None = None,
+        managed_secrets: dict[str, str | RunloopExistingSecret] | None = None,
         *,
         type: Literal["runloop"] = "runloop",
     ) -> None:
@@ -734,6 +746,7 @@ class RunloopSandboxSession(BaseSandboxSession):
             return 0.001
         return float(timeout_s)
 
+    @redact_mount_error_data
     async def start(self) -> None:
         """Resume a reconnected Runloop devbox without replaying full setup when possible.
 
@@ -741,6 +754,7 @@ class RunloopSandboxSession(BaseSandboxSession):
         In that path, Runloop reuses the live machine and only reapplies snapshot or ephemeral
         manifest state if the cached workspace fingerprint no longer matches.
         """
+        await self._validate_manifest_application()
         if self._skip_start:
             if await self.state.snapshot.restorable(dependencies=self.dependencies):
                 is_running = await self.running()
@@ -941,6 +955,24 @@ class RunloopSandboxSession(BaseSandboxSession):
                 context={"backend": "runloop", "detail": "invalid_tunnel_url"},
                 cause=e,
             ) from e
+
+    async def _read_bounded(self, path: Path, *, max_bytes: int) -> bytes:
+        normalized_path = await self._validate_path_access(path)
+        try:
+            async with self._sdk.api.devboxes.with_streaming_response.download_file(
+                self.devbox_id,
+                path=sandbox_path_str(normalized_path),
+                timeout=self.state.timeouts.file_download_s,
+            ) as response:
+                return await collect_bounded(response.iter_bytes(chunk_size=65536), max_bytes)
+        except Exception as error:
+            if _is_runloop_not_found(error):
+                raise WorkspaceReadNotFoundError(path=path) from None
+            if _is_runloop_provider_error(error):
+                raise WorkspaceArchiveReadError(
+                    path=path, retryable=_runloop_provider_retryability(error)
+                ) from None
+            raise
 
     async def read(self, path: Path | str, *, user: str | User | None = None) -> io.IOBase:
         """Read a file via Runloop's binary file API."""
@@ -1479,10 +1511,10 @@ def _runloop_launch_parameters_payload(
     return payload or None
 
 
-async def _upsert_runloop_managed_secrets(
+async def _resolve_runloop_managed_secret_refs(
     sdk: Any,
     *,
-    managed_secrets: dict[str, str] | None,
+    managed_secrets: dict[str, str | RunloopExistingSecret] | None,
     timeout_s: float,
 ) -> dict[str, str]:
     if not managed_secrets:
@@ -1490,13 +1522,14 @@ async def _upsert_runloop_managed_secrets(
 
     secret_refs: dict[str, str] = {}
     for env_var, secret_value in sorted(managed_secrets.items()):
-        try:
-            await sdk.secret.create(name=env_var, value=secret_value, timeout=timeout_s)
-        except Exception as e:
-            if _is_runloop_conflict(e):
-                await sdk.secret.update(env_var, value=secret_value, timeout=timeout_s)
-            else:
-                raise
+        if not isinstance(secret_value, RunloopExistingSecret):
+            try:
+                await sdk.secret.create(name=env_var, value=secret_value, timeout=timeout_s)
+            except Exception as e:
+                if _is_runloop_conflict(e):
+                    await sdk.secret.update(env_var, value=secret_value, timeout=timeout_s)
+                else:
+                    raise
         secret_refs[env_var] = env_var
     return secret_refs
 
@@ -1545,13 +1578,16 @@ class RunloopSandboxClient(BaseSandboxClient[RunloopSandboxClientOptions | None]
     ) -> None:
         self._sdk = _import_runloop_sdk().async_sdk(bearer_token=bearer_token, base_url=base_url)
         self._platform = RunloopPlatformClient(self._sdk)
-        self._instrumentation = instrumentation or Instrumentation()
+        self._instrumentation = (
+            instrumentation if instrumentation is not None else Instrumentation()
+        )
         self._dependencies = dependencies
 
     @property
     def platform(self) -> RunloopPlatformClient:
         return self._platform
 
+    @redact_mount_error_data
     async def create(
         self,
         *,
@@ -1567,7 +1603,7 @@ class RunloopSandboxClient(BaseSandboxClient[RunloopSandboxClientOptions | None]
         configured blueprint selection or user profile when provisioning the devbox. The returned
         session follows the shared sandbox lifecycle and must be started before direct operations.
         """
-        resolved_options = options or RunloopSandboxClientOptions()
+        resolved_options = options if options is not None else RunloopSandboxClientOptions()
         if (
             resolved_options.blueprint_id is not None
             and resolved_options.blueprint_name is not None
@@ -1577,8 +1613,13 @@ class RunloopSandboxClient(BaseSandboxClient[RunloopSandboxClientOptions | None]
             )
 
         user_parameters = _normalize_runloop_user_parameters(resolved_options.user_parameters)
-        manifest = manifest or Manifest(root=_default_runloop_manifest_root(user_parameters))
+        manifest = (
+            manifest
+            if manifest is not None
+            else Manifest(root=_default_runloop_manifest_root(user_parameters))
+        )
         _validate_runloop_manifest_root(manifest, user_parameters=user_parameters)
+        self._validate_manifest_for_create(manifest)
 
         timeouts_in = resolved_options.timeouts
         if isinstance(timeouts_in, RunloopTimeouts):
@@ -1588,7 +1629,7 @@ class RunloopSandboxClient(BaseSandboxClient[RunloopSandboxClientOptions | None]
         else:
             timeouts = RunloopTimeouts.model_validate(timeouts_in)
 
-        secret_refs = await _upsert_runloop_managed_secrets(
+        secret_refs = await _resolve_runloop_managed_secret_refs(
             self._sdk,
             managed_secrets=resolved_options.managed_secrets,
             timeout_s=timeouts.fast_op_s,
@@ -1660,6 +1701,7 @@ class RunloopSandboxClient(BaseSandboxClient[RunloopSandboxClientOptions | None]
             pass
         return session
 
+    @redact_mount_error_data
     async def resume(
         self,
         state: SandboxSessionState,
@@ -1673,6 +1715,7 @@ class RunloopSandboxClient(BaseSandboxClient[RunloopSandboxClientOptions | None]
         """
         if not isinstance(state, RunloopSandboxSessionState):
             raise TypeError("RunloopSandboxClient.resume expects a RunloopSandboxSessionState")
+        state.assert_path_grants_rebound()
 
         devbox = None
         reconnected = False
@@ -1717,4 +1760,4 @@ class RunloopSandboxClient(BaseSandboxClient[RunloopSandboxClientOptions | None]
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
     def deserialize_session_state(self, payload: dict[str, object]) -> SandboxSessionState:
-        return RunloopSandboxSessionState.model_validate(payload)
+        return self._deserialize_session_state_payload(payload, RunloopSandboxSessionState)

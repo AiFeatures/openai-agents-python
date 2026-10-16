@@ -24,13 +24,17 @@ from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import quote
 
 import aiohttp
 
 from .... import _debug
 from ....logger import log_tool_action_debug
+from ....sandbox._mount_security import (
+    _manifest_has_configured_mount_authority,
+    redact_mount_error_data,
+)
 from ....sandbox.errors import (
     ConfigurationError,
     ErrorCode,
@@ -38,18 +42,25 @@ from ....sandbox.errors import (
     ExecTransportError,
     ExposedPortUnavailableError,
     MountConfigError,
+    SandboxRuntimeError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
     WorkspaceReadNotFoundError,
     WorkspaceStartError,
+    WorkspaceStopError,
     WorkspaceWriteTypeError,
 )
 from ....sandbox.manifest import Manifest
 from ....sandbox.session import SandboxSession, SandboxSessionState
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
+from ....sandbox.session.bounded_read import collect_bounded
 from ....sandbox.session.dependencies import Dependencies
 from ....sandbox.session.manager import Instrumentation
-from ....sandbox.session.mount_lifecycle import with_ephemeral_mounts_removed
+from ....sandbox.session.mount_lifecycle import (
+    _settle_mount_transition,
+    with_ephemeral_mounts_removed,
+)
+from ....sandbox.session.pty_output import collect_pty_output
 from ....sandbox.session.pty_types import (
     PTY_PROCESSES_MAX,
     PTY_PROCESSES_WARNING,
@@ -58,7 +69,6 @@ from ....sandbox.session.pty_types import (
     clamp_pty_yield_time_ms,
     process_id_to_prune_from_meta,
     resolve_pty_write_yield_time_ms,
-    truncate_text_by_tokens,
 )
 from ....sandbox.session.runtime_helpers import RESOLVE_WORKSPACE_PATH_HELPER, RuntimeHelperScript
 from ....sandbox.session.sandbox_client import BaseSandboxClient, BaseSandboxClientOptions
@@ -207,12 +217,22 @@ class _ServerSentEvent:
 
 class _SSELineDecoder:
     _buf: bytes
+    _skip_leading_lf: bool
 
     def __init__(self) -> None:
         self._buf = b""
+        self._skip_leading_lf = False
 
-    def decode(self, text: str) -> list[str]:
-        raw = self._buf + text.encode("utf-8")
+    def decode(self, text: str | bytes) -> list[str]:
+        data = text.encode("utf-8") if isinstance(text, str) else text
+        if self._skip_leading_lf and data:
+            # The previous chunk ended on a CR, which already terminated its line. A LF
+            # opening this chunk is the second half of that CRLF, so consume it instead of
+            # reading it as a blank line, which SSE treats as an event dispatch.
+            self._skip_leading_lf = False
+            if data.startswith(b"\n"):
+                data = data[1:]
+        raw = self._buf + data
         self._buf = b""
 
         lines: list[str] = []
@@ -231,7 +251,12 @@ class _SSELineDecoder:
                 if cr + 1 < length and raw[cr + 1 : cr + 2] == b"\n":
                     i = cr + 2
                 elif cr + 1 == length:
-                    self._buf = b"\r"
+                    # A CR is a complete line ending on its own, so deliver the line now
+                    # rather than waiting to learn whether a LF follows. Only remember that
+                    # a LF opening the next chunk belongs to this CRLF; without that, the
+                    # LF reads as a blank line and dispatches the event early, splitting one
+                    # multi-line event into several.
+                    self._skip_leading_lf = True
                     lines.append(line.decode("utf-8"))
                     break
                 else:
@@ -247,11 +272,11 @@ class _SSELineDecoder:
     def flush(self) -> list[str]:
         buf = self._buf
         self._buf = b""
-        if buf == b"\r":
-            return [""]
-        if buf:
-            return [buf.decode("utf-8")]
-        return []
+        # A trailing CR already delivered its line, so there is nothing pending for it here.
+        self._skip_leading_lf = False
+        if not buf:
+            return []
+        return [buf.decode("utf-8")]
 
 
 class _SSEDecoder:
@@ -340,6 +365,16 @@ class CloudflareSandboxSessionState(SandboxSessionState):
     worker_url: str
     sandbox_id: str
 
+    def _sanitize_persisted_provider_identity(
+        self,
+        data: dict[str, Any],
+        *,
+        mount_authority_redacted: bool,
+    ) -> None:
+        if mount_authority_redacted:
+            data["sandbox_id"] = ""
+            data["workspace_root_ready"] = False
+
 
 @dataclass
 class _CloudflarePtyProcessEntry:
@@ -370,6 +405,7 @@ class CloudflareSandboxSession(BaseSandboxSession):
     # Tracks whether the worker was running when resume began so snapshot restore can
     # detach any active ephemeral mounts before hydrating the workspace.
     _restore_workspace_was_running: bool
+    _mount_transition_terminal: bool
 
     def __init__(
         self,
@@ -389,6 +425,7 @@ class CloudflareSandboxSession(BaseSandboxSession):
         self._pty_processes = {}
         self._reserved_pty_process_ids = set()
         self._restore_workspace_was_running = False
+        self._mount_transition_terminal = False
 
     @classmethod
     def from_state(
@@ -406,7 +443,15 @@ class CloudflareSandboxSession(BaseSandboxSession):
             request_timeout_s=request_timeout_s,
         )
 
-    def _session(self) -> aiohttp.ClientSession:
+    def _session(self, *, allow_terminal: bool = False) -> aiohttp.ClientSession:
+        if self._mount_transition_terminal and not allow_terminal:
+            raise SandboxRuntimeError(
+                message="sandbox session is unavailable after an ambiguous mount transition",
+                error_code=ErrorCode.MOUNT_FAILED,
+                op="shutdown",
+                context={"backend": "cloudflare"},
+                retryable=False,
+            )
         if self._http is None or self._http.closed:
             headers: dict[str, str] = {}
             if api_key := self._api_key or os.environ.get("CLOUDFLARE_SANDBOX_API_KEY"):
@@ -653,31 +698,23 @@ class CloudflareSandboxSession(BaseSandboxSession):
 
     async def _restore_snapshot_into_workspace_on_resume(self) -> None:
         root = self._workspace_root_path()
-        detached_mounts: list[tuple[Any, Path]] = []
-        if self._restore_workspace_was_running:
-            for mount_entry, mount_path in self.state.manifest.ephemeral_mount_targets():
-                try:
-                    await mount_entry.mount_strategy.teardown_for_snapshot(
-                        mount_entry, self, mount_path
-                    )
-                except Exception as e:
-                    raise WorkspaceStartError(path=root, cause=e) from e
-                detached_mounts.append((mount_entry, mount_path))
-
         workspace_archive: io.IOBase | None = None
+
+        async def restore_workspace() -> None:
+            nonlocal workspace_archive
+            try:
+                await self._clear_workspace_root_on_resume()
+                workspace_archive = await self.state.snapshot.restore(
+                    dependencies=self.dependencies
+                )
+                await self._hydrate_workspace_via_http(workspace_archive)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise WorkspaceStartError(path=root, cause=exc) from exc
+
         try:
-            await self._clear_workspace_root_on_resume()
-            workspace_archive = await self.state.snapshot.restore(dependencies=self.dependencies)
-            await self._hydrate_workspace_via_http(workspace_archive)
-        except Exception:
-            for mount_entry, mount_path in reversed(detached_mounts):
-                try:
-                    await mount_entry.mount_strategy.restore_after_snapshot(
-                        mount_entry, self, mount_path
-                    )
-                except Exception:
-                    pass
-            raise
+            await restore_workspace()
         finally:
             if workspace_archive is not None:
                 try:
@@ -685,17 +722,82 @@ class CloudflareSandboxSession(BaseSandboxSession):
                 except Exception:
                     pass
 
+    async def _restore_snapshot_and_reapply_ephemeral_on_resume(self) -> None:
+        if not self._restore_workspace_was_running:
+            await super()._restore_snapshot_and_reapply_ephemeral_on_resume()
+            return
+
+        async def restore_snapshot_and_accounts() -> None:
+            await self._restore_snapshot_into_workspace_on_resume()
+            if self.should_provision_manifest_accounts_on_resume():
+                await self.provision_manifest_accounts()
+
+        transition_error, caller_cancelled = await _settle_mount_transition(
+            self,
+            with_ephemeral_mounts_removed(
+                self,
+                restore_snapshot_and_accounts,
+                error_path=self._workspace_root_path(),
+                error_cls=WorkspaceStartError,
+                operation_error_context_key=None,
+                restore_on_success=False,
+            ),
+        )
+        if transition_error is not None:
+            raise transition_error
+        await self._reapply_ephemeral_manifest_on_resume()
+        if caller_cancelled:
+            raise asyncio.CancelledError() from None
+
+    async def _reapply_ephemeral_manifest_on_resume(self) -> None:
+        transition_error, caller_cancelled = await _settle_mount_transition(
+            self,
+            super()._reapply_ephemeral_manifest_on_resume(),
+        )
+        if transition_error is not None:
+            terminal_error, _terminal_cancelled = await _settle_mount_transition(
+                self,
+                self._terminate_ambiguous_mount_transition(),
+            )
+            if terminal_error is not None:
+                if isinstance(terminal_error, WorkspaceStopError):
+                    raise terminal_error
+                raise WorkspaceStopError(
+                    path=self._workspace_root_path(),
+                    context={
+                        "backend": "cloudflare",
+                        "reason": "terminal_cleanup_failed",
+                    },
+                    cause=terminal_error,
+                ) from terminal_error
+            raise transition_error
+        if caller_cancelled:
+            raise asyncio.CancelledError() from None
+
     async def _after_stop(self) -> None:
         await self._close_http()
 
     async def _shutdown_backend(self) -> None:
+        has_protected_mount_authority = (
+            _manifest_has_configured_mount_authority(self.state.manifest)
+            or self._runtime_has_protected_mount_authority()
+        )
         try:
-            http = self._session()
+            http = self._session(allow_terminal=True)
             url = self.state.worker_url.rstrip("/") + f"/v1/sandbox/{self.state.sandbox_id}"
             async with http.delete(url) as resp:
                 if resp.status < 400 or resp.status == 404:
                     return
-                if _debug.DONT_LOG_TOOL_DATA:
+                if self._mount_transition_terminal:
+                    raise WorkspaceStopError(
+                        path=self._workspace_root_path(),
+                        context={
+                            "backend": "cloudflare",
+                            "reason": "terminal_delete_failed",
+                            "http_status": resp.status,
+                        },
+                    )
+                if has_protected_mount_authority or _debug.DONT_LOG_TOOL_DATA:
                     logger.debug("Failed to delete Cloudflare sandbox on shutdown")
                 else:
                     detail = await _read_cloudflare_response_body(resp)
@@ -704,10 +806,46 @@ class CloudflareSandboxSession(BaseSandboxSession):
                         _cloudflare_http_error_message("DELETE /sandbox", resp.status, detail),
                     )
         except Exception as exc:
-            log_tool_action_debug(logger, "Failed to delete Cloudflare sandbox on shutdown", exc)
+            if self._mount_transition_terminal:
+                if isinstance(exc, WorkspaceStopError):
+                    raise
+                raise WorkspaceStopError(
+                    path=self._workspace_root_path(),
+                    context={
+                        "backend": "cloudflare",
+                        "reason": "terminal_delete_failed",
+                    },
+                    cause=exc,
+                ) from exc
+            if has_protected_mount_authority:
+                logger.debug("Failed to delete Cloudflare sandbox on shutdown")
+            else:
+                log_tool_action_debug(
+                    logger, "Failed to delete Cloudflare sandbox on shutdown", exc
+                )
 
     async def _after_shutdown(self) -> None:
         await self._close_http()
+
+    async def _terminate_ambiguous_mount_transition(self) -> None:
+        self._mount_transition_terminal = True
+        cleanup_error: BaseException | None = None
+        try:
+            await self._before_shutdown()
+        except BaseException as exc:
+            cleanup_error = exc
+        try:
+            await self._shutdown_backend()
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        try:
+            await self._after_shutdown()
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        if cleanup_error is not None:
+            raise cleanup_error
 
     async def _exec_internal(
         self,
@@ -758,8 +896,7 @@ class CloudflareSandboxSession(BaseSandboxSession):
 
                 async for chunk in resp.content.iter_any():
                     raw_stream.extend(chunk)
-                    text = chunk.decode("utf-8")
-                    for line in line_decoder.decode(text):
+                    for line in line_decoder.decode(chunk):
                         event = sse_decoder.decode(line)
                         if event is None:
                             continue
@@ -897,34 +1034,15 @@ class CloudflareSandboxSession(BaseSandboxSession):
         entry: _CloudflarePtyProcessEntry,
         yield_time_ms: int,
         max_output_tokens: int | None,
-    ) -> tuple[bytes, int | None]:
-        deadline = time.monotonic() + (yield_time_ms / 1000)
-        output = bytearray()
-
-        while True:
-            async with entry.output_lock:
-                while entry.output_chunks:
-                    output.extend(entry.output_chunks.popleft())
-
-            if entry.output_closed.is_set():
-                async with entry.output_lock:
-                    while entry.output_chunks:
-                        output.extend(entry.output_chunks.popleft())
-                break
-
-            remaining_s = deadline - time.monotonic()
-            if remaining_s <= 0:
-                break
-
-            try:
-                await asyncio.wait_for(entry.output_notify.wait(), timeout=remaining_s)
-            except asyncio.TimeoutError:
-                break
-            entry.output_notify.clear()
-
-        text = output.decode("utf-8", errors="replace")
-        truncated_text, original_token_count = truncate_text_by_tokens(text, max_output_tokens)
-        return truncated_text.encode("utf-8", errors="replace"), original_token_count
+    ) -> tuple[bytes, int | None, bool]:
+        return await collect_pty_output(
+            output_chunks=entry.output_chunks,
+            output_lock=entry.output_lock,
+            output_notify=entry.output_notify,
+            is_done=entry.output_closed.is_set,
+            yield_time_ms=yield_time_ms,
+            max_output_tokens=max_output_tokens,
+        )
 
     async def _finalize_pty_update(
         self,
@@ -933,10 +1051,11 @@ class CloudflareSandboxSession(BaseSandboxSession):
         entry: _CloudflarePtyProcessEntry,
         output: bytes,
         original_token_count: int | None,
+        output_closed: bool,
     ) -> PtyExecUpdate:
-        exit_code = entry.exit_code if entry.output_closed.is_set() else None
+        exit_code = entry.exit_code if output_closed else None
         live_process_id: int | None = process_id
-        if entry.output_closed.is_set():
+        if output_closed:
             async with self._pty_lock:
                 removed = self._pty_processes.pop(process_id, None)
                 self._reserved_pty_process_ids.discard(process_id)
@@ -1010,7 +1129,10 @@ class CloudflareSandboxSession(BaseSandboxSession):
         process_count = 0
 
         try:
-            ws = await self._session().ws_connect(self._ws_pty_url())
+            ws = cast(
+                "aiohttp.ClientWebSocketResponse[Any]",
+                await self._session().ws_connect(self._ws_pty_url()),
+            )
 
             ready_deadline = time.monotonic() + 30.0
             while True:
@@ -1084,7 +1206,7 @@ class CloudflareSandboxSession(BaseSandboxSession):
             )
 
         yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
+        output, original_token_count, output_closed = await self._collect_pty_output(
             entry=entry,
             yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
             max_output_tokens=max_output_tokens,
@@ -1094,6 +1216,7 @@ class CloudflareSandboxSession(BaseSandboxSession):
             entry=entry,
             output=output,
             original_token_count=original_token_count,
+            output_closed=output_closed,
         )
 
     async def pty_write_stdin(
@@ -1117,7 +1240,7 @@ class CloudflareSandboxSession(BaseSandboxSession):
             await asyncio.sleep(0.1)
 
         yield_time_ms = 250 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
+        output, original_token_count, output_closed = await self._collect_pty_output(
             entry=entry,
             yield_time_ms=resolve_pty_write_yield_time_ms(
                 yield_time_ms=yield_time_ms,
@@ -1131,6 +1254,7 @@ class CloudflareSandboxSession(BaseSandboxSession):
             entry=entry,
             output=output,
             original_token_count=original_token_count,
+            output_closed=output_closed,
         )
 
     async def pty_terminate_all(self) -> None:
@@ -1141,6 +1265,43 @@ class CloudflareSandboxSession(BaseSandboxSession):
 
         for entry in entries:
             await self._terminate_pty_entry(entry)
+
+    async def _read_bounded(self, path: Path, *, max_bytes: int) -> bytes:
+        workspace_path = await self._validate_path_access(path)
+        url_path = quote(sandbox_path_str(workspace_path).lstrip("/"), safe="/")
+        async with self._session().get(
+            self._url(f"file/{url_path}"), timeout=self._request_timeout()
+        ) as response:
+            if response.status == 404:
+                raise WorkspaceReadNotFoundError(path=path)
+            if response.status != 200:
+                raise WorkspaceArchiveReadError(
+                    path=path,
+                    retryable=False
+                    if response.status == 403
+                    else _cloudflare_retryability_for_status(response.status),
+                )
+            # Existing Workers return either bytes or an SSE-encoded file. Bound
+            # the wire representation too, before the existing decoder allocates.
+            try:
+                prefix = await response.content.readexactly(7)
+            except asyncio.IncompleteReadError as error:
+                prefix = error.partial
+            if prefix != b"data: {":
+                if len(prefix) >= max_bytes:
+                    return prefix[:max_bytes]
+                return prefix + await collect_bounded(
+                    response.content.iter_chunked(65536), max_bytes - len(prefix)
+                )
+            wire_limit = 8 * max_bytes + 65536
+            body = prefix + await collect_bounded(
+                response.content.iter_chunked(65536), wire_limit + 1 - len(prefix)
+            )
+            if len(body) > wire_limit:
+                raise WorkspaceArchiveReadError(
+                    path=path, context={"reason": "bounded_read_wire_limit"}
+                )
+            return self._decode_streamed_payload(body)[:max_bytes]
 
     async def read(self, path: Path | str, *, user: str | User | None = None) -> io.IOBase:
         if user is not None:
@@ -1282,8 +1443,9 @@ class CloudflareSandboxSession(BaseSandboxSession):
             return False
 
     @retry_async(
-        retry_if=lambda exc, self: isinstance(exc, aiohttp.ClientError)
-        or _is_transient_workspace_error(exc)
+        retry_if=lambda exc, self: (
+            isinstance(exc, aiohttp.ClientError) or _is_transient_workspace_error(exc)
+        )
     )
     async def _persist_workspace_via_http(self) -> io.IOBase:
         root = self._workspace_root_path()
@@ -1324,8 +1486,9 @@ class CloudflareSandboxSession(BaseSandboxSession):
             raise WorkspaceArchiveReadError(path=root, cause=e) from e
 
     @retry_async(
-        retry_if=lambda exc, self, data: isinstance(exc, aiohttp.ClientError)
-        or _is_transient_workspace_error(exc)
+        retry_if=lambda exc, self, data: (
+            isinstance(exc, aiohttp.ClientError) or _is_transient_workspace_error(exc)
+        )
     )
     async def _hydrate_workspace_via_http(self, data: io.IOBase) -> None:
         root = self._workspace_root_path()
@@ -1382,6 +1545,7 @@ class CloudflareSandboxSession(BaseSandboxSession):
         except Exception as e:
             raise WorkspaceArchiveWriteError(path=root, cause=e) from e
 
+    @redact_mount_error_data
     async def persist_workspace(self) -> io.IOBase:
         root = self._workspace_root_path()
         return await with_ephemeral_mounts_removed(
@@ -1392,6 +1556,7 @@ class CloudflareSandboxSession(BaseSandboxSession):
             operation_error_context_key="snapshot_error_before_remount_corruption",
         )
 
+    @redact_mount_error_data
     async def hydrate_workspace(self, data: io.IOBase) -> None:
         root = self._workspace_root_path()
         await with_ephemeral_mounts_removed(
@@ -1420,11 +1585,14 @@ class CloudflareSandboxClient(BaseSandboxClient[CloudflareSandboxClientOptions])
         request_timeout_s: float = _DEFAULT_REQUEST_TIMEOUT_S,
     ) -> None:
         super().__init__()
-        self._instrumentation = instrumentation or Instrumentation()
+        self._instrumentation = (
+            instrumentation if instrumentation is not None else Instrumentation()
+        )
         self._dependencies = dependencies
         self._exec_timeout_s = exec_timeout_s
         self._request_timeout_s = request_timeout_s
 
+    @redact_mount_error_data
     async def create(
         self,
         *,
@@ -1442,6 +1610,7 @@ class CloudflareSandboxClient(BaseSandboxClient[CloudflareSandboxClientOptions])
 
         if manifest is None:
             manifest = Manifest()
+        self._validate_manifest_for_create(manifest)
         if manifest.root != "/workspace":
             raise ConfigurationError(
                 message=(
@@ -1486,10 +1655,22 @@ class CloudflareSandboxClient(BaseSandboxClient[CloudflareSandboxClientOptions])
         await inner.shutdown()
         return session
 
+    @redact_mount_error_data
     async def resume(self, state: SandboxSessionState) -> SandboxSession:
         if not isinstance(state, CloudflareSandboxSessionState):
             raise TypeError(
                 "CloudflareSandboxClient.resume expects a CloudflareSandboxSessionState"
+            )
+        state.assert_path_grants_rebound()
+        if state.mount_authority_rebound or _manifest_has_configured_mount_authority(
+            state.manifest
+        ):
+            raise MountConfigError(
+                message=(
+                    "Cloudflare sandbox sessions with protected bucket configuration cannot "
+                    "be resumed; create a new session from current trusted configuration"
+                ),
+                context={"backend": "cloudflare"},
             )
         inner = CloudflareSandboxSession.from_state(
             state,
@@ -1503,7 +1684,7 @@ class CloudflareSandboxClient(BaseSandboxClient[CloudflareSandboxClientOptions])
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
     def deserialize_session_state(self, payload: dict[str, object]) -> SandboxSessionState:
-        return CloudflareSandboxSessionState.model_validate(payload)
+        return self._deserialize_session_state_payload(payload, CloudflareSandboxSessionState)
 
     async def _request_sandbox_id(
         self,

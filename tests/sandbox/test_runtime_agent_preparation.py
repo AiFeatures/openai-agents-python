@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Coroutine
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -11,13 +10,17 @@ import pytest
 from agents import UserError
 from agents.models.default_models import get_default_model
 from agents.run_context import RunContextWrapper
-from agents.sandbox import MemoryReadConfig, runtime_agent_preparation as sandbox_prep
+from agents.sandbox import (
+    MemoryReadConfig,
+    SandboxWorkspaceScope,
+    runtime_agent_preparation as sandbox_prep,
+)
 from agents.sandbox.capabilities import Capability, Compaction, Memory
 from agents.sandbox.entries import BaseEntry, File
 from agents.sandbox.manifest import Manifest
 from agents.sandbox.sandbox_agent import SandboxAgent
-from agents.sandbox.session.base_sandbox_session import BaseSandboxSession
 from agents.sandbox.types import User
+from agents.testing import scripted_sandbox_session
 
 
 def test_sandbox_agent_normalizes_first_party_dictionary_configuration() -> None:
@@ -84,8 +87,8 @@ class _Capability:
         return self.fragment
 
 
-def _session_with_manifest(manifest: Manifest | None) -> object:
-    return SimpleNamespace(state=SimpleNamespace(manifest=manifest))
+def _session_with_manifest(manifest: Manifest | None):
+    return scripted_sandbox_session(manifest=manifest)
 
 
 def test_prepare_sandbox_agent_passes_session_manifest_to_capability_instructions():
@@ -97,7 +100,7 @@ def test_prepare_sandbox_agent_passes_session_manifest_to_capability_instruction
             base_instructions="base instructions",
             instructions="additional instructions",
         ),
-        session=cast(BaseSandboxSession, _session_with_manifest(manifest)),
+        session=_session_with_manifest(manifest),
         capabilities=cast(list[Capability], [capability]),
     )
     instructions = cast(
@@ -134,7 +137,7 @@ def test_prepare_sandbox_agent_wraps_capabilities_without_agent_instructions():
             name="sandbox",
             base_instructions="base instructions",
         ),
-        session=cast(BaseSandboxSession, _session_with_manifest(manifest)),
+        session=_session_with_manifest(manifest),
         capabilities=cast(list[Capability], [capability]),
     )
     instructions = cast(
@@ -170,7 +173,7 @@ def test_prepare_sandbox_agent_passes_default_model_to_capability_sampling_param
             name="sandbox",
             instructions="base instructions",
         ),
-        session=cast(BaseSandboxSession, _session_with_manifest(manifest)),
+        session=_session_with_manifest(manifest),
         capabilities=cast(list[Capability], [capability]),
     )
 
@@ -185,7 +188,7 @@ def test_prepare_sandbox_agent_prepares_default_compaction_policy() -> None:
             name="sandbox",
             instructions="base instructions",
         ),
-        session=cast(BaseSandboxSession, _session_with_manifest(manifest)),
+        session=_session_with_manifest(manifest),
         capabilities=[Compaction()],
     )
 
@@ -203,7 +206,7 @@ def test_prepare_sandbox_agent_uses_default_sandbox_instructions_when_base_missi
             name="sandbox",
             instructions="additional instructions",
         ),
-        session=cast(BaseSandboxSession, _session_with_manifest(manifest)),
+        session=_session_with_manifest(manifest),
         capabilities=cast(list[Capability], [capability]),
     )
     instructions = cast(
@@ -249,6 +252,30 @@ def test_filesystem_instructions_tell_model_to_ls_when_manifest_tree_is_truncate
     ) in result
 
 
+def test_filesystem_instructions_describe_run_working_directory() -> None:
+    manifest = Manifest(root="/workspace", entries={"tasks/a": File(content=b"")})
+
+    result = sandbox_prep._filesystem_instructions(
+        manifest,
+        SandboxWorkspaceScope.from_cwd("tasks/a"),
+    )
+
+    assert "For this run, the working directory is `/workspace/tasks/a`." in result
+    assert (
+        "Relative paths passed to the built-in `exec_command`, `view_image`, and `apply_patch` "
+        "tools resolve from this directory."
+    ) in result
+    assert "Other sandbox tools follow their own path contract." in result
+    assert "The session workspace root remains `/workspace`." in result
+    assert (
+        "The working directory changes path resolution; it does not isolate this run from the "
+        "rest of the session workspace."
+    ) in result
+    assert (
+        "Files outside the working directory may be visible to or shared with other runs." in result
+    )
+
+
 def test_prepare_sandbox_agent_validates_required_capabilities() -> None:
     manifest = Manifest(root="/workspace")
 
@@ -259,7 +286,7 @@ def test_prepare_sandbox_agent_validates_required_capabilities() -> None:
                 instructions="base instructions",
                 capabilities=[Memory()],
             ),
-            session=cast(BaseSandboxSession, _session_with_manifest(manifest)),
+            session=_session_with_manifest(manifest),
             capabilities=[Memory()],
         )
 
@@ -270,7 +297,7 @@ def test_prepare_sandbox_agent_validates_required_capabilities() -> None:
                 instructions="base instructions",
                 capabilities=[Memory(read=MemoryReadConfig(live_update=False), generate=None)],
             ),
-            session=cast(BaseSandboxSession, _session_with_manifest(manifest)),
+            session=_session_with_manifest(manifest),
             capabilities=[Memory(read=MemoryReadConfig(live_update=False), generate=None)],
         )
 
@@ -280,7 +307,7 @@ def test_prepare_sandbox_agent_validates_required_capabilities() -> None:
             instructions="base instructions",
             capabilities=[Memory()],
         ),
-        session=cast(BaseSandboxSession, _session_with_manifest(manifest)),
+        session=_session_with_manifest(manifest),
         capabilities=cast(
             list[Capability],
             [

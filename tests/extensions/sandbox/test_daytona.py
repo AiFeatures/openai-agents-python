@@ -365,6 +365,18 @@ def test_daytona_package_re_exports_backend_symbols(monkeypatch: pytest.MonkeyPa
     assert package_module.DaytonaSandboxClient is daytona_module.DaytonaSandboxClient
 
 
+@pytest.fixture(autouse=True)
+def _trust_recording_mounts_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agents.sandbox import _mount_security
+
+    original = _mount_security._mount_class_is_trusted
+    monkeypatch.setattr(
+        _mount_security,
+        "_mount_class_is_trusted",
+        lambda mount: isinstance(mount, _RecordingMount) or original(mount),
+    )
+
+
 class _RecordingMount(Mount):
     type: str = "daytona_recording_mount"
     mount_strategy: InContainerMountStrategy = Field(
@@ -749,7 +761,10 @@ class TestDaytonaSandbox:
             session = await client.create(
                 options=daytona_module.DaytonaSandboxClientOptions(pause_on_exit=True),
             )
-            state = session.state
+            state = cast(
+                Any,
+                client.deserialize_session_state(client.serialize_session_state(session.state)),
+            )
             _FakeAsyncDaytona.create_calls.clear()
 
             resumed = await client.resume(state)
@@ -1180,11 +1195,9 @@ class TestDaytonaSandbox:
             f"{daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT}/repo/sub",
         }
         tar_command = sandbox.process.exec_calls[0][0]
-        assert "--exclude=repo" in tar_command
         assert "--exclude=./repo" in tar_command
-        assert "--exclude=repo/sub" in tar_command
         assert "--exclude=./repo/sub" in tar_command
-        assert "--exclude=runtime.tmp" in tar_command
+        assert "--exclude=./runtime.tmp" in tar_command
 
     @pytest.mark.asyncio
     async def test_persist_workspace_remounts_prior_mounts_after_unmount_failure(
@@ -1523,8 +1536,83 @@ class TestDaytonaSandbox:
             lambda _chunk: None,
         )
 
-        assert entry.done is False
         assert entry.exit_code is None
+        assert entry.output_closed.is_set() is False
+
+    @pytest.mark.asyncio
+    async def test_session_reader_closes_entry_when_logs_fail_after_known_exit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        sandbox.process.get_session_command_logs_error = RuntimeError("logs failed")
+        sandbox.process.session_command_exit_code = 7
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        entry = daytona_module._DaytonaPtySessionEntry(  # noqa: SLF001
+            daytona_session_id="session-123",
+            pty_handle=object(),
+            tty=False,
+            cmd_id="cmd-123",
+        )
+
+        await session._run_session_reader(  # noqa: SLF001
+            entry,
+            "session-123",
+            "cmd-123",
+            lambda _chunk: None,
+        )
+
+        assert entry.exit_code == 7
+        assert entry.output_closed.is_set() is True
+
+    @pytest.mark.asyncio
+    async def test_tty_waiter_closes_output_after_stream_callback_finishes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+
+        callback_started = asyncio.Event()
+        release_callback = asyncio.Event()
+
+        async def append_terminal_tail() -> None:
+            callback_started.set()
+            await release_callback.wait()
+            entry.output_chunks.append(b"tail")
+
+        class _ExitedPtyHandle:
+            exit_code = 0
+
+            async def wait(self) -> None:
+                await append_terminal_tail()
+
+        entry = daytona_module._DaytonaPtySessionEntry(  # noqa: SLF001
+            daytona_session_id="session-123",
+            pty_handle=_ExitedPtyHandle(),
+        )
+        waiter_task = asyncio.create_task(session._run_pty_waiter(entry))  # noqa: SLF001
+        await callback_started.wait()
+
+        assert entry.output_closed.is_set() is False
+
+        release_callback.set()
+        await waiter_task
+
+        assert entry.output_closed.is_set() is True
+        assert list(entry.output_chunks) == [b"tail"]
 
     @pytest.mark.asyncio
     async def test_terminate_pty_entry_awaits_worker_finalizer(
@@ -1899,7 +1987,7 @@ async def test_ensure_rclone_installs_when_missing() -> None:
 @pytest.mark.asyncio
 async def test_activate_calls_preflights_and_delegates() -> None:
     strategy = DaytonaCloudBucketMountStrategy()
-    mount = MagicMock()
+    mount = S3Mount(bucket="public-bucket", mount_strategy=strategy)
     session = _FakePreflightSession()
     dest = Path("/workspace")
     base_dir = Path("/workspace")
@@ -1915,6 +2003,29 @@ async def test_activate_calls_preflights_and_delegates() -> None:
         fuse_mock.assert_awaited_once_with(session)
         rclone_mock.assert_awaited_once_with(session)
         delegate_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_activate_rejects_credentials_before_preflights() -> None:
+    strategy = DaytonaCloudBucketMountStrategy()
+    mount = S3Mount(
+        bucket="bucket",
+        access_key_id="access-key",
+        secret_access_key="secret-key",
+        mount_strategy=strategy,
+    )
+    session = _FakePreflightSession()
+
+    with (
+        patch.object(_daytona_mounts, "_ensure_fuse_support", new_callable=AsyncMock) as fuse_mock,
+        patch.object(_daytona_mounts, "_ensure_rclone", new_callable=AsyncMock) as rclone_mock,
+        pytest.raises(MountConfigError),
+    ):
+        await strategy.activate(mount, session, Path("/workspace"), Path("/workspace"))
+
+    fuse_mock.assert_not_awaited()
+    rclone_mock.assert_not_awaited()
+    assert session.exec_calls == []
 
 
 @pytest.mark.asyncio
@@ -1961,7 +2072,7 @@ async def test_teardown_delegates_without_preflights() -> None:
 @pytest.mark.asyncio
 async def test_restore_after_snapshot_reruns_preflights() -> None:
     strategy = DaytonaCloudBucketMountStrategy()
-    mount = MagicMock()
+    mount = S3Mount(bucket="public-bucket", mount_strategy=strategy)
     session = _FakePreflightSession()
     path = Path("/workspace/bucket")
 
@@ -1976,6 +2087,29 @@ async def test_restore_after_snapshot_reruns_preflights() -> None:
         fuse_mock.assert_awaited_once_with(session)
         rclone_mock.assert_awaited_once_with(session)
         delegate_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_restore_after_snapshot_rejects_credentials_before_preflights() -> None:
+    strategy = DaytonaCloudBucketMountStrategy()
+    mount = S3Mount(
+        bucket="bucket",
+        access_key_id="access-key",
+        secret_access_key="secret-key",
+        mount_strategy=strategy,
+    )
+    session = _FakePreflightSession()
+
+    with (
+        patch.object(_daytona_mounts, "_ensure_fuse_support", new_callable=AsyncMock) as fuse_mock,
+        patch.object(_daytona_mounts, "_ensure_rclone", new_callable=AsyncMock) as rclone_mock,
+        pytest.raises(MountConfigError),
+    ):
+        await strategy.restore_after_snapshot(mount, session, Path("/workspace/data"))
+
+    fuse_mock.assert_not_awaited()
+    rclone_mock.assert_not_awaited()
+    assert session.exec_calls == []
 
 
 def test_build_docker_volume_driver_config_returns_none() -> None:

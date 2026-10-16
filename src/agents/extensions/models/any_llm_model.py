@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import importlib
 import inspect
 import json
 import time
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Mapping
 from copy import copy
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
@@ -26,7 +28,7 @@ from ...agent_output import AgentOutputSchemaBase
 from ...exceptions import ModelBehaviorError, UserError
 from ...handoffs import Handoff
 from ...items import ItemHelpers, ModelResponse, TResponseInputItem, TResponseStreamEvent
-from ...logger import logger
+from ...logger import log_model_action_debug, logger
 from ...model_settings import ModelSettings
 from ...models._openai_retry import get_openai_retry_advice
 from ...models._response_terminal import (
@@ -34,7 +36,7 @@ from ...models._response_terminal import (
     response_terminal_failure_error,
 )
 from ...models._retry_runtime import should_disable_provider_managed_retries
-from ...models._trace import model_config_for_trace
+from ...models._trace import model_config_for_trace, populate_generation_span
 from ...models.chatcmpl_converter import Converter
 from ...models.chatcmpl_helpers import HEADERS, HEADERS_OVERRIDE, ChatCmplHelpers
 from ...models.chatcmpl_stream_handler import ChatCmplStreamHandler
@@ -50,7 +52,17 @@ from ...tool import Tool
 from ...tracing import generation_span, response_span
 from ...tracing.span_data import GenerationSpanData
 from ...tracing.spans import Span
-from ...usage import Usage
+from ...usage import (
+    Usage,
+    _attach_raw_usage_snapshot,
+    _extract_raw_usage_snapshot,
+    _mark_request_completed_without_usage,
+    _raw_usage_snapshot,
+    _requests_for_response_without_usage,
+    _response_usage_to_usage,
+    model_usage_to_span_usage,
+)
+from ...util._error_tracing import model_span_errors, record_model_error_on_span
 from ...util._json import _to_dump_compatible
 
 try:
@@ -67,9 +79,16 @@ if TYPE_CHECKING:
 
 
 class InternalChatCompletionMessage(ChatCompletionMessage):
-    """Internal wrapper used to carry normalized reasoning content."""
+    """Internal wrapper used to carry normalized reasoning fields."""
 
     reasoning_content: str = ""
+    reasoning: str = ""
+
+
+def _usage_payload(response: Any) -> Any | None:
+    if isinstance(response, Mapping):
+        return response.get("usage")
+    return getattr(response, "usage", None)
 
 
 class _AnyLLMResponsesParamsShim:
@@ -182,7 +201,7 @@ def _flatten_any_llm_reasoning_value(value: Any) -> str:
 
 def _extract_any_llm_reasoning_text(value: Any) -> str:
     direct_reasoning_content = getattr(value, "reasoning_content", None)
-    if isinstance(direct_reasoning_content, str):
+    if isinstance(direct_reasoning_content, str) and direct_reasoning_content:
         return direct_reasoning_content
 
     reasoning = getattr(value, "reasoning", None)
@@ -190,7 +209,7 @@ def _extract_any_llm_reasoning_text(value: Any) -> str:
         reasoning = value.get("reasoning")
         if reasoning is None:
             direct_reasoning_content = value.get("reasoning_content")
-            if isinstance(direct_reasoning_content, str):
+            if isinstance(direct_reasoning_content, str) and direct_reasoning_content:
                 return direct_reasoning_content
 
     if reasoning is None:
@@ -214,6 +233,11 @@ def _normalize_any_llm_message(message: ChatCompletionMessage) -> ChatCompletion
             _convert_any_llm_tool_call_to_openai(tool_call) for tool_call in message.tool_calls
         ]
 
+    reasoning_content = getattr(message, "reasoning_content", "")
+    if not isinstance(reasoning_content, str):
+        reasoning_content = ""
+    reasoning = "" if reasoning_content else _extract_any_llm_reasoning_text(message)
+
     return InternalChatCompletionMessage(
         content=message.content,
         refusal=message.refusal,
@@ -221,7 +245,8 @@ def _normalize_any_llm_message(message: ChatCompletionMessage) -> ChatCompletion
         annotations=message.annotations,
         audio=message.audio,
         tool_calls=tool_calls,
-        reasoning_content=_extract_any_llm_reasoning_text(message),
+        reasoning_content=reasoning_content,
+        reasoning=reasoning,
     )
 
 
@@ -305,8 +330,33 @@ class AnyLLMModel(Model):
         conversation_id: str | None = None,
         prompt: ResponsePromptParam | None = None,
     ) -> AsyncIterator[TResponseStreamEvent]:
+        # `aclosing` forwards an early `aclose()` on this generator to the delegate, so the
+        # delegate's cleanup runs deterministically instead of waiting for garbage collection.
+        # The guarantee stops at the iterator any-llm returns: as of any-llm 1.11.0 its
+        # exception and provider wrappers delegate with bare `async for ... yield`, so they do
+        # not forward `aclose()` to the underlying transport. Closing that transport is an
+        # upstream any-llm concern, not something to reach into from here.
         if self._selected_api() == "responses":
-            async for chunk in self._stream_response_via_responses(
+            async with contextlib.aclosing(
+                self._stream_response_via_responses(
+                    system_instructions=system_instructions,
+                    input=input,
+                    model_settings=model_settings,
+                    tools=tools,
+                    output_schema=output_schema,
+                    handoffs=handoffs,
+                    tracing=tracing,
+                    previous_response_id=previous_response_id,
+                    conversation_id=conversation_id,
+                    prompt=prompt,
+                )
+            ) as responses_stream:
+                async for chunk in responses_stream:
+                    yield chunk
+            return
+
+        async with contextlib.aclosing(
+            self._stream_response_via_chat(
                 system_instructions=system_instructions,
                 input=input,
                 model_settings=model_settings,
@@ -314,24 +364,11 @@ class AnyLLMModel(Model):
                 output_schema=output_schema,
                 handoffs=handoffs,
                 tracing=tracing,
-                previous_response_id=previous_response_id,
-                conversation_id=conversation_id,
                 prompt=prompt,
-            ):
+            )
+        ) as chat_stream:
+            async for chunk in chat_stream:
                 yield chunk
-            return
-
-        async for chunk in self._stream_response_via_chat(
-            system_instructions=system_instructions,
-            input=input,
-            model_settings=model_settings,
-            tools=tools,
-            output_schema=output_schema,
-            handoffs=handoffs,
-            tracing=tracing,
-            prompt=prompt,
-        ):
-            yield chunk
 
     async def _get_response_via_responses(
         self,
@@ -347,7 +384,14 @@ class AnyLLMModel(Model):
         conversation_id: str | None,
         prompt: ResponsePromptParam | None,
     ) -> ModelResponse:
-        with response_span(disabled=tracing.is_disabled()) as span_response:
+        with (
+            response_span(disabled=tracing.is_disabled()) as span_response,
+            model_span_errors(
+                span_response,
+                message="Error getting response",
+                trace_include_sensitive_data=tracing.include_data(),
+            ),
+        ):
             response = await self._fetch_responses_response(
                 system_instructions=system_instructions,
                 input=input,
@@ -360,6 +404,9 @@ class AnyLLMModel(Model):
                 stream=False,
                 prompt=prompt,
             )
+
+            if getattr(response, "status", None) in {"failed", "incomplete"}:
+                raise response_terminal_failure_error(f"response.{response.status}", response)
 
             if _debug.DONT_LOG_MODEL_DATA:
                 logger.debug("LLM responded")
@@ -376,15 +423,18 @@ class AnyLLMModel(Model):
             usage = (
                 Usage(
                     requests=1,
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens,
-                    total_tokens=response.usage.total_tokens,
+                    input_tokens=response.usage.input_tokens or 0,
+                    output_tokens=response.usage.output_tokens or 0,
+                    total_tokens=response.usage.total_tokens or 0,
                     input_tokens_details=response.usage.input_tokens_details,
                     output_tokens_details=response.usage.output_tokens_details,
                 )
-                if response.usage
-                else Usage()
+                if response.usage is not None
+                # The request completed, so it counts even when the provider omits usage.
+                else Usage(requests=1)
             )
+
+            span_response.span_data.usage = model_usage_to_span_usage(usage)
 
             if tracing.include_data():
                 span_response.span_data.response = response
@@ -395,6 +445,11 @@ class AnyLLMModel(Model):
                 usage=usage,
                 response_id=response.id,
                 request_id=getattr(response, "_request_id", None),
+                raw_usage=(
+                    _extract_raw_usage_snapshot(response, fallback=response.usage)
+                    if model_settings.preserve_raw_usage is True
+                    else None
+                ),
             )
 
     async def _stream_response_via_responses(
@@ -410,8 +465,15 @@ class AnyLLMModel(Model):
         previous_response_id: str | None,
         conversation_id: str | None,
         prompt: ResponsePromptParam | None,
-    ) -> AsyncIterator[ResponseStreamEvent]:
-        with response_span(disabled=tracing.is_disabled()) as span_response:
+    ) -> AsyncGenerator[ResponseStreamEvent, None]:
+        with (
+            response_span(disabled=tracing.is_disabled()) as span_response,
+            model_span_errors(
+                span_response,
+                message="Error streaming response",
+                trace_include_sensitive_data=tracing.include_data(),
+            ),
+        ):
             stream = await self._fetch_responses_response(
                 system_instructions=system_instructions,
                 input=input,
@@ -427,11 +489,20 @@ class AnyLLMModel(Model):
 
             final_response: Response | None = None
             terminal_failure_error: ModelBehaviorError | None = None
+            yielded_terminal_event = False
+            close_stream_in_background = False
             try:
                 async for chunk in stream:
                     chunk_type = getattr(chunk, "type", None)
                     if isinstance(chunk, ResponseCompletedEvent):
                         final_response = chunk.response
+                        if model_settings.preserve_raw_usage is True:
+                            _attach_raw_usage_snapshot(chunk.response, chunk.response.usage)
+                        if final_response.usage is None:
+                            # Match the non-streaming path: the request happened even though
+                            # the provider reported no usage. Recorded without synthesizing a
+                            # usage payload, so tokens are not reported as real zeros.
+                            _mark_request_completed_without_usage(final_response)
                     elif chunk_type in {"response.failed", "response.incomplete"}:
                         terminal_response = getattr(chunk, "response", None)
                         terminal_failure_error = response_terminal_failure_error(
@@ -443,16 +514,59 @@ class AnyLLMModel(Model):
                             cast(str, chunk_type),
                             chunk,
                         )
+                    if chunk_type in {
+                        "response.completed",
+                        "response.failed",
+                        "response.incomplete",
+                        "error",
+                        "response.error",
+                    }:
+                        yielded_terminal_event = True
+                        # Populate the span before yielding the terminal event so a consumer
+                        # that stops there still leaves a fully recorded span.
+                        if final_response is not None:
+                            span_response.span_data.usage = model_usage_to_span_usage(
+                                _response_usage_to_usage(final_response.usage)
+                                if final_response.usage is not None
+                                else Usage(
+                                    requests=_requests_for_response_without_usage(final_response)
+                                )
+                            )
+                        if tracing.include_data() and final_response is not None:
+                            span_response.span_data.response = final_response
+                            span_response.span_data.input = input
+                        if terminal_failure_error is not None:
+                            # The failure is already known here. A consumer that stops at
+                            # this event closes the generator, which raises GeneratorExit
+                            # at the yield below and skips the raise after the loop, so
+                            # recording later would miss it entirely.
+                            record_model_error_on_span(
+                                span_response,
+                                message="Error streaming response",
+                                error=terminal_failure_error,
+                                trace_include_sensitive_data=tracing.include_data(),
+                            )
                     yield chunk
+            except asyncio.CancelledError:
+                close_stream_in_background = True
+                self._schedule_async_iterator_close(stream)
+                raise
             finally:
-                await self._maybe_aclose(stream)
+                if not close_stream_in_background:
+                    try:
+                        await self._close_stream_allowing_background_completion(stream)
+                    except Exception as exc:
+                        if yielded_terminal_event:
+                            log_model_action_debug(
+                                logger,
+                                "Ignoring stream cleanup error after terminal event",
+                                exc,
+                            )
+                        else:
+                            raise
 
             if terminal_failure_error is not None:
                 raise terminal_failure_error
-
-            if tracing.include_data() and final_response:
-                span_response.span_data.response = final_response
-                span_response.span_data.input = input
 
     async def _get_response_via_chat(
         self,
@@ -466,15 +580,23 @@ class AnyLLMModel(Model):
         tracing: ModelTracing,
         prompt: ResponsePromptParam | None,
     ) -> ModelResponse:
-        with generation_span(
-            model=str(self.model),
-            model_config=model_config_for_trace(
-                model_settings,
-                base_url=self.base_url or "",
-                extra_config={"provider": self._provider_name, "model_impl": "any-llm"},
+        with (
+            generation_span(
+                model=str(self.model),
+                model_config=model_config_for_trace(
+                    model_settings,
+                    tracing,
+                    base_url=self.base_url or "",
+                    extra_config={"provider": self._provider_name, "model_impl": "any-llm"},
+                ),
+                disabled=tracing.is_disabled(),
+            ) as span_generation,
+            model_span_errors(
+                span_generation,
+                message="Error getting response",
+                trace_include_sensitive_data=tracing.include_data(),
             ),
-            disabled=tracing.is_disabled(),
-        ) as span_generation:
+        ):
             response = await self._fetch_chat_response(
                 system_instructions=system_instructions,
                 input=input,
@@ -503,21 +625,35 @@ class AnyLLMModel(Model):
                         json.dumps(message.model_dump(), indent=2, ensure_ascii=False),
                     )
                 else:
-                    finish_reason = first_choice.finish_reason if first_choice else "-"
+                    finish_reason = first_choice.finish_reason if first_choice is not None else "-"
                     logger.debug("LLM resp had no message. finish_reason: %s", finish_reason)
 
             usage = (
                 Usage(
                     requests=1,
-                    input_tokens=response.usage.prompt_tokens,
-                    output_tokens=response.usage.completion_tokens,
-                    total_tokens=response.usage.total_tokens,
+                    input_tokens=response.usage.prompt_tokens or 0,
+                    output_tokens=response.usage.completion_tokens or 0,
+                    total_tokens=response.usage.total_tokens or 0,
                     input_tokens_details=response.usage.prompt_tokens_details,  # type: ignore[arg-type]
                     output_tokens_details=response.usage.completion_tokens_details,  # type: ignore[arg-type]
                 )
-                if response.usage
-                else Usage()
+                if response.usage is not None
+                # The request completed, so it counts even when the provider omits usage.
+                else Usage(requests=1)
             )
+
+            # Some providers signal a filtered non-streaming completion only through
+            # finish_reason="content_filter" and an otherwise empty message. Preserve
+            # that terminal signal as a refusal instead of returning an empty output.
+            if (
+                message is not None
+                and first_choice is not None
+                and first_choice.finish_reason == "content_filter"
+                and not message.content
+                and not message.refusal
+                and not message.tool_calls
+            ):
+                message.refusal = "Response withheld by the provider's content filter."
 
             if tracing.include_data():
                 span_generation.span_data.output = (
@@ -546,7 +682,11 @@ class AnyLLMModel(Model):
             )
 
             logprob_models = None
-            if first_choice and first_choice.logprobs and first_choice.logprobs.content:
+            if (
+                first_choice is not None
+                and first_choice.logprobs is not None
+                and first_choice.logprobs.content
+            ):
                 logprob_models = ChatCmplHelpers.convert_logprobs_for_output_text(
                     first_choice.logprobs.content
                 )
@@ -554,7 +694,16 @@ class AnyLLMModel(Model):
             if logprob_models:
                 self._attach_logprobs_to_output(items, logprob_models)
 
-            return ModelResponse(output=items, usage=usage, response_id=None)
+            return ModelResponse(
+                output=items,
+                usage=usage,
+                response_id=None,
+                raw_usage=(
+                    _extract_raw_usage_snapshot(response, fallback=response.usage)
+                    if model_settings.preserve_raw_usage is True
+                    else None
+                ),
+            )
 
     async def _stream_response_via_chat(
         self,
@@ -567,16 +716,24 @@ class AnyLLMModel(Model):
         handoffs: list[Handoff],
         tracing: ModelTracing,
         prompt: ResponsePromptParam | None,
-    ) -> AsyncIterator[TResponseStreamEvent]:
-        with generation_span(
-            model=str(self.model),
-            model_config=model_config_for_trace(
-                model_settings,
-                base_url=self.base_url or "",
-                extra_config={"provider": self._provider_name, "model_impl": "any-llm"},
+    ) -> AsyncGenerator[TResponseStreamEvent, None]:
+        with (
+            generation_span(
+                model=str(self.model),
+                model_config=model_config_for_trace(
+                    model_settings,
+                    tracing,
+                    base_url=self.base_url or "",
+                    extra_config={"provider": self._provider_name, "model_impl": "any-llm"},
+                ),
+                disabled=tracing.is_disabled(),
+            ) as span_generation,
+            model_span_errors(
+                span_generation,
+                message="Error streaming response",
+                trace_include_sensitive_data=tracing.include_data(),
             ),
-            disabled=tracing.is_disabled(),
-        ) as span_generation:
+        ):
             response, stream = await self._fetch_chat_response(
                 system_instructions=system_instructions,
                 input=input,
@@ -591,38 +748,59 @@ class AnyLLMModel(Model):
             )
 
             final_response: Response | None = None
+            yielded_terminal_event = False
+            close_stream_in_background = False
+            raw_usage_options: dict[str, Any] = (
+                {"preserve_raw_usage": True} if model_settings.preserve_raw_usage is True else {}
+            )
             try:
                 async for chunk in ChatCmplStreamHandler.handle_stream(
                     response,
-                    cast(Any, self._normalize_chat_stream(stream)),
+                    cast(
+                        Any,
+                        self._normalize_chat_stream(
+                            stream,
+                            preserve_raw_usage=model_settings.preserve_raw_usage is True,
+                        ),
+                    ),
                     model=self.model,
+                    **raw_usage_options,
                 ):
-                    yield chunk
+                    # Record terminal state and populate the span before yielding so a consumer
+                    # that stops at the completed event still leaves a fully recorded span.
                     if chunk.type == "response.completed":
                         final_response = chunk.response
+                        yielded_terminal_event = True
+                        self._populate_chat_generation_span(
+                            span_generation, final_response, tracing
+                        )
+
+                    yield chunk
+            except asyncio.CancelledError:
+                close_stream_in_background = True
+                self._schedule_async_iterator_close(stream)
+                raise
             finally:
-                await self._maybe_aclose(stream)
+                if not close_stream_in_background:
+                    try:
+                        await self._close_stream_allowing_background_completion(stream)
+                    except Exception as exc:
+                        if yielded_terminal_event:
+                            log_model_action_debug(
+                                logger,
+                                "Ignoring stream cleanup error after terminal event",
+                                exc,
+                            )
+                        else:
+                            raise
 
-            if tracing.include_data() and final_response:
-                span_generation.span_data.output = [final_response.model_dump()]
-
-            if final_response and final_response.usage:
-                span_generation.span_data.usage = {
-                    "requests": 1,
-                    "input_tokens": final_response.usage.input_tokens,
-                    "output_tokens": final_response.usage.output_tokens,
-                    "total_tokens": final_response.usage.total_tokens,
-                    "input_tokens_details": (
-                        final_response.usage.input_tokens_details.model_dump()
-                        if final_response.usage.input_tokens_details
-                        else {"cached_tokens": 0, "cache_write_tokens": 0}
-                    ),
-                    "output_tokens_details": (
-                        final_response.usage.output_tokens_details.model_dump()
-                        if final_response.usage.output_tokens_details
-                        else {"reasoning_tokens": 0}
-                    ),
-                }
+    @staticmethod
+    def _populate_chat_generation_span(
+        span_generation: Span[GenerationSpanData],
+        final_response: Response,
+        tracing: ModelTracing,
+    ) -> None:
+        populate_generation_span(span_generation, final_response, tracing)
 
     @overload
     async def _fetch_chat_response(
@@ -692,19 +870,13 @@ class AnyLLMModel(Model):
         if tracing.include_data():
             span.span_data.input = converted_messages
 
-        parallel_tool_calls = (
-            True
-            if model_settings.parallel_tool_calls and tools
-            else False
-            if model_settings.parallel_tool_calls is False
-            else None
-        )
         tool_choice = Converter.convert_tool_choice(model_settings.tool_choice)
         response_format = Converter.convert_response_format(output_schema)
         converted_tools = [Converter.tool_to_openai(tool) for tool in tools] if tools else []
         for handoff in handoffs:
             converted_tools.append(Converter.convert_handoff_tool(handoff))
         converted_tools = _to_dump_compatible(converted_tools)
+        parallel_tool_calls = model_settings.parallel_tool_calls if converted_tools else None
 
         if _debug.DONT_LOG_MODEL_DATA:
             logger.debug("Calling LLM")
@@ -720,7 +892,9 @@ class AnyLLMModel(Model):
                 response_format,
             )
 
-        reasoning_effort = model_settings.reasoning.effort if model_settings.reasoning else None
+        reasoning_effort = (
+            model_settings.reasoning.effort if model_settings.reasoning is not None else None
+        )
         if reasoning_effort is None and model_settings.extra_args:
             reasoning_effort = cast(Any, model_settings.extra_args.get("reasoning_effort"))
 
@@ -776,7 +950,18 @@ class AnyLLMModel(Model):
         )
 
         if not stream:
-            return self._normalize_chat_completion_response(ret)
+            raw_usage = (
+                _raw_usage_snapshot(_usage_payload(ret))
+                if model_settings.preserve_raw_usage is True
+                else None
+            )
+            normalized_response = self._normalize_chat_completion_response(ret)
+            if model_settings.preserve_raw_usage is True:
+                _attach_raw_usage_snapshot(
+                    normalized_response,
+                    raw_usage,
+                )
+            return normalized_response
 
         responses_tool_choice = OpenAIResponsesConverter.convert_tool_choice(
             model_settings.tool_choice
@@ -855,14 +1040,6 @@ class AnyLLMModel(Model):
         list_input = _to_dump_compatible(list_input)
         list_input = self._sanitize_any_llm_responses_input(list_input)
 
-        parallel_tool_calls = (
-            True
-            if model_settings.parallel_tool_calls and tools
-            else False
-            if model_settings.parallel_tool_calls is False
-            else None
-        )
-
         tool_choice = OpenAIResponsesConverter.convert_tool_choice(
             model_settings.tool_choice,
             tools=tools,
@@ -877,6 +1054,9 @@ class AnyLLMModel(Model):
             tool_choice=model_settings.tool_choice,
         )
         converted_tools_payload = _materialize_responses_tool_params(converted_tools.tools)
+        parallel_tool_calls = (
+            model_settings.parallel_tool_calls if converted_tools_payload else None
+        )
 
         include_set = set(converted_tools.includes)
         if model_settings.response_include is not None:
@@ -904,11 +1084,15 @@ class AnyLLMModel(Model):
             "stream": stream,
             "truncation": model_settings.truncation,
             "store": model_settings.store,
+            "prompt_cache_retention": model_settings.prompt_cache_retention,
             "previous_response_id": previous_response_id,
             "conversation": conversation_id,
             "include": include,
             "parallel_tool_calls": parallel_tool_calls,
-            "reasoning": _to_dump_compatible(model_settings.reasoning)
+            # any-llm types `ResponsesParams.reasoning` as a mapping, so dump the model
+            # directly. `_to_dump_compatible` only materializes lazy iterables, and a
+            # pydantic model iterates as key/value pairs, which would send a list instead.
+            "reasoning": model_settings.reasoning.model_dump(mode="json", exclude_none=True)
             if model_settings.reasoning is not None
             else None,
             "text": self._remove_not_given(text),
@@ -924,7 +1108,18 @@ class AnyLLMModel(Model):
         if stream:
             return cast(AsyncIterator[ResponseStreamEvent], response)
 
-        return self._normalize_response(response)
+        raw_usage = (
+            _raw_usage_snapshot(_usage_payload(response))
+            if model_settings.preserve_raw_usage is True
+            else None
+        )
+        normalized_response = self._normalize_response(response)
+        if model_settings.preserve_raw_usage is True:
+            _attach_raw_usage_snapshot(
+                normalized_response,
+                raw_usage,
+            )
+        return normalized_response
 
     @staticmethod
     def _split_model_name(model: str) -> tuple[str, str]:
@@ -1056,10 +1251,20 @@ class AnyLLMModel(Model):
         return ChatCompletion.model_validate(response)
 
     async def _normalize_chat_stream(
-        self, stream: AsyncIterator[ChatCompletionChunk]
+        self,
+        stream: AsyncIterator[ChatCompletionChunk],
+        *,
+        preserve_raw_usage: bool = False,
     ) -> AsyncIterator[ChatCompletionChunk]:
         async for chunk in stream:
-            yield self._normalize_chat_chunk(chunk)
+            raw_usage = _raw_usage_snapshot(_usage_payload(chunk)) if preserve_raw_usage else None
+            normalized_chunk = self._normalize_chat_chunk(chunk)
+            if preserve_raw_usage:
+                _attach_raw_usage_snapshot(
+                    normalized_chunk,
+                    raw_usage,
+                )
+            yield normalized_chunk
 
     def _normalize_chat_chunk(self, chunk: Any) -> ChatCompletionChunk:
         normalized_chunk = chunk
@@ -1100,14 +1305,49 @@ class AnyLLMModel(Model):
             if inspect.isawaitable(result):
                 await result
 
+    def _schedule_async_iterator_close(self, iterator: Any) -> None:
+        self._detach_stream_close(asyncio.ensure_future(self._maybe_aclose(iterator)))
+
+    async def _close_stream_allowing_background_completion(self, iterator: Any) -> None:
+        """Close the provider iterator, letting an in-flight close finish in the background.
+
+        Cancellation can arrive while `aclose()` is already awaiting the provider. Shielding the
+        close and detaching that exact task keeps it running instead of abandoning it half-done,
+        and avoids starting a second close: re-closing a provider iterator is not guaranteed to
+        be safe or idempotent.
+        """
+        close_task = asyncio.ensure_future(self._maybe_aclose(iterator))
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            self._detach_stream_close(close_task)
+            raise
+
+    def _detach_stream_close(self, close_task: asyncio.Future[None]) -> None:
+        if close_task.done():
+            self._consume_background_cleanup_task_result(close_task)
+            return
+        close_task.add_done_callback(self._consume_background_cleanup_task_result)
+
+    @staticmethod
+    def _consume_background_cleanup_task_result(task: asyncio.Future[Any]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            log_model_action_debug(
+                logger, "Background stream cleanup failed after cancellation", exc
+            )
+
     def _build_chat_extra_kwargs(self, model_settings: ModelSettings) -> dict[str, Any]:
         extra_kwargs: dict[str, Any] = {}
-        if model_settings.extra_query:
+        if model_settings.extra_query is not None:
             extra_kwargs["extra_query"] = copy(model_settings.extra_query)
-        if model_settings.metadata:
+        if model_settings.metadata is not None:
             extra_kwargs["metadata"] = copy(model_settings.metadata)
-        if isinstance(model_settings.extra_body, dict):
-            extra_kwargs.update(model_settings.extra_body)
+        if model_settings.extra_body is not None:
+            extra_kwargs["extra_body"] = copy(model_settings.extra_body)
         if model_settings.extra_args:
             extra_kwargs.update(model_settings.extra_args)
         return extra_kwargs
@@ -1276,7 +1516,7 @@ class AnyLLMModel(Model):
                         if isinstance(tool_call, dict) and tool_call.get("id"):
                             # Create a separate assistant message for each tool call.
                             # Only the first split keeps the assistant text/thinking
-                            # blocks/reasoning content; the rest carry tool_calls only,
+                            # blocks/reasoning fields; the rest carry tool_calls only,
                             # to avoid duplicating signed thinking blocks (which
                             # Anthropic rejects) and assistant text in history.
                             single_tool_msg = message_dict.copy()
@@ -1286,6 +1526,7 @@ class AnyLLMModel(Model):
                                     "content",
                                     "thinking_blocks",
                                     "reasoning_content",
+                                    "reasoning",
                                 ):
                                     single_tool_msg.pop(shared_field, None)
                             tool_call_messages[str(tool_call["id"])] = (

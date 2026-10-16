@@ -31,6 +31,7 @@ from agents.tool import (
 from agents.tool_context import ToolContext
 from agents.tracing import SpanError, custom_span
 from agents.usage import Usage as AgentsUsage, _make_input_tokens_details
+from agents.util._asyncio_tasks import run_producer_consumer
 from agents.util._types import MaybeAwaitable
 
 from .codex import Codex
@@ -530,19 +531,27 @@ def _validate_default_run_context_thread_id_suffix(value: str) -> str:
 
 
 def _parse_tool_input(parameters_model: type[BaseModel], input_json: str) -> BaseModel:
+    base_message = "Invalid JSON input for codex tool"
+    decode_failed = False
     try:
         json_data = json.loads(input_json) if input_json else {}
     except Exception as exc:
-        if _debug.DONT_LOG_TOOL_DATA:
-            logger.debug("Invalid JSON input for codex tool")
-        else:
-            logger.debug("Invalid JSON input for codex tool: %s", input_json)
-        raise ModelBehaviorError(f"Invalid JSON input for codex tool: {input_json}") from exc
+        if not _debug.DONT_LOG_TOOL_DATA:
+            logger.debug("%s: %s", base_message, input_json)
+            raise ModelBehaviorError(f"{base_message}: {input_json}") from exc
+        logger.debug(base_message)
+        decode_failed = True
+
+    if decode_failed:
+        raise ModelBehaviorError(base_message)
 
     try:
         return parameters_model.model_validate(json_data)
     except ValidationError as exc:
-        raise ModelBehaviorError(f"Invalid JSON input for codex tool: {exc}") from exc
+        if not _debug.DONT_LOG_TOOL_DATA:
+            raise ModelBehaviorError(f"{base_message}: {exc}") from exc
+
+    raise ModelBehaviorError(base_message)
 
 
 def _normalize_parameters(params: BaseModel) -> CodexToolCallArguments:
@@ -576,7 +585,7 @@ def _resolve_codex_options(
     options: CodexOptions | Mapping[str, Any] | None,
 ) -> CodexOptions | None:
     options = coerce_codex_options(options)
-    if options and options.api_key:
+    if options is not None and options.api_key:
         return options
 
     api_key = _resolve_default_codex_api_key(options)
@@ -596,10 +605,10 @@ def _resolve_codex_options(
 
 
 def _resolve_default_codex_api_key(options: CodexOptions | None) -> str | None:
-    if options and options.api_key:
+    if options is not None and options.api_key:
         return options.api_key
 
-    env_override = options.env if options else None
+    env_override = options.env if options is not None else None
     if env_override:
         env_codex = env_override.get("CODEX_API_KEY")
         if env_codex:
@@ -647,12 +656,17 @@ def _resolve_thread_options(
     skip_git_repo_check: bool | None,
 ) -> ThreadOptions | None:
     defaults = coerce_thread_options(defaults)
-    if not defaults and not sandbox_mode and not working_directory and skip_git_repo_check is None:
+    if (
+        defaults is None
+        and not sandbox_mode
+        and not working_directory
+        and skip_git_repo_check is None
+    ):
         return None
 
     return ThreadOptions(
         **{
-            **(defaults.__dict__ if defaults else {}),
+            **(defaults.__dict__ if defaults is not None else {}),
             **({"sandbox_mode": sandbox_mode} if sandbox_mode else {}),
             **({"working_directory": working_directory} if working_directory else {}),
             **(
@@ -1030,6 +1044,9 @@ async def _consume_events(
 ) -> tuple[str, Usage | None, str | None]:
     # Track spans keyed by item id for command execution events.
     active_spans: dict[str, Any] = {}
+    run_config = ctx.run_config
+    tracing_disabled = run_config is not None and run_config.tracing_disabled
+    include_sensitive_data = run_config is None or run_config.trace_include_sensitive_data
     final_response = ""
     usage: Usage | None = None
     resolved_thread_id = thread.id
@@ -1039,78 +1056,97 @@ async def _consume_events(
         resolved_thread_id_holder["thread_id"] = resolved_thread_id
 
     event_queue: asyncio.Queue[CodexToolStreamEvent | None] | None = None
-    dispatch_task: asyncio.Task[None] | None = None
-
     if on_stream is not None:
         # Buffer events so user callbacks cannot block the Codex stream loop.
         event_queue = asyncio.Queue()
 
-        async def _run_handler(payload: CodexToolStreamEvent) -> None:
-            # Dispatch user callbacks asynchronously to avoid blocking the stream.
+    async def _run_handler(payload: CodexToolStreamEvent) -> None:
+        # Dispatch user callbacks asynchronously to avoid blocking the stream.
+        assert on_stream is not None
+        try:
+            maybe_result = on_stream(payload)
+            if inspect.isawaitable(maybe_result):
+                await maybe_result
+        except Exception as exc:
+            log_model_and_tool_action_error(
+                logger,
+                "Error while handling Codex on_stream event",
+                exc,
+            )
+
+    async def _dispatch() -> None:
+        assert event_queue is not None
+        while True:
+            payload = await event_queue.get()
+            is_sentinel = payload is None
             try:
-                maybe_result = on_stream(payload)
-                if inspect.isawaitable(maybe_result):
-                    await maybe_result
-            except Exception as exc:
-                log_model_and_tool_action_error(
-                    logger,
-                    "Error while handling Codex on_stream event",
-                    exc,
-                )
+                if payload is not None:
+                    await _run_handler(payload)
+            finally:
+                event_queue.task_done()
+            if is_sentinel:
+                break
 
-        async def _dispatch() -> None:
-            assert event_queue is not None
-            while True:
-                payload = await event_queue.get()
-                is_sentinel = payload is None
-                try:
-                    if payload is not None:
-                        await _run_handler(payload)
-                finally:
-                    event_queue.task_done()
-                if is_sentinel:
-                    break
+    async def _process_events() -> None:
+        nonlocal final_response, resolved_thread_id, usage
 
-        dispatch_task = asyncio.create_task(_dispatch())
+        try:
+            async for raw_event in events:
+                event = coerce_thread_event(raw_event)
+                if event_queue is not None:
+                    await event_queue.put(
+                        CodexToolStreamEvent(
+                            event=event,
+                            thread=thread,
+                            tool_call=ctx.tool_call,
+                        )
+                    )
+
+                if isinstance(event, ItemStartedEvent):
+                    if not tracing_disabled:
+                        _handle_item_started(
+                            event.item,
+                            active_spans,
+                            span_data_max_chars,
+                            include_sensitive_data=include_sensitive_data,
+                        )
+                elif isinstance(event, ItemUpdatedEvent):
+                    _handle_item_updated(
+                        event.item,
+                        active_spans,
+                        span_data_max_chars,
+                        include_sensitive_data=include_sensitive_data,
+                    )
+                elif isinstance(event, ItemCompletedEvent):
+                    _handle_item_completed(
+                        event.item,
+                        active_spans,
+                        span_data_max_chars,
+                        include_sensitive_data=include_sensitive_data,
+                    )
+                    if is_agent_message_item(event.item):
+                        final_response = event.item.text
+                elif isinstance(event, TurnCompletedEvent):
+                    usage = event.usage
+                elif isinstance(event, ThreadStartedEvent):
+                    resolved_thread_id = event.thread_id
+                    if resolved_thread_id_holder is not None:
+                        resolved_thread_id_holder["thread_id"] = resolved_thread_id
+                elif isinstance(event, TurnFailedEvent):
+                    error = event.error.message
+                    raise UserError(f"Codex turn failed{(': ' + error) if error else ''}")
+                elif isinstance(event, ThreadErrorEvent):
+                    raise UserError(f"Codex stream error: {event.message}")
+        finally:
+            if event_queue is not None:
+                await event_queue.put(None)
 
     try:
-        async for raw_event in events:
-            event = coerce_thread_event(raw_event)
-            if event_queue is not None:
-                await event_queue.put(
-                    CodexToolStreamEvent(
-                        event=event,
-                        thread=thread,
-                        tool_call=ctx.tool_call,
-                    )
-                )
-
-            if isinstance(event, ItemStartedEvent):
-                _handle_item_started(event.item, active_spans, span_data_max_chars)
-            elif isinstance(event, ItemUpdatedEvent):
-                _handle_item_updated(event.item, active_spans, span_data_max_chars)
-            elif isinstance(event, ItemCompletedEvent):
-                _handle_item_completed(event.item, active_spans, span_data_max_chars)
-                if is_agent_message_item(event.item):
-                    final_response = event.item.text
-            elif isinstance(event, TurnCompletedEvent):
-                usage = event.usage
-            elif isinstance(event, ThreadStartedEvent):
-                resolved_thread_id = event.thread_id
-                if resolved_thread_id_holder is not None:
-                    resolved_thread_id_holder["thread_id"] = resolved_thread_id
-            elif isinstance(event, TurnFailedEvent):
-                error = event.error.message
-                raise UserError(f"Codex turn failed{(': ' + error) if error else ''}")
-            elif isinstance(event, ThreadErrorEvent):
-                raise UserError(f"Codex stream error: {event.message}")
+        if on_stream is None:
+            await _process_events()
+        else:
+            await run_producer_consumer(_process_events(), _dispatch())
     finally:
-        if event_queue is not None:
-            await event_queue.put(None)
-            await event_queue.join()
-        if dispatch_task is not None:
-            await dispatch_task
-
         # Ensure any open spans are closed even on failure.
         for span in active_spans.values():
             span.finish()
@@ -1123,21 +1159,26 @@ async def _consume_events(
 
 
 def _handle_item_started(
-    item: ThreadItem, spans: dict[str, Any], span_data_max_chars: int | None
+    item: ThreadItem,
+    spans: dict[str, Any],
+    span_data_max_chars: int | None,
+    *,
+    include_sensitive_data: bool = True,
 ) -> None:
     item_id = getattr(item, "id", None)
     if not item_id:
         return
 
     if _is_command_execution_item(item):
-        output = item.aggregated_output
-        updates = {
-            "command": item.command,
+        updates: dict[str, Any] = {
             "status": item.status,
             "exit_code": item.exit_code,
         }
-        if output not in (None, ""):
-            updates["output"] = _truncate_span_value(output, span_data_max_chars)
+        if include_sensitive_data:
+            updates["command"] = item.command
+            output = item.aggregated_output
+            if output not in (None, ""):
+                updates["output"] = _truncate_span_value(output, span_data_max_chars)
         data = _merge_span_data(
             {},
             updates,
@@ -1153,7 +1194,11 @@ def _handle_item_started(
 
 
 def _handle_item_updated(
-    item: ThreadItem, spans: dict[str, Any], span_data_max_chars: int | None
+    item: ThreadItem,
+    spans: dict[str, Any],
+    span_data_max_chars: int | None,
+    *,
+    include_sensitive_data: bool = True,
 ) -> None:
     item_id = getattr(item, "id", None)
     if not item_id:
@@ -1163,11 +1208,17 @@ def _handle_item_updated(
         return
 
     if _is_command_execution_item(item):
-        _update_command_span(span, item, span_data_max_chars)
+        _update_command_span(
+            span, item, span_data_max_chars, include_sensitive_data=include_sensitive_data
+        )
 
 
 def _handle_item_completed(
-    item: ThreadItem, spans: dict[str, Any], span_data_max_chars: int | None
+    item: ThreadItem,
+    spans: dict[str, Any],
+    span_data_max_chars: int | None,
+    *,
+    include_sensitive_data: bool = True,
 ) -> None:
     item_id = getattr(item, "id", None)
     if not item_id:
@@ -1177,14 +1228,17 @@ def _handle_item_completed(
         return
 
     if _is_command_execution_item(item):
-        _update_command_span(span, item, span_data_max_chars)
+        _update_command_span(
+            span, item, span_data_max_chars, include_sensitive_data=include_sensitive_data
+        )
         if item.status == "failed":
             error_data: dict[str, Any] = {
                 "exit_code": item.exit_code,
             }
-            output = item.aggregated_output
-            if output not in (None, ""):
-                error_data["output"] = _truncate_span_value(output, span_data_max_chars)
+            if include_sensitive_data:
+                output = item.aggregated_output
+                if output not in (None, ""):
+                    error_data["output"] = _truncate_span_value(output, span_data_max_chars)
             span.set_error(
                 SpanError(
                     message="Codex command execution failed.",
@@ -1308,7 +1362,7 @@ def _enforce_span_data_budget(data: dict[str, Any], max_chars: int | None) -> di
 
     ordered_keys = [key for key in trim_keys if key in values]
     min_budget = 1
-    budgets = {key: 0 for key in values}
+    budgets = dict.fromkeys(values, 0)
     if available >= len(values):
         for key in values:
             budgets[key] = min_budget
@@ -1393,16 +1447,21 @@ def _apply_span_updates(
 
 
 def _update_command_span(
-    span: Any, item: CommandExecutionItem, span_data_max_chars: int | None
+    span: Any,
+    item: CommandExecutionItem,
+    span_data_max_chars: int | None,
+    *,
+    include_sensitive_data: bool = True,
 ) -> None:
     updates: dict[str, Any] = {
-        "command": item.command,
         "status": item.status,
         "exit_code": item.exit_code,
     }
-    output = item.aggregated_output
-    if output not in (None, ""):
-        updates["output"] = _truncate_span_value(output, span_data_max_chars)
+    if include_sensitive_data:
+        updates["command"] = item.command
+        output = item.aggregated_output
+        if output not in (None, ""):
+            updates["output"] = _truncate_span_value(output, span_data_max_chars)
     _apply_span_updates(
         span,
         updates,

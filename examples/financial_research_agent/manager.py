@@ -13,7 +13,12 @@ from agents import Runner, RunResult, RunResultStreaming, custom_span, gen_trace
 from examples.web_search_utils import extract_url_citations, extract_web_search_source_urls
 
 from .agents.financials_agent import financials_agent
-from .agents.planner_agent import FinancialSearchItem, FinancialSearchPlan, planner_agent
+from .agents.planner_agent import (
+    MAX_SEARCHES,
+    FinancialSearchItem,
+    FinancialSearchPlan,
+    planner_agent,
+)
 from .agents.risk_agent import risk_agent
 from .agents.search_agent import FinancialSearchSummary, search_agent
 from .agents.verifier_agent import VerificationResult, verifier_agent
@@ -76,7 +81,7 @@ class FinancialResearchManager:
             with trace("Financial research trace", trace_id=trace_id):
                 self.printer.update_item(
                     "trace_id",
-                    f"View trace: https://platform.openai.com/traces/trace?trace_id={trace_id}",
+                    f"View trace: https://platform.openai.com/logs/trace?trace_id={trace_id}",
                     is_done=True,
                     hide_checkmark=True,
                 )
@@ -122,7 +127,7 @@ class FinancialResearchManager:
         result = await Runner.run(planner_agent, f"Query: {query}")
         self.printer.update_item(
             "planning",
-            f"Will perform {len(result.final_output.searches)} searches",
+            f"Will perform {min(len(result.final_output.searches), MAX_SEARCHES)} searches",
             is_done=True,
         )
         return result.final_output_as(FinancialSearchPlan)
@@ -132,7 +137,11 @@ class FinancialResearchManager:
     ) -> Sequence[FinancialSearchEvidence]:
         with custom_span("Search the web"):
             self.printer.update_item("searching", "Searching...")
-            tasks = [asyncio.create_task(self._search(item)) for item in search_plan.searches]
+            # Enforce the host's search budget before scheduling model-generated work.
+            tasks = [
+                asyncio.create_task(self._search(item))
+                for item in search_plan.searches[:MAX_SEARCHES]
+            ]
             results: list[FinancialSearchEvidence] = []
             num_completed = 0
             num_succeeded = 0
@@ -237,18 +246,31 @@ class FinancialResearchManager:
         search_results: Sequence[FinancialSearchEvidence],
     ) -> VerificationResult:
         self.printer.update_item("verifying", "Verifying report...")
-        input_data = json.dumps(
+        result = await Runner.run(
+            verifier_agent,
+            self._verification_input(query, report, search_results),
+        )
+        self.printer.mark_item_done("verifying")
+        return result.final_output_as(VerificationResult)
+
+    def _verification_input(
+        self,
+        query: str,
+        report: FinancialReportData,
+        search_results: Sequence[FinancialSearchEvidence],
+    ) -> str:
+        return json.dumps(
             {
                 "original_query": query,
                 "research_cutoff": self.research_cutoff,
                 "report": report.model_dump(mode="json"),
                 "evidence": [item.model_dump(mode="json") for item in search_results],
+                "allowed_source_urls": sorted(
+                    {source.url for item in search_results for source in item.sources}
+                ),
             },
             ensure_ascii=False,
         )
-        result = await Runner.run(verifier_agent, input_data)
-        self.printer.mark_item_done("verifying")
-        return result.final_output_as(VerificationResult)
 
     def _report_input(
         self,

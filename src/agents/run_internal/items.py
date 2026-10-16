@@ -16,6 +16,8 @@ from uuid import uuid4
 from openai.types.responses import ResponseFunctionToolCall
 from pydantic import BaseModel
 
+from .._tool_identity import get_hosted_mcp_approval_request_identity
+from .._tool_invocation import tool_output_identity
 from ..agent_tool_state import drop_agent_tool_run_result
 from ..items import ItemHelpers, RunItem, ToolCallOutputItem, TResponseInputItem
 from ..models.fake_id import FAKE_RESPONSES_ID
@@ -35,6 +37,10 @@ _TOOL_CALL_TO_OUTPUT_TYPE: dict[str, str] = {
     "local_shell_call": "local_shell_call_output",
     "tool_search_call": "tool_search_output",
 }
+# These items must retain their original position relative to required follower items.
+_DEDUPE_EARLIEST_ANCHOR_ITEM_TYPES = frozenset(
+    {*_TOOL_CALL_TO_OUTPUT_TYPE, "mcp_approval_request", "reasoning"}
+)
 _PROGRAM_OWNED_HOSTED_ITEM_TYPES = frozenset(
     {
         "hosted_tool_call",
@@ -56,11 +62,14 @@ __all__ = [
     "REJECTION_MESSAGE",
     "TOOL_CALL_SESSION_DESCRIPTION_KEY",
     "TOOL_CALL_SESSION_TITLE_KEY",
+    "apply_reasoning_item_id_policy",
     "copy_input_items",
     "drop_orphan_function_calls",
     "ensure_input_item_format",
+    "prepare_model_input_items",
     "run_item_to_input_item",
     "run_items_to_input_items",
+    "order_current_turn_tool_outputs",
     "normalize_input_items_for_api",
     "normalize_resumed_input",
     "fingerprint_input_item",
@@ -81,6 +90,44 @@ __all__ = [
     "extract_mcp_request_id",
     "extract_mcp_request_id_from_run",
 ]
+
+
+def order_current_turn_tool_outputs(
+    items: Sequence[RunItem],
+    *,
+    start: int | None,
+    call_positions: dict[str, int],
+    published_items: Sequence[RunItem] = (),
+) -> list[RunItem]:
+    """Order pending local outputs without moving the response or published history."""
+    ordered_items = list(items)
+    if start is None:
+        return ordered_items
+    published_ids = {
+        identity
+        for item in published_items
+        if isinstance(item, ToolCallOutputItem)
+        and (identity := tool_output_identity(item.raw_item)) is not None
+    }
+    for index in range(start, len(ordered_items)):
+        if (
+            isinstance(ordered_items[index], ToolCallOutputItem)
+            and tool_output_identity(ordered_items[index].raw_item) in published_ids
+        ):
+            start = index + 1
+    slots = [
+        index
+        for index in range(start, len(ordered_items))
+        if isinstance(item := ordered_items[index], ToolCallOutputItem)
+        and item.call_id in call_positions
+    ]
+    outputs = sorted(
+        (ordered_items[index] for index in slots),
+        key=lambda item: call_positions[cast(ToolCallOutputItem, item).call_id or ""],
+    )
+    for index, output in zip(slots, outputs, strict=True):
+        ordered_items[index] = output
+    return ordered_items
 
 
 @dataclass(frozen=True)
@@ -161,15 +208,21 @@ def run_items_to_input_items(
     return converted
 
 
-def drop_orphan_function_calls(items: list[TResponseInputItem]) -> list[TResponseInputItem]:
+def drop_orphan_function_calls(
+    items: list[TResponseInputItem],
+    *,
+    pruning_indexes: set[int] | None = None,
+    output_pruning_indexes: set[int] | None = None,
+) -> list[TResponseInputItem]:
     """
     Remove tool and program call items that do not have corresponding outputs so resumptions or
-    retries do not replay stale calls. Program-owned items are removed with an orphan program,
-    while programs with retained hosted calls or tool outputs remain available for continuation.
-    Reasoning items that immediately precede a call dropped by this pass are also removed, since
-    the Responses API rejects reasoning items that are not followed by their associated
-    model-emitted item (``Item 'rs_...' of type 'reasoning' was provided without its required
-    following item``).
+    retries do not replay stale calls. When ``output_pruning_indexes`` identifies unambiguous
+    stored history, also remove tool outputs whose corresponding calls are no longer present after
+    history pruning. Program-owned items are removed with an orphan program, while programs with
+    retained hosted calls or tool outputs remain available for continuation. Reasoning items that
+    immediately precede a call dropped by this pass are also removed, since the Responses API
+    rejects reasoning items that are not followed by their associated model-emitted item (``Item
+    'rs_...' of type 'reasoning' was provided without its required following item``).
     """
 
     completed_call_ids = _completed_call_ids_by_type(items)
@@ -197,54 +250,71 @@ def drop_orphan_function_calls(items: list[TResponseInputItem]) -> list[TRespons
             orphan_program_call_ids.add(call_id)
 
     dropped_indexes: set[int] = set()
-    filtered: list[TResponseInputItem] = []
+    reasoning_trigger_indexes: set[int] = set()
     for index, entry in enumerate(items):
         if not isinstance(entry, dict):
-            filtered.append(entry)
             continue
         entry_type = entry.get("type")
         if not isinstance(entry_type, str):
-            filtered.append(entry)
             continue
         if pruning_indexes is not None and index not in pruning_indexes:
-            filtered.append(entry)
             continue
         program_caller_id = _get_program_caller_id(entry)
         if program_caller_id is not None and program_caller_id in orphan_program_call_ids:
             dropped_indexes.add(index)
-            continue
-        output_type = _TOOL_CALL_TO_OUTPUT_TYPE.get(entry_type)
-        if output_type is None:
-            filtered.append(entry)
+            reasoning_trigger_indexes.add(index)
             continue
         call_id = entry.get("call_id")
+        output_type = _TOOL_CALL_TO_OUTPUT_TYPE.get(entry_type)
+        if output_type is None:
+            continue
         if program_caller_id is not None and _is_pending_hosted_shell_call(entry):
-            filtered.append(entry)
             continue
         if entry_type == "program" and call_id in active_program_call_ids:
-            filtered.append(entry)
             continue
         if isinstance(call_id, str) and call_id in completed_call_ids.get(output_type, set()):
-            filtered.append(entry)
             continue
         if (
             entry_type == "tool_search_call"
             and not isinstance(call_id, str)
             and index in matched_anonymous_tool_search_calls
         ):
-            filtered.append(entry)
             continue
         # Tool call entry will be dropped; record so we can also drop preceding reasoning items.
         dropped_indexes.add(index)
+        reasoning_trigger_indexes.add(index)
+
+    available_call_ids = _available_call_ids_by_output_type(
+        items,
+        excluded_indexes=dropped_indexes,
+    )
+    if output_pruning_indexes is not None:
+        for index in output_pruning_indexes:
+            if index in dropped_indexes or index < 0 or index >= len(items):
+                continue
+            entry = items[index]
+            if not isinstance(entry, dict):
+                continue
+            entry_type = entry.get("type")
+            if not isinstance(entry_type, str) or entry_type not in available_call_ids:
+                continue
+            call_id = entry.get("call_id")
+            if isinstance(call_id, str) and call_id not in available_call_ids[entry_type]:
+                dropped_indexes.add(index)
 
     if not dropped_indexes:
-        return filtered
-    return _drop_reasoning_items_preceding_dropped_calls(items, dropped_indexes)
+        return list(items)
+    return _drop_reasoning_items_preceding_dropped_calls(
+        items,
+        dropped_indexes,
+        reasoning_trigger_indexes,
+    )
 
 
 def _drop_reasoning_items_preceding_dropped_calls(
     items: list[TResponseInputItem],
     dropped_indexes: set[int],
+    reasoning_trigger_indexes: set[int],
 ) -> list[TResponseInputItem]:
     """Drop reasoning items whose tied tool call was just dropped as orphan.
 
@@ -267,7 +337,7 @@ def _drop_reasoning_items_preceding_dropped_calls(
             next_entry = items[next_index]
             if isinstance(next_entry, dict) and next_entry.get("type") == "reasoning":
                 continue
-            if next_index in dropped_indexes:
+            if next_index in reasoning_trigger_indexes:
                 drop_reasoning.add(index)
             break
     excluded = dropped_indexes | drop_reasoning
@@ -296,6 +366,20 @@ def normalize_input_items_for_api(items: list[TResponseInputItem]) -> list[TResp
         normalized_item = strip_internal_input_item_metadata(cast(TResponseInputItem, coerced))
         normalized.append(normalized_item)
     return normalized
+
+
+def prepare_model_input_items(
+    caller_items: Sequence[TResponseInputItem],
+    generated_items: Sequence[TResponseInputItem] = (),
+) -> list[TResponseInputItem]:
+    """Normalize model input while pruning orphans only from runner-generated history."""
+    normalized_caller_items = normalize_input_items_for_api(list(caller_items))
+    if not generated_items:
+        return normalized_caller_items
+
+    normalized_generated_items = normalize_input_items_for_api(list(generated_items))
+    filtered_generated_items = drop_orphan_function_calls(normalized_generated_items)
+    return normalized_caller_items + filtered_generated_items
 
 
 def normalize_resumed_input(
@@ -346,7 +430,7 @@ def fingerprint_input_item(item: Any, *, ignore_ids_for_matching: bool = False) 
         return None
 
 
-def digest_input_item(item: Any) -> str | None:
+def digest_input_item(item: Any, *, ignore_ids_for_matching: bool = False) -> str | None:
     """Return a fixed-size digest of an input item for durable occurrence tracking."""
     coerced = _coerce_to_dict(item)
     if coerced is not None:
@@ -362,7 +446,7 @@ def digest_input_item(item: Any) -> str | None:
                 coerced.pop("status", None)
         item = coerced
 
-    fingerprint = fingerprint_input_item(item)
+    fingerprint = fingerprint_input_item(item, ignore_ids_for_matching=ignore_ids_for_matching)
     if fingerprint is None:
         return None
     return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
@@ -644,6 +728,12 @@ def _dedupe_key(item: TResponseInputItem) -> str | None:
     item_type = payload.get("type") or role
     if role is not None or item_type == "message":
         return None
+    call_id = payload.get("call_id")
+    if isinstance(call_id, str) and item_type in {
+        *_TOOL_CALL_TO_OUTPUT_TYPE,
+        *_TOOL_CALL_TO_OUTPUT_TYPE.values(),
+    }:
+        return f"call_id:{item_type}:{call_id}"
     item_id = payload.get("id")
     if item_id == FAKE_RESPONSES_ID:
         # Ignore placeholder IDs so call_id-based dedupe remains possible.
@@ -651,7 +741,6 @@ def _dedupe_key(item: TResponseInputItem) -> str | None:
     if isinstance(item_id, str):
         return f"id:{item_type}:{item_id}"
 
-    call_id = payload.get("call_id")
     if isinstance(call_id, str):
         return f"call_id:{item_type}:{call_id}"
 
@@ -664,14 +753,26 @@ def _dedupe_key(item: TResponseInputItem) -> str | None:
 
 
 def strip_internal_input_item_metadata(item: TResponseInputItem) -> TResponseInputItem:
-    """Remove SDK-only session metadata before sending items back to the model."""
+    """Remove session and output-only metadata before replaying items as input."""
     if not isinstance(item, dict):
         return item
 
     cleaned = dict(item)
     cleaned.pop(TOOL_CALL_SESSION_DESCRIPTION_KEY, None)
     cleaned.pop(TOOL_CALL_SESSION_TITLE_KEY, None)
+    # Compaction and persisted history can bypass RunItem's output-to-input conversion.
+    cleaned.pop("created_by", None)
     return cast(TResponseInputItem, cleaned)
+
+
+def apply_reasoning_item_id_policy(
+    items: list[TResponseInputItem],
+    reasoning_item_id_policy: ReasoningItemIdPolicy | None,
+) -> list[TResponseInputItem]:
+    """Apply the reasoning item ID policy to already-converted input items."""
+    if not _should_omit_reasoning_item_ids(reasoning_item_id_policy):
+        return items
+    return [_without_reasoning_item_id(item) for item in items]
 
 
 def _should_omit_reasoning_item_ids(reasoning_item_id_policy: ReasoningItemIdPolicy | None) -> bool:
@@ -709,10 +810,36 @@ def deduplicate_input_items(items: Sequence[TResponseInputItem]) -> list[TRespon
 def deduplicate_input_items_preferring_latest(
     items: Sequence[TResponseInputItem],
 ) -> list[TResponseInputItem]:
-    """Deduplicate by stable identifiers while keeping the latest occurrence."""
-    # deduplicate_input_items keeps the first item per dedupe key. Reverse twice so that
-    # the latest item in the original order wins for duplicate IDs/call_ids.
-    return list(reversed(deduplicate_input_items(list(reversed(items)))))
+    """Deduplicate by stable identifiers while keeping the latest value.
+
+    Causal precursor items stay at their earliest position so they cannot move behind required
+    followers. Other identified items stay at their latest position so replacing a stale value
+    does not move the replacement earlier in the conversation.
+    """
+    latest_by_key: dict[str, TResponseInputItem] = {}
+    anchor_index_by_key: dict[str, int] = {}
+    for index, item in enumerate(items):
+        dedupe_key = _dedupe_key(item)
+        if dedupe_key is None:
+            continue
+
+        latest_by_key[dedupe_key] = item
+        payload = _coerce_to_dict(item)
+        item_type = payload.get("type") if payload is not None else None
+        if (
+            dedupe_key not in anchor_index_by_key
+            or item_type not in _DEDUPE_EARLIEST_ANCHOR_ITEM_TYPES
+        ):
+            anchor_index_by_key[dedupe_key] = index
+
+    deduplicated: list[TResponseInputItem] = []
+    for index, item in enumerate(items):
+        dedupe_key = _dedupe_key(item)
+        if dedupe_key is None:
+            deduplicated.append(item)
+        elif anchor_index_by_key[dedupe_key] == index:
+            deduplicated.append(latest_by_key[dedupe_key])
+    return deduplicated
 
 
 def function_tool_error_output(
@@ -816,6 +943,12 @@ def apply_patch_rejection_item(
 
 def extract_mcp_request_id(raw_item: Any) -> str | None:
     """Pull the request id from hosted MCP approval payloads."""
+    try:
+        hosted_request = get_hosted_mcp_approval_request_identity(raw_item)
+    except Exception:
+        hosted_request = None
+    if hosted_request is not None:
+        return hosted_request.request_id
     if isinstance(raw_item, dict):
         provider_data = raw_item.get("provider_data")
         if isinstance(provider_data, dict):
@@ -842,6 +975,12 @@ def extract_mcp_request_id(raw_item: Any) -> str | None:
 def extract_mcp_request_id_from_run(mcp_run: Any) -> str | None:
     """Extract the hosted MCP request id from a streaming run item."""
     request_item = getattr(mcp_run, "request_item", None) or getattr(mcp_run, "requestItem", None)
+    try:
+        hosted_request = get_hosted_mcp_approval_request_identity(request_item)
+    except Exception:
+        hosted_request = None
+    if hosted_request is not None:
+        return hosted_request.request_id
     if isinstance(request_item, dict):
         provider_data = request_item.get("provider_data")
         if isinstance(provider_data, dict):
@@ -879,6 +1018,32 @@ def _completed_call_ids_by_type(payload: list[TResponseInputItem]) -> dict[str, 
         if isinstance(call_id, str):
             completed[item_type].add(call_id)
     return completed
+
+
+def _available_call_ids_by_output_type(
+    payload: list[TResponseInputItem],
+    *,
+    excluded_indexes: set[int],
+) -> dict[str, set[str]]:
+    """Return retained call ids grouped by their required output type."""
+    available: dict[str, set[str]] = {
+        output_type: set() for output_type in _TOOL_CALL_TO_OUTPUT_TYPE.values()
+    }
+    for index, entry in enumerate(payload):
+        if index in excluded_indexes:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        item_type = entry.get("type")
+        if not isinstance(item_type, str):
+            continue
+        output_type = _TOOL_CALL_TO_OUTPUT_TYPE.get(item_type)
+        if output_type is None:
+            continue
+        call_id = entry.get("call_id")
+        if isinstance(call_id, str):
+            available[output_type].add(call_id)
+    return available
 
 
 def _get_program_caller_id(entry: TResponseInputItem) -> str | None:

@@ -43,7 +43,11 @@ except ImportError as e:
     )
 
 from ...items import TResponseInputItem
-from ...logger import log_model_and_tool_action_error, logger
+from ...logger import (
+    log_model_and_tool_action_error,
+    log_model_and_tool_action_warning,
+    logger,
+)
 from ...memory.session import SessionABC
 from ...memory.session_settings import (
     SessionSettings,
@@ -89,7 +93,9 @@ class DaprSession(SessionABC):
                 the underlying state store implementation. Defaults to None.
             consistency (ConsistencyLevel, optional): Consistency level for state operations.
                 Use DAPR_CONSISTENCY_EVENTUAL or DAPR_CONSISTENCY_STRONG constants.
-                Defaults to DAPR_CONSISTENCY_EVENTUAL.
+                Note that strong consistency is requested for write and delete operations
+                (store-dependent); read operations depend on the underlying Dapr client
+                exposing wire-level consistency. Defaults to DAPR_CONSISTENCY_EVENTUAL.
             session_settings (SessionSettings | None): Session configuration settings including
                 default limit for retrieving items. If None, uses default SessionSettings().
         """
@@ -105,6 +111,8 @@ class DaprSession(SessionABC):
         self._consistency = consistency
         self._lock = asyncio.Lock()
         self._owns_client = False  # Track if we own the Dapr client
+        self._closed = False
+        self._client_released = False
 
         # State keys
         self._messages_key = f"{self.session_id}:messages"
@@ -154,7 +162,9 @@ class DaprSession(SessionABC):
     def _get_read_metadata(self) -> dict[str, str]:
         """Get metadata for read operations including consistency.
 
-        The consistency level is passed through state_metadata as per Dapr's state API.
+        Passes consistency through state_metadata. Note that Dapr's gRPC runtime
+        expects consistency as a dedicated field on GetStateRequest, which is not
+        currently exposed by the Dapr Python client.
         """
         metadata: dict[str, str] = {}
         # Add consistency level to metadata for read operations
@@ -181,6 +191,32 @@ class DaprSession(SessionABC):
         if self._ttl is not None:
             metadata["ttlInSeconds"] = str(self._ttl)
         return metadata
+
+    async def _read_created_at(self) -> tuple[str | None, str | None]:
+        """Return the stored creation timestamp and the metadata etag backing it.
+
+        The timestamp is None when it is missing or unreadable. The etag is returned so the
+        caller can write the metadata conditionally against the same revision it read. The
+        Dapr SDK reports a missing etag as an empty string, so it is normalized to None and
+        callers can test for a real etag rather than for a particular empty representation.
+        """
+        response = await self._dapr_client.get_state(
+            store_name=self._state_store_name,
+            key=self._metadata_key,
+            state_metadata=self._get_read_metadata(),
+        )
+        etag = response.etag or None
+        data = response.data
+        if not data:
+            return None, etag
+        try:
+            stored = json.loads(data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None, etag
+        if not isinstance(stored, dict):
+            return None, etag
+        created_at = stored.get("created_at")
+        return (created_at if isinstance(created_at, str) and created_at else None), etag
 
     async def _serialize_item(self, item: TResponseInputItem) -> str:
         """Serialize an item to JSON string. Can be overridden by subclasses."""
@@ -258,6 +294,11 @@ class DaprSession(SessionABC):
     # Session protocol implementation
     # ------------------------------------------------------------------
 
+    def _check_not_closed(self) -> None:
+        """Raise if the session has already been closed."""
+        if self._closed:
+            raise RuntimeError("DaprSession is closed")
+
     async def get_items(self, limit: int | None = None) -> list[TResponseInputItem]:
         """Retrieve the conversation history for this session.
 
@@ -271,6 +312,7 @@ class DaprSession(SessionABC):
         session_limit = resolve_session_limit(limit, self.session_settings)
 
         async with self._lock:
+            self._check_not_closed()
             # Get messages from state store with consistency level
             response = await self._dapr_client.get_state(
                 store_name=self._state_store_name,
@@ -284,7 +326,23 @@ class DaprSession(SessionABC):
             if session_limit is not None:
                 if session_limit <= 0:
                     return []
-                messages = messages[-session_limit:]
+                # Walk back from the newest entry so limit counts valid conversation items:
+                # a corrupt entry is skipped instead of spending the caller's budget, matching
+                # pop_item and the other session backends.
+                latest_first: list[TResponseInputItem] = []
+                for msg in reversed(messages):
+                    try:
+                        if isinstance(msg, str):
+                            item = await self._deserialize_item(msg)
+                        else:
+                            item = msg
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    latest_first.append(item)
+                    if len(latest_first) == session_limit:
+                        break
+                latest_first.reverse()
+                return latest_first
             items: list[TResponseInputItem] = []
             for msg in messages:
                 try:
@@ -303,10 +361,12 @@ class DaprSession(SessionABC):
         Args:
             items: List of input items to add to the history
         """
+        self._check_not_closed()
         if not items:
             return
 
         async with self._lock:
+            self._check_not_closed()
             serialized_items: list[str] = [await self._serialize_item(item) for item in items]
             attempt = 0
             while True:
@@ -336,19 +396,55 @@ class DaprSession(SessionABC):
                         continue
                     raise
 
-            # Update metadata
-            metadata = {
-                "session_id": self.session_id,
-                "created_at": str(int(time.time())),
-                "updated_at": str(int(time.time())),
-            }
-            await self._dapr_client.save_state(
-                store_name=self._state_store_name,
-                key=self._metadata_key,
-                value=json.dumps(metadata),
-                state_metadata=self._get_metadata(),
-                options=self._get_state_options(),
-            )
+            # Update metadata, preserving created_at across subsequent writes. A plain write
+            # would let a later append overwrite created_at with its own now, so the save is
+            # guarded by the etag that backed the value that was read.
+            #
+            # The guard only applies once a real etag was read. Dapr documents a write without
+            # an etag as last-write-wins even when first-write concurrency is requested, so
+            # asking for it on the create is not a race guarantee and is left off rather than
+            # implying one. Concurrent etag-less creation is therefore last-write-wins.
+            #
+            # The messages key is already committed once we reach here, so raising would tell
+            # the caller the append failed while their items are in the session, and the
+            # natural response of retrying add_items() would store the batch twice. Metadata
+            # is derived bookkeeping, so give up on it with a warning instead.
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    stored_created_at, metadata_etag = await self._read_created_at()
+                    now = str(int(time.time()))
+                    metadata = {
+                        "session_id": self.session_id,
+                        "created_at": stored_created_at or now,
+                        "updated_at": now,
+                    }
+                    await self._dapr_client.save_state(
+                        store_name=self._state_store_name,
+                        key=self._metadata_key,
+                        value=json.dumps(metadata),
+                        etag=metadata_etag,
+                        state_metadata=self._get_metadata(),
+                        options=self._get_state_options(
+                            concurrency=(
+                                Concurrency.first_write if metadata_etag is not None else None
+                            )
+                        ),
+                    )
+                    break
+                except Exception as error:
+                    should_retry = await self._handle_concurrency_conflict(error, attempt)
+                    if should_retry:
+                        continue
+                    log_model_and_tool_action_warning(
+                        logger,
+                        "DaprSession stored the new items but could not update the session "
+                        "metadata",
+                        error,
+                        diagnostic_extra=lambda: {"session_id": self.session_id},
+                    )
+                    break
 
     async def pop_item(self) -> TResponseInputItem | None:
         """Remove and return the most recent item from the session.
@@ -357,6 +453,7 @@ class DaprSession(SessionABC):
             The most recent item if it exists, None if the session is empty
         """
         async with self._lock:
+            self._check_not_closed()
             while True:
                 attempt = 0
                 while True:
@@ -397,6 +494,7 @@ class DaprSession(SessionABC):
     async def clear_session(self) -> None:
         """Clear all items for this session."""
         async with self._lock:
+            self._check_not_closed()
             # Delete messages and metadata keys
             await self._dapr_client.delete_state(
                 store_name=self._state_store_name,
@@ -414,11 +512,23 @@ class DaprSession(SessionABC):
         """Close the Dapr client connection.
 
         Only closes the connection if this session owns the Dapr client
-        (i.e., created via from_address). If the client was injected externally,
-        the caller is responsible for managing its lifecycle.
+        (i.e., created via from_address). In that case the session becomes
+        terminal and subsequent operations raise RuntimeError. If the client was
+        injected externally, the caller is responsible for managing its lifecycle
+        and this is a no-op.
+
+        The session is terminal from the first close attempt. If releasing the
+        client fails or is cancelled, operations still raise and a later close()
+        retries the unfinished cleanup. Once the client is released, repeated and
+        concurrent calls are safe no-ops.
         """
-        if self._owns_client:
-            await self._dapr_client.close()
+        async with self._lock:
+            if not self._owns_client:
+                return
+            self._closed = True
+            if not self._client_released:
+                await self._dapr_client.close()
+                self._client_released = True
 
     async def __aenter__(self) -> DaprSession:
         """Enter async context manager."""
@@ -433,33 +543,39 @@ class DaprSession(SessionABC):
 
         Returns:
             True if Dapr is reachable, False otherwise.
+
+        Raises:
+            RuntimeError: If the session owns its client and has been closed.
         """
-        try:
-            # First attempt a read; some stores may not be initialized yet.
-            await self._dapr_client.get_state(
-                store_name=self._state_store_name,
-                key="__ping__",
-                state_metadata=self._get_read_metadata(),
-            )
-            return True
-        except Exception as initial_error:
-            # If relation/table is missing or store isn't initialized,
-            # attempt a write to initialize it, then read again.
+        async with self._lock:
+            # Checked outside the try block; the except clause below would swallow it.
+            self._check_not_closed()
             try:
-                await self._dapr_client.save_state(
-                    store_name=self._state_store_name,
-                    key="__ping__",
-                    value="ok",
-                    state_metadata=self._get_metadata(),
-                    options=self._get_state_options(),
-                )
-                # Read again after write.
+                # First attempt a read; some stores may not be initialized yet.
                 await self._dapr_client.get_state(
                     store_name=self._state_store_name,
                     key="__ping__",
                     state_metadata=self._get_read_metadata(),
                 )
                 return True
-            except Exception:
-                log_model_and_tool_action_error(logger, "Dapr connection failed", initial_error)
-                return False
+            except Exception as initial_error:
+                # If relation/table is missing or store isn't initialized,
+                # attempt a write to initialize it, then read again.
+                try:
+                    await self._dapr_client.save_state(
+                        store_name=self._state_store_name,
+                        key="__ping__",
+                        value="ok",
+                        state_metadata=self._get_metadata(),
+                        options=self._get_state_options(),
+                    )
+                    # Read again after write.
+                    await self._dapr_client.get_state(
+                        store_name=self._state_store_name,
+                        key="__ping__",
+                        state_metadata=self._get_read_metadata(),
+                    )
+                    return True
+                except Exception:
+                    log_model_and_tool_action_error(logger, "Dapr connection failed", initial_error)
+                    return False

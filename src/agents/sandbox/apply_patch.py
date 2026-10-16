@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import io
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkable
+from uuid import uuid4
 
 from ..apply_diff import ApplyDiffMode, apply_diff
 from ..editor import ApplyPatchOperation, ApplyPatchOperationType, ApplyPatchResult
@@ -13,6 +15,12 @@ from .errors import (
     ApplyPatchPathError,
     InvalidManifestPathError,
     WorkspaceReadNotFoundError,
+)
+from .workspace_paths import (
+    SandboxWorkspaceScope,
+    _is_absolute_sandbox_path,
+    coerce_posix_path,
+    posix_path_for_error,
 )
 
 if TYPE_CHECKING:
@@ -38,9 +46,11 @@ class WorkspaceEditor:
         session: BaseSandboxSession,
         *,
         user: str | User | None = None,
+        workspace_scope: SandboxWorkspaceScope | None = None,
     ) -> None:
         self._session = session
         self._user = user
+        self._workspace_scope = workspace_scope or SandboxWorkspaceScope()
 
     async def apply_patch(
         self,
@@ -62,9 +72,8 @@ class WorkspaceEditor:
         patch_format: PatchFormat | Literal["v4a"] = "v4a",
     ) -> ApplyPatchResult:
         format_impl = _resolve_patch_format(patch_format)
-        relative_path = self._validate_path(operation.path)
+        relative_path, display_path = self._resolve_path(operation.path)
         destination = self._session.normalize_path(relative_path)
-        display_path = relative_path.as_posix()
 
         if operation.type == "delete_file":
             await self._ensure_exists(destination, display_path=display_path)
@@ -80,7 +89,16 @@ class WorkspaceEditor:
             )
 
         if operation.type == "update_file":
-            original_text = await self._read_text(destination, op_path=operation.path)
+            decode_path = destination
+            if self._workspace_scope.cwd is not None:
+                decode_path = posix_path_for_error(
+                    operation.path if _is_absolute_sandbox_path(operation.path) else display_path
+                )
+            original_text = await self._read_text(
+                destination,
+                op_path=operation.path,
+                decode_path=decode_path,
+            )
             try:
                 updated_text = format_impl.apply_diff(original_text, operation.diff, mode="default")
             except ValueError as exc:
@@ -93,12 +111,13 @@ class WorkspaceEditor:
                 await self._write_text(destination, updated_text)
                 return ApplyPatchResult(output=f"Updated {display_path}")
 
-            moved_relative_path = self._validate_path(operation.move_to)
+            moved_relative_path, moved_display_path = self._resolve_path(operation.move_to)
             moved_destination = self._session.normalize_path(moved_relative_path)
-            await self._write_text(moved_destination, updated_text)
-            if moved_destination != destination:
-                await self._session.rm(destination)
-            moved_display_path = moved_relative_path.as_posix()
+            await self._move_updated_text(
+                source=destination,
+                moved_destination=moved_destination,
+                text=updated_text,
+            )
             return ApplyPatchResult(
                 output=f"Updated {display_path}\nMoved {display_path} to {moved_display_path}"
             )
@@ -112,7 +131,11 @@ class WorkspaceEditor:
                     path=operation.path,
                     cause=exc,
                 ) from exc
-            await self._write_text(destination, created_text)
+            # Hand over the unresolved path. destination has already been through
+            # normalize_path(), which resolves leaf symlinks on some backends, so passing
+            # it would ask the backend to create the link target instead of the requested
+            # name and a dangling link would be reported as a successful create.
+            await self._write_new_text(relative_path, created_text, display_path=display_path)
             return ApplyPatchResult(output=f"Created {display_path}")
 
         raise ApplyPatchDiffError(
@@ -120,19 +143,45 @@ class WorkspaceEditor:
             path=operation.path,
         )
 
-    def _validate_path(self, path: str | Path) -> Path:
-        if isinstance(path, str):
-            if not path.strip():
-                raise ApplyPatchPathError(path=path, reason="empty")
-            normalized_path = Path(path)
-        else:
-            normalized_path = path
+    def normalize_operation(self, operation: ApplyPatchOperation) -> ApplyPatchOperation:
+        """Return an operation whose paths use the workspace policy's canonical form."""
+        normalized_path = self._validate_path(operation.path).as_posix()
+        normalized_move_to = (
+            self._validate_path(operation.move_to).as_posix()
+            if operation.move_to is not None
+            else None
+        )
+        return ApplyPatchOperation(
+            type=operation.type,
+            path=normalized_path,
+            diff=operation.diff,
+            ctx_wrapper=operation.ctx_wrapper,
+            move_to=normalized_move_to,
+        )
 
+    def _resolve_path(self, path: str | Path) -> tuple[Path, str]:
+        relative_path = self._validate_path(path)
+        normalized_path = coerce_posix_path(path)
+        display_path = self._workspace_scope.display_path(
+            original_path=normalized_path,
+            workspace_relative_path=relative_path,
+        ).as_posix()
+        return relative_path, display_path
+
+    def _validate_path(self, path: str | Path) -> Path:
+        if isinstance(path, str) and not path.strip():
+            raise ApplyPatchPathError(path=path, reason="empty")
+
+        # Keep raw model-provided strings intact until the sandbox path policy
+        # normalizes them. Converting through host-native Path first would make
+        # backslash handling depend on the SDK host operating system.
         try:
-            return self._session._workspace_path_policy().relative_path(normalized_path)
+            normalized_path = coerce_posix_path(path)
+            scoped_path = self._workspace_scope.anchor(normalized_path)
+            return self._session._workspace_path_policy().relative_path(scoped_path)
         except InvalidManifestPathError as exc:
             raise ApplyPatchPathError(
-                path=normalized_path,
+                path=path,
                 reason="escape_root",
                 cause=exc,
             ) from exc
@@ -145,7 +194,25 @@ class WorkspaceEditor:
         else:
             handle.close()
 
-    async def _read_text(self, destination: Path, *, op_path: str) -> str:
+    async def _write_new_text(self, destination: Path, text: str, *, display_path: str) -> None:
+        # Backends with a native no-clobber primitive can reject occupied names.
+        try:
+            await self._session._write_new_file(
+                destination,
+                io.BytesIO(text.encode("utf-8")),
+                user=self._user,
+            )
+        except FileExistsError as exc:
+            raise ApplyPatchDiffError(
+                message=(
+                    f"apply_patch cannot create {display_path} because it already exists. "
+                    "Use an update_file operation to change an existing file."
+                ),
+                path=display_path,
+                cause=exc,
+            ) from exc
+
+    async def _read_text(self, destination: Path, *, op_path: str, decode_path: Path) -> str:
         try:
             handle = await self._session.read(destination, user=self._user)
         except (FileNotFoundError, WorkspaceReadNotFoundError) as exc:
@@ -162,11 +229,70 @@ class WorkspaceEditor:
             try:
                 return bytes(payload).decode("utf-8")
             except UnicodeDecodeError as exc:
-                raise ApplyPatchDecodeError(path=destination, cause=exc) from exc
+                raise ApplyPatchDecodeError(path=decode_path, cause=exc) from exc
         raise ApplyPatchDiffError(
             message=f"apply_patch read() returned non-text content: {type(payload).__name__}",
             path=op_path,
         )
+
+    async def _move_updated_text(
+        self,
+        *,
+        source: Path,
+        moved_destination: Path,
+        text: str,
+    ) -> None:
+        """Stage filesystem aliases; retain ordinary destination write semantics otherwise.
+
+        An alias needs a staged replacement because writing and then removing the source
+        would delete the updated file. Distinct files retain the released write/remove path,
+        including an existing destination's metadata and file-level write permissions.
+        If the paths stop identifying the same file after an alias replacement, leave both
+        paths alone and report the incomplete move. This includes distinct hardlink aliases.
+        These operations do not provide a transaction against concurrent workspace writers.
+        """
+        if source.as_posix() == moved_destination.as_posix():
+            # Not a rename, so nothing needs committing elsewhere. Writing in place is what an
+            # update without `move_to` does, and it keeps the inode, the mode and the xattrs.
+            #
+            # The comparison is on the spelling rather than on `Path` equality, which folds case
+            # on a Windows host. Whether two sandbox paths are one file is the sandbox's answer,
+            # not the host's: a Windows host talking to a case-sensitive sandbox would otherwise
+            # take this branch for a case-only rename and never create the new name. Paths that
+            # differ only in case go down the staging path, where `same_file` asks the sandbox.
+            await self._write_text(source, text)
+            return
+
+        if not await self._session.same_file(
+            source, moved_destination, follow_symlinks=False, user=self._user
+        ):
+            await self._write_text(moved_destination, text)
+            await self._session.rm(source, user=self._user)
+            return
+
+        staging = moved_destination.with_name(f".apply_patch-{uuid4().hex}.tmp")
+        try:
+            await self._write_text(staging, text)
+            await self._session.mv(staging, moved_destination, user=self._user)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await self._session.rm(staging, user=self._user)
+            raise
+        same_entry = await self._session.same_file(
+            source, moved_destination, follow_symlinks=False, user=self._user
+        )
+        if same_entry and source.name != moved_destination.name:
+            # On case-folding APFS, replacing an existing entry through a case-variant path
+            # updates its content but keeps its old spelling. Moving that same entry performs
+            # the requested case-only rename without touching the committed content.
+            await self._session.mv(source, moved_destination, user=self._user)
+        elif not same_entry:
+            raise ApplyPatchDiffError(
+                message=(
+                    "Move destination was updated, but source and destination no longer identify "
+                    "the same file; source was left untouched"
+                ),
+            )
 
     async def _write_text(self, destination: Path, text: str) -> None:
         await self._session.mkdir(destination.parent, parents=True, user=self._user)
@@ -208,6 +334,7 @@ def _coerce_operation_mapping(operation: dict[str, object]) -> ApplyPatchOperati
     raw_path = operation.get("path")
     raw_diff = operation.get("diff")
     raw_ctx_wrapper = operation.get("ctx_wrapper")
+    raw_move_to = operation.get("move_to")
 
     if raw_type not in {"create_file", "update_file", "delete_file"}:
         raise ApplyPatchDiffError(
@@ -221,11 +348,16 @@ def _coerce_operation_mapping(operation: dict[str, object]) -> ApplyPatchOperati
         raise ApplyPatchDiffError(
             message=f"Invalid apply_patch diff type: {type(raw_diff).__name__}"
         )
+    if raw_move_to is not None and not isinstance(raw_move_to, str):
+        raise ApplyPatchDiffError(
+            message=f"Invalid apply_patch move_to type: {type(raw_move_to).__name__}"
+        )
     return ApplyPatchOperation(
         type=cast(ApplyPatchOperationType, raw_type),
         path=raw_path,
         diff=raw_diff,
         ctx_wrapper=cast(Any, raw_ctx_wrapper),
+        move_to=raw_move_to,
     )
 
 

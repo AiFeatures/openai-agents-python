@@ -2,7 +2,9 @@ import asyncio
 import gc
 import os
 import weakref
+from typing import Any, cast
 
+import httpx2
 import openai
 import pytest
 
@@ -16,7 +18,7 @@ from agents import (
 )
 from agents.models import _openai_shared
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
-from agents.models.openai_provider import OpenAIProvider
+from agents.models.openai_provider import OpenAIProvider, shared_http_client
 from agents.models.openai_responses import OpenAIResponsesModel, OpenAIResponsesWSModel
 
 
@@ -39,6 +41,17 @@ def test_cc_set_default_openai_client():
     assert chat_model._client.api_key == "test_key"  # type: ignore
 
 
+def test_provider_preserves_falsy_default_client(monkeypatch):
+    class FalsyClient:
+        def __bool__(self) -> bool:
+            return False
+
+    client = cast(Any, FalsyClient())
+    monkeypatch.setattr(_openai_shared, "get_default_openai_client", lambda: client)
+
+    assert OpenAIProvider()._get_client() is client
+
+
 def test_resp_no_default_key_errors(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     assert os.getenv("OPENAI_API_KEY") is None
@@ -57,6 +70,10 @@ def test_resp_set_default_openai_client():
     set_default_openai_client(client)
     resp_model = OpenAIProvider(use_responses=True).get_model("gpt-4")
     assert resp_model._client.api_key == "test_key"  # type: ignore
+
+
+def test_openai_provider_shared_http_client_uses_httpx2() -> None:
+    assert isinstance(shared_http_client(), httpx2.AsyncClient)
 
 
 def test_set_default_openai_api():

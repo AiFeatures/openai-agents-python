@@ -8,11 +8,13 @@ from inline_snapshot import snapshot
 from openai.types.responses.response_usage import InputTokensDetails
 
 from agents import Agent, RunConfig, Runner, RunState, custom_span, function_tool, trace
+from agents.exceptions import UserError
 from agents.sandbox.runtime import SandboxRuntime
+from agents.testing import ScriptedModel
+from agents.tracing import get_current_span
 from agents.usage import Usage
 
-from .fake_model import FakeModel
-from .test_responses import get_function_tool_call, get_text_message
+from .test_responses import get_function_tool_call, get_handoff_tool_call, get_text_message
 from .testing_processor import (
     assert_no_traces,
     fetch_events,
@@ -22,7 +24,7 @@ from .testing_processor import (
 )
 
 
-def _make_approval_agent(model: FakeModel) -> Agent[None]:
+def _make_approval_agent(model: ScriptedModel) -> Agent[None]:
     @function_tool(name_override="approval_tool", needs_approval=True)
     def approval_tool() -> str:
         return "ok"
@@ -43,8 +45,8 @@ def _usage_metadata(requests: int, input_tokens: int, output_tokens: int) -> dic
 async def test_single_run_is_single_trace():
     agent = Agent(
         name="test_agent",
-        model=FakeModel(
-            initial_output=[get_text_message("first_test")],
+        model=ScriptedModel(
+            steps=[[get_text_message("first_test")]],
         ),
     )
 
@@ -70,20 +72,80 @@ async def test_single_run_is_single_trace():
     )
 
 
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("surface", ["function_tool", "handoff", "mixed"])
+@pytest.mark.asyncio
+async def test_agent_span_uses_resolved_tool_name_collision_view(
+    surface: str,
+    streamed: bool,
+) -> None:
+    model = ScriptedModel(steps=[[get_text_message("done")]])
+    expected_tools: list[str]
+    expected_handoffs: list[str]
+
+    if surface == "function_tool":
+
+        @function_tool(name_override="lookup")
+        def first_lookup() -> str:
+            return "first"
+
+        @function_tool(name_override="lookup")
+        def second_lookup() -> str:
+            return "second"
+
+        agent = Agent(name="test_agent", model=model, tools=[first_lookup, second_lookup])
+        expected_tools = ["lookup"]
+        expected_handoffs = []
+    elif surface == "handoff":
+        agent = Agent(
+            name="test_agent",
+            model=model,
+            handoffs=[Agent(name="Billing Agent"), Agent(name="billing agent")],
+        )
+        expected_tools = []
+        expected_handoffs = ["billing agent"]
+    else:
+        agent = Agent(
+            name="test_agent",
+            model=model,
+            tools=[
+                Agent(name="transfer to Billing Agent").as_tool(
+                    tool_name=None,
+                    tool_description="Billing tool",
+                )
+            ],
+            handoffs=[Agent(name="Billing Agent")],
+        )
+        expected_tools = []
+        expected_handoffs = ["Billing Agent"]
+
+    if streamed:
+        result = Runner.run_streamed(agent, input="test")
+        async for _ in result.stream_events():
+            pass
+    else:
+        await Runner.run(agent, input="test")
+
+    agent_spans = [span for span in fetch_ordered_spans() if span.span_data.type == "agent"]
+    assert len(agent_spans) == 1
+    assert agent_spans[0].span_data.tools == expected_tools
+    assert agent_spans[0].span_data.handoffs == expected_handoffs
+
+
 @pytest.mark.asyncio
 async def test_task_and_turn_spans_export_aggregate_usage():
     @function_tool
     def foo_tool() -> str:
         return "foo result"
 
-    model = FakeModel(tracing_enabled=True)
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel(emit_traces=True)
+    model.extend(
         [
             [get_function_tool_call("foo_tool", "{}", call_id="call-1")],
             [get_text_message("done")],
         ]
     )
-    model.set_hardcoded_usage(
+    model.set_default_usage(
         Usage(
             requests=1,
             input_tokens=10,
@@ -199,8 +261,8 @@ async def test_task_and_turn_spans_can_be_disabled():
     def foo_tool() -> str:
         return "foo result"
 
-    model = FakeModel(tracing_enabled=True)
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel(emit_traces=True)
+    model.extend(
         [
             [get_function_tool_call("foo_tool", "{}", call_id="call-1")],
             [get_text_message("done")],
@@ -236,9 +298,9 @@ async def test_task_and_turn_spans_can_be_disabled():
 async def test_task_and_turn_spans_can_be_explicitly_enabled():
     agent = Agent(
         name="test_agent",
-        model=FakeModel(
-            tracing_enabled=True,
-            initial_output=[get_text_message("done")],
+        model=ScriptedModel(
+            emit_traces=True,
+            steps=[[get_text_message("done")]],
         ),
     )
 
@@ -257,9 +319,9 @@ async def test_task_and_turn_spans_can_be_explicitly_enabled():
 async def test_task_span_resets_current_span_if_run_setup_fails(monkeypatch: pytest.MonkeyPatch):
     agent = Agent(
         name="test_agent",
-        model=FakeModel(
-            tracing_enabled=True,
-            initial_output=[get_text_message("first_test")],
+        model=ScriptedModel(
+            emit_traces=True,
+            steps=[[get_text_message("first_test")]],
         ),
     )
 
@@ -287,8 +349,8 @@ async def test_task_span_resets_current_span_if_run_setup_fails(monkeypatch: pyt
 
 @pytest.mark.asyncio
 async def test_multiple_runs_are_multiple_traces():
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [get_text_message("first_test")],
             [get_text_message("second_test")],
@@ -337,9 +399,97 @@ async def test_multiple_runs_are_multiple_traces():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("include_task_and_turn_spans", [False, True])
+@pytest.mark.parametrize("outcome", ["continue", "stop", "error", "handoff"])
+async def test_approved_tool_executes_inside_resumed_agent_span(
+    streamed: bool, include_task_and_turn_spans: bool, outcome: str
+) -> None:
+    calls = 0
+
+    @function_tool(needs_approval=True, failure_error_function=None)
+    def approved_tool() -> str:
+        nonlocal calls
+        calls += 1
+        if outcome == "error":
+            raise RuntimeError("synthetic tool failure")
+        return "tool result"
+
+    target = Agent(name="target", model=ScriptedModel(steps=[[get_text_message("done")]]))
+    first_response = [get_function_tool_call("approved_tool", "{}")]
+    if outcome == "handoff":
+        first_response.append(get_handoff_tool_call(target))
+    agent = Agent(
+        name="approval agent",
+        tools=[approved_tool],
+        handoffs=[target] if outcome == "handoff" else [],
+        model=ScriptedModel(
+            steps=[
+                first_response,
+                [get_text_message("done")],
+            ]
+        ),
+        tool_use_behavior="stop_on_first_tool" if outcome == "stop" else "run_llm_again",
+    )
+    config = RunConfig(tracing={"include_task_and_turn_spans": include_task_and_turn_spans})
+
+    async def run(input: str | RunState[None]):
+        # A direct tool-result resume must not consume another model turn.
+        max_turns = 1 if outcome == "stop" else 2
+        if streamed:
+            result = Runner.run_streamed(agent, input, run_config=config, max_turns=max_turns)
+            async for _ in result.stream_events():
+                pass
+            return result
+        return await Runner.run(agent, input, run_config=config, max_turns=max_turns)
+
+    first = await run("run the tool")
+    assert calls == 0
+    assert len(first.interruptions) == 1
+    state = first.to_state()
+    state.approve(first.interruptions[0])
+    initial_span_ids = {span.span_id for span in fetch_ordered_spans()}
+
+    if outcome == "error":
+        with pytest.raises(UserError, match="synthetic tool failure"):
+            await run(state)
+    else:
+        result = await run(state)
+        assert result.final_output == ("tool result" if outcome == "stop" else "done")
+
+    assert calls == 1
+    spans = [span for span in fetch_ordered_spans() if span.span_id not in initial_span_ids]
+    agent_spans = [span for span in spans if span.span_data.type == "agent"]
+    function_spans = [span for span in spans if span.span_data.type == "function"]
+    assert len(agent_spans) == (2 if outcome == "handoff" else 1)
+    assert len(function_spans) == 1
+    agent_span = agent_spans[0]
+    assert function_spans[0].parent_id == agent_span.span_id
+    assert agent_span.span_data.name == "approval agent"
+    assert agent_span.span_data.tools == ["approved_tool"]
+    assert agent_span.span_data.handoffs == (["target"] if outcome == "handoff" else [])
+    if outcome == "handoff":
+        assert agent_spans[1].span_data.name == "target"
+        assert agent_spans[1].parent_id == agent_span.parent_id
+        handoff_spans = [span for span in spans if span.span_data.type == "handoff"]
+        assert len(handoff_spans) == 1
+        assert handoff_spans[0].parent_id == agent_span.span_id
+    if outcome == "error":
+        assert agent_span.error is not None
+        assert agent_span.error["message"] == "Error in agent run"
+        assert function_spans[0].error is not None
+        assert function_spans[0].error["message"] == "Error running tool"
+    else:
+        assert agent_span.error is None
+    assert all(span.ended_at is not None for span in spans)
+    assert fetch_events().count("span_start") == fetch_events().count("span_end")
+    assert get_current_span() is None
+
+
+@pytest.mark.asyncio
 async def test_resumed_run_reuses_original_trace_without_duplicate_trace_start():
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [get_function_tool_call("approval_tool", "{}", call_id="call-1")],
             [get_text_message("done")],
@@ -365,14 +515,14 @@ async def test_resumed_run_reuses_original_trace_without_duplicate_trace_start()
 
 @pytest.mark.asyncio
 async def test_resumed_run_task_span_usage_is_run_local_delta():
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [get_function_tool_call("approval_tool", "{}", call_id="call-1")],
             [get_text_message("done")],
         ]
     )
-    model.set_hardcoded_usage(Usage(requests=1, input_tokens=10, output_tokens=3, total_tokens=13))
+    model.set_default_usage(Usage(requests=1, input_tokens=10, output_tokens=3, total_tokens=13))
     agent = _make_approval_agent(model)
 
     first = await Runner.run(agent, input="first_test")
@@ -401,8 +551,8 @@ async def test_resumed_run_task_span_usage_is_run_local_delta():
 
 @pytest.mark.asyncio
 async def test_resumed_run_from_serialized_state_reuses_original_trace():
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [get_function_tool_call("approval_tool", "{}", call_id="call-1")],
             [get_text_message("done")],
@@ -430,8 +580,8 @@ async def test_resumed_run_from_serialized_state_reuses_original_trace():
 
 @pytest.mark.asyncio
 async def test_resumed_run_from_serialized_state_preserves_explicit_trace_key():
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [get_function_tool_call("approval_tool", "{}", call_id="call-1")],
             [get_text_message("done")],
@@ -470,8 +620,8 @@ async def test_resumed_run_from_serialized_state_preserves_explicit_trace_key():
 @pytest.mark.asyncio
 async def test_resumed_run_with_workflow_override_starts_new_trace() -> None:
     trace_id = f"trace_{uuid4().hex}"
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [get_function_tool_call("approval_tool", "{}", call_id="call-1")],
             [get_text_message("done")],
@@ -510,8 +660,8 @@ async def test_resumed_run_with_workflow_override_starts_new_trace() -> None:
 
 @pytest.mark.asyncio
 async def test_wrapped_trace_is_single_trace():
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [get_text_message("first_test")],
             [get_text_message("second_test")],
@@ -571,8 +721,8 @@ async def test_parent_disabled_trace_disabled_agent_trace():
     with trace(workflow_name="test_workflow", disabled=True):
         agent = Agent(
             name="test_agent",
-            model=FakeModel(
-                initial_output=[get_text_message("first_test")],
+            model=ScriptedModel(
+                steps=[[get_text_message("first_test")]],
             ),
         )
 
@@ -585,8 +735,8 @@ async def test_parent_disabled_trace_disabled_agent_trace():
 async def test_manual_disabling_works():
     agent = Agent(
         name="test_agent",
-        model=FakeModel(
-            initial_output=[get_text_message("first_test")],
+        model=ScriptedModel(
+            steps=[[get_text_message("first_test")]],
         ),
     )
 
@@ -599,8 +749,8 @@ async def test_manual_disabling_works():
 async def test_trace_config_works():
     agent = Agent(
         name="test_agent",
-        model=FakeModel(
-            initial_output=[get_text_message("first_test")],
+        model=ScriptedModel(
+            steps=[[get_text_message("first_test")]],
         ),
     )
 
@@ -636,8 +786,8 @@ async def test_trace_config_works():
 async def test_not_starting_streaming_creates_trace():
     agent = Agent(
         name="test_agent",
-        model=FakeModel(
-            initial_output=[get_text_message("first_test")],
+        model=ScriptedModel(
+            steps=[[get_text_message("first_test")]],
         ),
     )
 
@@ -677,8 +827,8 @@ async def test_not_starting_streaming_creates_trace():
 async def test_streaming_single_run_is_single_trace():
     agent = Agent(
         name="test_agent",
-        model=FakeModel(
-            initial_output=[get_text_message("first_test")],
+        model=ScriptedModel(
+            steps=[[get_text_message("first_test")]],
         ),
     )
 
@@ -708,8 +858,8 @@ async def test_streaming_single_run_is_single_trace():
 
 @pytest.mark.asyncio
 async def test_multiple_streamed_runs_are_multiple_traces():
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [get_text_message("first_test")],
             [get_text_message("second_test")],
@@ -764,8 +914,8 @@ async def test_multiple_streamed_runs_are_multiple_traces():
 
 @pytest.mark.asyncio
 async def test_resumed_streaming_run_reuses_original_trace_without_duplicate_trace_start():
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [get_function_tool_call("approval_tool", "{}", call_id="call-1")],
             [get_text_message("done")],
@@ -795,14 +945,14 @@ async def test_resumed_streaming_run_reuses_original_trace_without_duplicate_tra
 
 @pytest.mark.asyncio
 async def test_resumed_streaming_run_task_span_usage_is_run_local_delta():
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [get_function_tool_call("approval_tool", "{}", call_id="call-1")],
             [get_text_message("done")],
         ]
     )
-    model.set_hardcoded_usage(Usage(requests=1, input_tokens=11, output_tokens=4, total_tokens=15))
+    model.set_default_usage(Usage(requests=1, input_tokens=11, output_tokens=4, total_tokens=15))
     agent = _make_approval_agent(model)
 
     first = Runner.run_streamed(agent, input="first_test")
@@ -835,8 +985,8 @@ async def test_resumed_streaming_run_task_span_usage_is_run_local_delta():
 
 @pytest.mark.asyncio
 async def test_wrapped_streaming_trace_is_single_trace():
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [get_text_message("first_test")],
             [get_text_message("second_test")],
@@ -903,9 +1053,9 @@ async def test_wrapped_streaming_trace_is_single_trace():
 async def test_wrapped_streaming_run_creates_root_task_span():
     agent = Agent(
         name="test_agent",
-        model=FakeModel(
-            tracing_enabled=True,
-            initial_output=[get_text_message("first_test")],
+        model=ScriptedModel(
+            emit_traces=True,
+            steps=[[get_text_message("first_test")]],
         ),
     )
 
@@ -933,12 +1083,37 @@ async def test_wrapped_streaming_run_creates_root_task_span():
 
 
 @pytest.mark.asyncio
+async def test_wrapped_run_task_span_uses_run_workflow_name():
+    def _make_agent() -> Agent[None]:
+        return Agent(
+            name="test_agent",
+            model=ScriptedModel(steps=[[get_text_message("first_test")]]),
+        )
+
+    run_config = RunConfig(workflow_name="inner_workflow")
+
+    with trace(workflow_name="outer_workflow"):
+        await Runner.run(_make_agent(), input="first_test", run_config=run_config)
+        result = Runner.run_streamed(_make_agent(), input="first_test", run_config=run_config)
+        async for _ in result.stream_events():
+            pass
+
+    task_spans = [span.export() for span in fetch_ordered_spans() if span.span_data.type == "task"]
+    # A task span names one Runner invocation, so both runs must use their own workflow name
+    # rather than the enclosing trace's name.
+    assert [span["span_data"]["data"]["name"] for span in task_spans if span] == [
+        "inner_workflow",
+        "inner_workflow",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_wrapped_streaming_run_can_disable_task_and_turn_spans():
     agent = Agent(
         name="test_agent",
-        model=FakeModel(
-            tracing_enabled=True,
-            initial_output=[get_text_message("done")],
+        model=ScriptedModel(
+            emit_traces=True,
+            steps=[[get_text_message("done")]],
         ),
     )
 
@@ -965,8 +1140,8 @@ async def test_wrapped_streaming_run_can_disable_task_and_turn_spans():
 
 @pytest.mark.asyncio
 async def test_wrapped_mixed_trace_is_single_trace():
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [get_text_message("first_test")],
             [get_text_message("second_test")],
@@ -1029,8 +1204,8 @@ async def test_wrapped_mixed_trace_is_single_trace():
 
 @pytest.mark.asyncio
 async def test_parent_disabled_trace_disables_streaming_agent_trace():
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [get_text_message("first_test")],
             [get_text_message("second_test")],
@@ -1051,8 +1226,8 @@ async def test_parent_disabled_trace_disables_streaming_agent_trace():
 
 @pytest.mark.asyncio
 async def test_manual_streaming_disabling_works():
-    model = FakeModel()
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel()
+    model.extend(
         [
             [get_text_message("first_test")],
             [get_text_message("second_test")],

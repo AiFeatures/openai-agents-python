@@ -7,6 +7,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, get_args, get_origin
 
+from .._run_state_agent_identity import (
+    _build_agent_identity_keys_by_id,
+    _build_agent_identity_map,
+    _build_agent_map,
+)
 from .._tool_identity import get_function_tool_trace_name
 from ..agent import Agent
 from ..items import (
@@ -16,11 +21,6 @@ from ..items import (
     ToolCallOutputItem,
     ToolSearchCallItem,
     ToolSearchOutputItem,
-)
-from ..run_state import (
-    _build_agent_identity_keys_by_id,
-    _build_agent_identity_map,
-    _build_agent_map,
 )
 from .run_steps import ProcessedResponse, ToolRunFunction
 
@@ -158,7 +158,9 @@ def hydrate_tool_use_tracker(
     agent_map = _build_agent_map(starting_agent)
     agent_identity_map = _build_agent_identity_map(starting_agent)
     for agent_name, tool_names in snapshot.items():
-        agent = agent_identity_map.get(agent_name) or agent_map.get(agent_name)
+        agent = agent_identity_map.get(agent_name)
+        if agent is None:
+            agent = agent_map.get(agent_name)
         if agent is None:
             continue
         tool_use_tracker.add_tool_use(agent, list(tool_names))

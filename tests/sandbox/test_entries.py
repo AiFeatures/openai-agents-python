@@ -5,6 +5,7 @@ import io
 import os
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path, PureWindowsPath
+from typing import cast
 
 import pytest
 
@@ -269,6 +270,35 @@ async def test_local_file_allows_extra_path_granted_source_outside_base_dir(
     (outside / "secret.txt").write_text("secret", encoding="utf-8")
     session = _RecordingSession(
         Manifest(extra_path_grants=(SandboxPathGrant(path=str(outside)),)),
+    )
+
+    result = await LocalFile(src=outside / "secret.txt").apply(
+        session,
+        Path("/workspace/copied.txt"),
+        base,
+    )
+
+    assert result[0].path == Path("/workspace/copied.txt")
+    assert session.writes[Path("/workspace/copied.txt")] == b"secret"
+
+
+@pytest.mark.asyncio
+async def test_local_file_uses_host_path_for_source_grant(tmp_path: Path) -> None:
+    base = tmp_path / "base"
+    outside = tmp_path / "outside"
+    base.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    session = _RecordingSession(
+        Manifest(
+            extra_path_grants=(
+                SandboxPathGrant(
+                    path="/mnt/shared-data",
+                    host_path=str(outside),
+                    read_only=True,
+                ),
+            )
+        ),
     )
 
     result = await LocalFile(src=outside / "secret.txt").apply(
@@ -953,7 +983,29 @@ async def test_git_repo_root_subpath_alias_copies_repo_root(subpath: str) -> Non
     assert copy_call[3].startswith("/tmp/sandbox-git-")
     assert copy_call[3].endswith("/.")
     assert not copy_call[3].endswith("//.")
-    assert copy_call[4].replace("\\", "/") == "/workspace/repo/"
+    assert copy_call[4] == "/workspace/repo/"
+
+
+@pytest.mark.asyncio
+async def test_git_repo_copies_to_a_posix_destination_from_a_windows_host() -> None:
+    """The copy destination must stay POSIX so the clone lands inside the sandbox.
+
+    A Windows host resolves a sandbox destination to a native path, and interpolating that into the
+    argument sends ``\\workspace\\repo/`` to a POSIX container. ``cp`` accepts it, creating a
+    directory with that literal name and leaving the real destination empty, so the misplacement is
+    silent. ``PureWindowsPath`` reproduces the host-native shape on every platform.
+
+    This reuses the file-local recording session rather than ``scripted_sandbox_session`` because
+    the assertion targets one argument inside the clone's fixed multi-command sequence.
+    """
+    session = _RecordingSession()
+    repo = GitRepo(repo="openai/example", ref="main")
+
+    await repo.apply(session, cast(Path, PureWindowsPath("/workspace/repo")), Path("/ignored"))
+
+    copy_call = next(call for call in session.exec_calls if call[:1] == ("cp",))
+    assert copy_call[4] == "/workspace/repo/"
+    assert not any("\\" in argument for argument in copy_call)
 
 
 @pytest.mark.asyncio
@@ -965,7 +1017,7 @@ async def test_git_repo_allows_relative_subpath_copy() -> None:
 
     copy_call = next(call for call in session.exec_calls if call[:1] == ("cp",))
     assert copy_call[3].endswith("/docs/reference/.")
-    assert copy_call[4].replace("\\", "/") == "/workspace/repo/"
+    assert copy_call[4] == "/workspace/repo/"
 
 
 def _git_temp_cleanup_calls(session: _RecordingSession) -> list[tuple[str, ...]]:

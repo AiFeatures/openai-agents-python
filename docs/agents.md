@@ -2,7 +2,7 @@
 
 Agents are the core building block in your apps. An agent is a large language model (LLM) configured with instructions, tools, and optional runtime behavior such as handoffs, guardrails, and structured outputs.
 
-Use this page when you want to define or customize a single plain `Agent`. If you are deciding how multiple agents should collaborate, read [Agent orchestration](multi_agent.md). If the agent should run inside an isolated workspace with manifest-defined files and sandbox-native capabilities, read [Sandbox agent concepts](sandbox/guide.md).
+Use this page when you want to define or customize a single base `Agent` rather than a `SandboxAgent`. If you are deciding how multiple agents should collaborate, read [Agent orchestration](multi_agent.md). If the agent should run inside an isolated workspace with manifest-defined files and sandbox-native capabilities, read [Sandbox agent concepts](sandbox/guide.md).
 
 The SDK uses the Responses API by default for OpenAI models, but the distinction here is orchestration: `Agent` plus `Runner` lets the SDK manage turns, tools, guardrails, handoffs, and sessions for you. If you want to own that loop yourself, use the Responses API directly instead.
 
@@ -35,20 +35,25 @@ The most common properties of an agent are:
 | `model` | no | Which LLM to use. See [Models](models/index.md). |
 | `model_settings` | no | Model tuning parameters such as `temperature`, `top_p`, and `tool_choice`. |
 | `tools` | no | Tools the agent can call. See [Tools](tools.md). |
-| `mcp_servers` | no | MCP-backed tools for the agent. See the [MCP guide](mcp.md). |
+| `mcp_servers` | no | MCP servers that provide MCP-backed tools to the agent. See the [MCP guide](mcp.md). |
+| `mcp_config` | no | Fine-tune how MCP tools are prepared, such as converting their schemas to strict mode and formatting MCP failures. See the [MCP guide](mcp.md#agent-level-mcp-configuration). |
 | `input_guardrails` | no | Guardrails that run on the first user input for this agent chain. See [Guardrails](guardrails.md). |
 | `output_guardrails` | no | Guardrails that run on the final output for this agent. See [Guardrails](guardrails.md). |
 | `output_type` | no | Structured output type instead of plain text. See [Output types](#output-types). |
+| `hooks` | no | Agent-scoped lifecycle callbacks. See [Lifecycle events (hooks)](#lifecycle-events-hooks). |
 | `tool_use_behavior` | no | Control whether tool results loop back to the model or end the run. See [Tool use behavior](#tool-use-behavior). |
 | `reset_tool_choice` | no | Reset `tool_choice` after a tool call (default: `True`) to avoid tool-use loops. See [Forcing tool use](#forcing-tool-use). |
 
 ```python
-from agents import Agent, function_tool
+from agents import Agent
+from agents.decorators import tool
 
-@function_tool
+
+@tool
 def get_weather(city: str) -> str:
     """returns weather info for the specified city."""
     return f"The weather in {city} is sunny"
+
 
 agent = Agent(
     name="Haiku agent",
@@ -62,7 +67,7 @@ Everything in this section applies to `Agent`. `SandboxAgent` builds on the same
 
 ## Prompt templates
 
-You can reference a prompt template created in the OpenAI platform by setting `prompt`. This works with OpenAI models using the Responses API.
+You can reference a prompt template created in the OpenAI platform by setting `prompt`. This works when OpenAI models are accessed through the Responses API.
 
 To use it, please:
 
@@ -96,6 +101,7 @@ from dataclasses import dataclass
 
 from agents import Agent, GenerateDynamicPromptData, Runner
 
+
 @dataclass
 class PromptContext:
     prompt_id: str
@@ -128,9 +134,11 @@ Read the [context guide](context.md) for the full `RunContextWrapper` surface, s
 ```python
 from dataclasses import dataclass
 
+
 @dataclass
 class Purchase:
     id: str
+
 
 @dataclass
 class UserContext:
@@ -141,6 +149,7 @@ class UserContext:
     async def fetch_purchases(self) -> list[Purchase]:
         # implement your logic here
         return []
+
 
 agent = Agent[UserContext](
     ...,
@@ -160,6 +169,7 @@ class CalendarEvent(BaseModel):
     name: str
     date: str
     participants: list[str]
+
 
 agent = Agent(
     name="Calendar extractor",
@@ -205,14 +215,14 @@ customer_facing_agent = Agent(
         refund_agent.as_tool(
             tool_name="refund_expert",
             tool_description="Handles refund questions and requests.",
-        )
+        ),
     ],
 )
 ```
 
 ### Handoffs
 
-Handoffs are sub‑agents the agent can delegate to. When a handoff occurs, the delegated agent receives the conversation history and takes over the conversation. This pattern enables modular, specialized agents that excel at a single task. Read more in the [handoffs](handoffs.md) documentation.
+Configured handoff targets are sub‑agents to which the agent can delegate. When a handoff occurs, the delegated agent receives the conversation history and takes over the conversation. This pattern enables modular, specialized agents that excel at a single task. Read more in the [handoffs](handoffs.md) documentation.
 
 ```python
 from agents import Agent
@@ -238,9 +248,8 @@ In most cases, you can provide instructions when you create the agent. However, 
 ```python
 from agents import Agent, RunContextWrapper
 
-def dynamic_instructions(
-    context: RunContextWrapper[UserContext], agent: Agent[UserContext]
-) -> str:
+
+def dynamic_instructions(context: RunContextWrapper[UserContext], agent: Agent[UserContext]) -> str:
     return f"The user's name is {context.context.name}. Help them with their questions."
 
 
@@ -266,12 +275,12 @@ The callback context also changes depending on the event:
 
 Typical hook timing:
 
--   `on_agent_start` / `on_agent_end`: when a specific agent begins or finishes producing a final output.
+-   `on_agent_start`: when a specific agent begins running; `on_agent_end`: when that agent finishes producing a final output.
 -   `on_llm_start` / `on_llm_end`: immediately around each model call.
 - `on_tool_start` / `on_tool_end`: around each local tool invocation. For function tools, the hook `context` is typically a `ToolContext`, so you can inspect tool-call metadata such as `tool_call_id`.
 -   `on_handoff`: when control moves from one agent to another.
 
-Use `RunHooks` when you want a single observer for the whole workflow, and `AgentHooks` when one agent needs custom side effects.
+Use `RunHooks` when you want a single observer for the whole workflow, and `AgentHooks` when you want lifecycle callbacks scoped to a specific agent.
 
 ```python
 from agents import Agent, RunHooks, Runner
@@ -316,6 +325,8 @@ robot_agent = pirate_agent.clone(
 )
 ```
 
+`clone()` uses `dataclasses.replace`, so it performs a shallow copy. A list attribute that you do not override, such as `tools`, `handoffs`, `mcp_servers`, `input_guardrails`, or `output_guardrails`, remains the exact list held by the original agent. Mutating that list through either agent therefore affects both agents. To give the clone an independent list container, pass a new list, for example `pirate_agent.clone(tools=[*pirate_agent.tools, extra_tool])`. The entries copied into that new list remain the same tool or handoff objects unless you replace those entries too.
+
 ## Forcing tool use
 
 Supplying a list of tools doesn't always mean the LLM will use a tool. You can force tool use by setting [`ModelSettings.tool_choice`][agents.model_settings.ModelSettings.tool_choice]. Valid values are:
@@ -328,18 +339,21 @@ Supplying a list of tools doesn't always mean the LLM will use a tool. You can f
 When you are using OpenAI Responses tool search, named tool choices are more limited: you cannot target bare namespace names or deferred-only tools with `tool_choice`, and `tool_choice="tool_search"` does not target [`ToolSearchTool`][agents.tool.ToolSearchTool]. In those cases, prefer `auto` or `required`. See [Hosted tool search](tools.md#hosted-tool-search) for the Responses-specific constraints.
 
 ```python
-from agents import Agent, function_tool, ModelSettings
+from agents import Agent, ModelSettings
+from agents.decorators import tool
 
-@function_tool
+
+@tool
 def get_weather(city: str) -> str:
     """Returns weather info for the specified city."""
     return f"The weather in {city} is sunny"
+
 
 agent = Agent(
     name="Weather Agent",
     instructions="Retrieve weather details.",
     tools=[get_weather],
-    model_settings=ModelSettings(tool_choice="get_weather")
+    model_settings=ModelSettings(tool_choice="get_weather"),
 )
 ```
 
@@ -351,78 +365,84 @@ The `tool_use_behavior` parameter in the `Agent` configuration controls how tool
 - `"stop_on_first_tool"`: The output of the first tool call is used as the final response, without further LLM processing.
 
 ```python
-from agents import Agent, function_tool
+from agents import Agent
+from agents.decorators import tool
 
-@function_tool
+
+@tool
 def get_weather(city: str) -> str:
     """Returns weather info for the specified city."""
     return f"The weather in {city} is sunny"
+
 
 agent = Agent(
     name="Weather Agent",
     instructions="Retrieve weather details.",
     tools=[get_weather],
-    tool_use_behavior="stop_on_first_tool"
+    tool_use_behavior="stop_on_first_tool",
 )
 ```
 
 - `StopAtTools(stop_at_tool_names=[...])`: Stops if any specified tool is called, using its output as the final response.
 
 ```python
-from agents import Agent, function_tool
+from agents import Agent
 from agents.agent import StopAtTools
+from agents.decorators import tool
 
-@function_tool
+
+@tool
 def get_weather(city: str) -> str:
     """Returns weather info for the specified city."""
     return f"The weather in {city} is sunny"
 
-@function_tool
+
+@tool
 def sum_numbers(a: int, b: int) -> int:
     """Adds two numbers."""
     return a + b
+
 
 agent = Agent(
     name="Stop At Stock Agent",
     instructions="Get weather or sum numbers.",
     tools=[get_weather, sum_numbers],
-    tool_use_behavior=StopAtTools(stop_at_tool_names=["get_weather"])
+    tool_use_behavior=StopAtTools(stop_at_tool_names=["get_weather"]),
 )
 ```
 
-- `ToolsToFinalOutputFunction`: A custom function that processes tool results and decides whether to stop or continue with the LLM.
+- `ToolsToFinalOutputFunction`: A custom function that processes tool results and decides whether to end the run with a final output or continue processing with the LLM.
 
 ```python
-from agents import Agent, function_tool, FunctionToolResult, RunContextWrapper
+from agents import Agent, FunctionToolResult, RunContextWrapper
 from agents.agent import ToolsToFinalOutputResult
+from agents.decorators import tool
 from typing import List, Any
 
-@function_tool
+
+@tool
 def get_weather(city: str) -> str:
     """Returns weather info for the specified city."""
     return f"The weather in {city} is sunny"
 
+
 def custom_tool_handler(
-    context: RunContextWrapper[Any],
-    tool_results: List[FunctionToolResult]
+    context: RunContextWrapper[Any], tool_results: List[FunctionToolResult]
 ) -> ToolsToFinalOutputResult:
     """Processes tool results to decide final output."""
     for result in tool_results:
         if result.output and "sunny" in result.output:
             return ToolsToFinalOutputResult(
-                is_final_output=True,
-                final_output=f"Final weather: {result.output}"
+                is_final_output=True, final_output=f"Final weather: {result.output}"
             )
-    return ToolsToFinalOutputResult(
-        is_final_output=False,
-        final_output=None
-    )
+    return ToolsToFinalOutputResult(is_final_output=False, final_output=None)
+
 
 agent = Agent(
     name="Weather Agent",
     instructions="Retrieve weather details.",
     tools=[get_weather],
-    tool_use_behavior=custom_tool_handler
+    tool_use_behavior=custom_tool_handler,
 )
 ```
 

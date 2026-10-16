@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 from pydantic import GetCoreSchemaHandler
 from pydantic_core import core_schema
 
+from ._tool_invocation import tool_output_identity
 from .agent import Agent
 from .agent_output import AgentOutputSchemaBase
 from .exceptions import (
@@ -18,6 +19,10 @@ from .exceptions import (
     InputGuardrailTripwireTriggered,
     MaxTurnsExceeded,
     RunErrorDetails,
+    _await_data_redacted_error_boundary,
+    _detach_data_redacted_error_traceback,
+    _is_error_data_redacted,
+    _raise_data_redacted_error,
     _should_drain_stream_events_before_raising,
 )
 from .guardrail import InputGuardrailResult, OutputGuardrailResult
@@ -26,6 +31,7 @@ from .items import (
     ModelResponse,
     RunItem,
     ToolApprovalItem,
+    ToolCallOutputItem,
     TResponseInputItem,
 )
 from .logger import log_tool_action_warning, logger
@@ -43,7 +49,7 @@ from .run_internal.run_steps import (
     ProcessedResponse,
     QueueCompleteSentinel,
 )
-from .run_state import RunState
+from .run_state import RunState, _PendingSessionWrite
 from .stream_events import StreamEvent
 from .tool_guardrails import ToolInputGuardrailResult, ToolOutputGuardrailResult
 from .tracing import Trace
@@ -129,7 +135,7 @@ def _populate_state_from_result(
         snapshot_refs,
     )
     state._nested_history_owned_session_item_refs = live_refs
-    state._model_responses = result.raw_responses
+    state._model_responses = list(result.raw_responses)
     state._input_guardrail_results = result.input_guardrail_results
     state._output_guardrail_results = result.output_guardrail_results
     state._tool_input_guardrail_results = result.tool_input_guardrail_results
@@ -144,8 +150,24 @@ def _populate_state_from_result(
     source_state = getattr(result, "_state", None)
     if isinstance(source_state, RunState):
         state._generated_prompt_cache_key = source_state._generated_prompt_cache_key
+        state._pending_input = copy.deepcopy(source_state._pending_input)
+        state._pending_session_write = copy.deepcopy(source_state._pending_session_write)
+        state._current_step = source_state._current_step
+        if isinstance(source_state._current_step, NextStepInterruption):
+            # Failure diagnostics may expose accepted outputs still awaiting their
+            # normal resume write. Keep the checkpoint's publication boundary so
+            # recovery does not mistake those outputs for already persisted work.
+            state._session_items = list(source_state._session_items)
+        # A streamed result exists before its terminal append does, so a checkpoint taken from a
+        # failed stream has to keep the fail-closed marker or it would look resumable.
+        state._terminal_unrecoverable = source_state._terminal_unrecoverable
     else:
         state._generated_prompt_cache_key = getattr(result, "_generated_prompt_cache_key", None)
+        state._pending_input = copy.deepcopy(getattr(result, "_pending_input_for_state", []))
+        state._pending_session_write = copy.deepcopy(
+            getattr(result, "_pending_session_write", None)
+        )
+        state._current_step = getattr(result, "_current_step_for_state", None)
     state._reasoning_item_id_policy = getattr(result, "_reasoning_item_id_policy", None)
 
     interruptions = list(getattr(result, "interruptions", []))
@@ -155,7 +177,7 @@ def _populate_state_from_result(
     trace_state = getattr(result, "_trace_state", None)
     if trace_state is None:
         trace_state = TraceState.from_trace(getattr(result, "trace", None))
-    state._trace_state = copy.deepcopy(trace_state) if trace_state else None
+    state._trace_state = copy.deepcopy(trace_state) if trace_state is not None else None
     sandbox_resume_state = getattr(result, "_sandbox_resume_state", None)
     if isinstance(sandbox_resume_state, dict):
         state._sandbox = copy.deepcopy(sandbox_resume_state)
@@ -163,6 +185,61 @@ def _populate_state_from_result(
         state._sandbox = None
 
     return state
+
+
+def _copy_pending_nested_agent_tool_states(state: RunState[Any], result: RunResultBase) -> None:
+    """Bind detached nested approval checkpoints to the new outer checkpoint scope."""
+    if state._last_processed_response is None:
+        return
+
+    from .agent_tool_state import (
+        drop_agent_tool_run_result,
+        get_agent_tool_resume_state,
+        get_agent_tool_state_scope,
+        peek_agent_tool_run_result,
+        record_agent_tool_resume_state,
+    )
+
+    source_scope = get_agent_tool_state_scope(result.context_wrapper)
+    templates = getattr(result, "_checkpoint_nested_state_templates", None)
+    if not isinstance(templates, dict):
+        templates = {}
+        result.__dict__["_checkpoint_nested_state_templates"] = templates
+    for function_run in state._last_processed_response.functions:
+        template = templates.get(id(function_run.tool_call))
+        if isinstance(template, RunState):
+            nested_state = template._copy_for_result_checkpoint()
+            resolved_interruptions = template.get_interruptions()
+        else:
+            pending_result = peek_agent_tool_run_result(
+                function_run.tool_call,
+                scope_id=source_scope,
+            )
+            pending_interruptions = getattr(pending_result, "interruptions", None)
+            to_state = getattr(pending_result, "to_state", None)
+            if (
+                not isinstance(pending_interruptions, list)
+                or not pending_interruptions
+                or not callable(to_state)
+            ):
+                continue
+            pending_state = get_agent_tool_resume_state(pending_result)
+            copy_for_checkpoint = getattr(pending_state, "_copy_for_result_checkpoint", None)
+            template = copy_for_checkpoint() if callable(copy_for_checkpoint) else to_state()
+            if not isinstance(template, RunState):
+                continue
+            templates[id(function_run.tool_call)] = template
+            drop_agent_tool_run_result(function_run.tool_call, scope_id=source_scope)
+            nested_state = template._copy_for_result_checkpoint()
+            resolved_interruptions = pending_interruptions
+        if not isinstance(nested_state, RunState) or nested_state is state:
+            continue
+        record_agent_tool_resume_state(
+            function_run.tool_call,
+            nested_state,
+            scope_id=state._agent_tool_state_scope_id,
+            approval_items=resolved_interruptions,
+        )
 
 
 ToInputListMode = Literal["preserve_all", "normalized"]
@@ -222,6 +299,52 @@ def _input_items_for_result(
     model_input_items = getattr(result, "_model_input_items", None)
     if not isinstance(model_input_items, list):
         return session_items
+
+    if isinstance(result, RunResultStreaming):
+        # Execution checkpoints can contain accepted outputs that final guardrails
+        # have not released. Keep them private in every public history view.
+        from .run_internal.blocked_output import (
+            _current_response_boundary,
+            _identity_sequence_start,
+        )
+
+        processed = result._last_processed_response
+        if processed is None and isinstance(result._state, RunState):
+            processed = result._state._last_processed_response
+        if processed is not None:
+            legacy_public_outputs: set[tuple[str, str]] = set()
+            start = _identity_sequence_start(model_input_items, processed.new_items)
+            if start is None and isinstance(result._state, RunState):
+                # Legacy first-turn checkpoints have no shared processed-item identities.
+                # Prove their boundary against this result's captured history, since the
+                # caller can resume the source RunState before inspecting an earlier result.
+                boundary_state = copy.copy(result._state)
+                boundary_state._generated_items = model_input_items
+                boundary_state._session_items = result.new_items
+                boundary_state._current_turn = result.current_turn
+                boundary = _current_response_boundary((), processed, boundary_state)
+                start = boundary.generated_start
+                if start is None and boundary_state._terminal_unrecoverable:
+                    return session_items
+                if start is not None and boundary.session_start is not None:
+                    public_start = boundary.session_start + len(boundary.processed_items)
+                    legacy_public_outputs = {
+                        identity
+                        for item in result.new_items[public_start:]
+                        if isinstance(item, ToolCallOutputItem)
+                        and (identity := tool_output_identity(item.raw_item)) is not None
+                    }
+            if start is not None:
+                output_start = start + len(processed.new_items)
+                public_items = {id(item) for item in result.new_items}
+                model_input_items = [
+                    item
+                    for index, item in enumerate(model_input_items)
+                    if index < output_start
+                    or not isinstance(item, ToolCallOutputItem)
+                    or id(item) in public_items
+                    or tool_output_identity(item.raw_item) in legacy_public_outputs
+                ]
 
     # When the runner marks a divergence, generated_items already reflect the continuation input
     # chosen for the next local run after applying handoff/input filtering.
@@ -297,6 +420,16 @@ class RunResultBase(abc.ABC):
     """Root agent graph used when converting the result back into RunState."""
     _generated_prompt_cache_key: str | None = field(default=None, init=False, repr=False)
     """SDK-generated prompt cache key captured during the run."""
+    _pending_input_for_state: list[TResponseInputItem] = field(
+        default_factory=list, init=False, repr=False
+    )
+    """Pending input preserved when a non-streaming result is converted back to RunState."""
+    _pending_session_write: _PendingSessionWrite | None = field(
+        default=None, init=False, repr=False
+    )
+    """Held pending Session write preserved when a non-streaming result becomes a RunState."""
+    _current_step_for_state: Any = field(default=None, init=False, repr=False)
+    """Current step preserved when a non-streaming result is converted back to RunState."""
 
     @classmethod
     def __get_pydantic_core_schema__(
@@ -497,7 +630,7 @@ class RunResult(RunResultBase):
         # Create a RunState from the current result
         original_input_for_state = getattr(self, "_original_input", None)
         state = RunState(
-            context=self.context_wrapper,
+            context=self.context_wrapper._copy_for_run_state(),
             original_input=original_input_for_state
             if original_input_for_state is not None
             else self.input,
@@ -505,7 +638,7 @@ class RunResult(RunResultBase):
             max_turns=self.max_turns,
         )
 
-        return _populate_state_from_result(
+        state = _populate_state_from_result(
             state,
             self,
             current_turn=self._current_turn,
@@ -516,6 +649,8 @@ class RunResult(RunResultBase):
             previous_response_id=self._previous_response_id,
             auto_previous_response_id=self._auto_previous_response_id,
         )
+        _copy_pending_nested_agent_tool_states(state, self)
+        return state
 
     def __str__(self) -> str:
         return pretty_print_result(self)
@@ -528,7 +663,8 @@ class RunResultStreaming(RunResultBase):
 
     The streaming method will raise:
     - A MaxTurnsExceeded exception if the agent exceeds the max_turns limit.
-    - A GuardrailTripwireTriggered exception if a guardrail is tripped.
+    - A tripwire exception if a guardrail is tripped, e.g. InputGuardrailTripwireTriggered
+      or OutputGuardrailTripwireTriggered.
     """
 
     current_agent: Agent[Any]
@@ -572,13 +708,19 @@ class RunResultStreaming(RunResultBase):
     _input_guardrails_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     _triggered_input_guardrail_result: InputGuardrailResult | None = field(default=None, repr=False)
     _output_guardrails_task: asyncio.Task[Any] | None = field(default=None, repr=False)
-    _stored_exception: Exception | None = field(default=None, repr=False)
+    _stored_exception: BaseException | None = field(default=None, repr=False)
+    _tool_error_selected: bool = field(default=False, init=False, repr=False)
+    """A selected tool error owns failure reporting while its input verdict settles."""
     _cancel_mode: Literal["none", "immediate", "after_turn"] = field(default="none", repr=False)
     _last_processed_response: ProcessedResponse | None = field(default=None, repr=False)
     """The last processed model response. This is needed for resuming from interruptions."""
     interruptions: list[ToolApprovalItem] = field(default_factory=list)
     """Pending tool approval requests (interruptions) for this run."""
     _waiting_on_event_queue: bool = field(default=False, repr=False)
+    _active_stream_consumers: int = field(default=0, init=False, repr=False)
+    _stream_consumers_stopped: asyncio.Event = field(
+        default_factory=asyncio.Event, init=False, repr=False
+    )
 
     _current_turn_persisted_item_count: int = 0
     """Number of items from new_items already persisted to session for the
@@ -617,6 +759,21 @@ class RunResultStreaming(RunResultBase):
     )
     _sandbox_cleanup_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
     _sandbox_cleanup_callback_registered: bool = field(default=False, init=False, repr=False)
+    _sandbox_wrapped_run_loop_task: asyncio.Task[Any] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _model_provider_cleanup: Callable[[], Awaitable[None]] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _model_provider_cleanup_task: asyncio.Task[None] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self, _run_impl_task: asyncio.Task[Any] | None) -> None:
         self._current_agent_ref = weakref.ref(self.current_agent)
@@ -681,6 +838,7 @@ class RunResultStreaming(RunResultBase):
             return
 
         original_task = self.run_loop_task
+        self._sandbox_wrapped_run_loop_task = original_task
         self._sandbox_cleanup_callback_registered = True
         original_task.add_done_callback(
             lambda _task: asyncio.create_task(self._run_sandbox_cleanup())
@@ -689,18 +847,68 @@ class RunResultStreaming(RunResultBase):
         async def _await_run_and_cleanup() -> Any:
             try:
                 result = await original_task
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as error:
                 if not original_task.done():
                     original_task.cancel()
+                if _is_error_data_redacted(error):
+                    _detach_data_redacted_error_traceback(error)
                 raise
-            except Exception:
+            except Exception as error:
                 await self._run_sandbox_cleanup()
+                if _is_error_data_redacted(error):
+                    _detach_data_redacted_error_traceback(error)
+                raise
+            except BaseException as error:
+                if _is_error_data_redacted(error):
+                    _detach_data_redacted_error_traceback(error)
                 raise
 
             await self._run_sandbox_cleanup()
             return result
 
-        self.run_loop_task = asyncio.create_task(_await_run_and_cleanup())
+        cleanup_wrapper_task = asyncio.create_task(
+            _await_data_redacted_error_boundary(_await_run_and_cleanup)
+        )
+
+        def cancel_original_if_wrapper_cancelled(task: asyncio.Task[Any]) -> None:
+            # A task cancelled before its first event-loop step cannot enter its coroutine body.
+            if task.cancelled() and not original_task.done():
+                original_task.cancel()
+
+        cleanup_wrapper_task.add_done_callback(cancel_original_if_wrapper_cancelled)
+        self.run_loop_task = cleanup_wrapper_task
+
+    def _ensure_model_provider_cleanup_on_completion(
+        self,
+        cleanup: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Register one cleanup task that also starts if the run task never enters its body."""
+        self._model_provider_cleanup = cleanup
+        if self.run_loop_task is not None:
+            self.run_loop_task.add_done_callback(lambda _task: self._start_model_provider_cleanup())
+
+    def _start_model_provider_cleanup(self) -> asyncio.Task[None] | None:
+        task = self._model_provider_cleanup_task
+        if task is not None:
+            return task
+
+        cleanup = self._model_provider_cleanup
+        if cleanup is None:
+            return None
+
+        self._model_provider_cleanup = None
+
+        async def run_cleanup() -> None:
+            await cleanup()
+
+        task = asyncio.create_task(run_cleanup())
+        self._model_provider_cleanup_task = task
+        return task
+
+    async def _await_model_provider_cleanup(self) -> None:
+        task = self._start_model_provider_cleanup()
+        if task is not None:
+            await asyncio.shield(task)
 
     @property
     def run_loop_exception(self) -> BaseException | None:
@@ -725,7 +933,10 @@ class RunResultStreaming(RunResultBase):
         task = self.run_loop_task
         if task is None or not task.done() or task.cancelled():
             return None
-        return task.exception()
+        error = task.exception()
+        if error is not None and _is_error_data_redacted(error):
+            _detach_data_redacted_error_traceback(error)
+        return error
 
     def cancel(self, mode: Literal["immediate", "after_turn"] = "immediate") -> None:
         """Cancel the streaming run.
@@ -775,6 +986,22 @@ class RunResultStreaming(RunResultBase):
             # Don't call _cleanup_tasks() or clear queues yet
             pass
 
+    async def _wait_for_turn_event_consumption(self) -> None:
+        """Wait for active consumers to finish processing the current turn's events."""
+        if self._active_stream_consumers == 0:
+            return
+
+        queue_drained = asyncio.create_task(self._event_queue.join())
+        consumers_stopped = asyncio.create_task(self._stream_consumers_stopped.wait())
+        tasks = {queue_drained, consumers_stopped}
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def stream_events(self) -> AsyncIterator[StreamEvent]:
         """Stream deltas for new items as they are generated. We're using the types from the
         OpenAI Responses API, so these are semantic events: each event has a `type` field that
@@ -782,11 +1009,56 @@ class RunResultStreaming(RunResultBase):
 
         This will raise:
         - A MaxTurnsExceeded exception if the agent exceeds the max_turns limit.
-        - A GuardrailTripwireTriggered exception if a guardrail is tripped.
+        - A tripwire exception if a guardrail is tripped, e.g. InputGuardrailTripwireTriggered
+          or OutputGuardrailTripwireTriggered.
         """
+        consumer_registered = False
+        registered_consumer_task: asyncio.Task[Any] | None = None
+        item_acknowledgement_pending = False
+
+        def acknowledge_item() -> None:
+            nonlocal item_acknowledgement_pending
+            if not item_acknowledgement_pending:
+                return
+            item_acknowledgement_pending = False
+            self._event_queue.task_done()
+
+        def unregister_consumer() -> None:
+            nonlocal consumer_registered, registered_consumer_task
+            if not consumer_registered:
+                return
+            acknowledge_item()
+            consumer_registered = False
+            registered_consumer_task = None
+            self._active_stream_consumers -= 1
+            if self._active_stream_consumers == 0:
+                self._stream_consumers_stopped.set()
+
+        def consumer_task_done(task: asyncio.Task[Any]) -> None:
+            if registered_consumer_task is not task:
+                return
+            if task.cancelled() or task.exception() is not None:
+                unregister_consumer()
+
+        def register_current_consumer() -> None:
+            nonlocal consumer_registered, registered_consumer_task
+            current_task = asyncio.current_task()
+            if current_task is None or registered_consumer_task is current_task:
+                return
+            if registered_consumer_task is not None:
+                registered_consumer_task.remove_done_callback(consumer_task_done)
+            registered_consumer_task = current_task
+            if not consumer_registered:
+                consumer_registered = True
+                self._active_stream_consumers += 1
+                self._stream_consumers_stopped.clear()
+            current_task.add_done_callback(consumer_task_done)
+
+        register_current_consumer()
         cancelled = False
         try:
             while True:
+                register_current_consumer()
                 self._check_errors()
                 should_drain_queued_events = isinstance(
                     self._stored_exception, MaxTurnsExceeded
@@ -794,7 +1066,7 @@ class RunResultStreaming(RunResultBase):
                     self._stored_exception is not None
                     and _should_drain_stream_events_before_raising(self._stored_exception)
                 )
-                if self._stored_exception and (
+                if self._stored_exception is not None and (
                     not should_drain_queued_events or self._event_queue.empty()
                 ):
                     logger.debug("Breaking due to stored exception")
@@ -826,28 +1098,35 @@ class RunResultStreaming(RunResultBase):
                     self._check_errors()
                     break
 
-                yield item
-                self._event_queue.task_done()
+                item_acknowledgement_pending = True
+                try:
+                    yield item
+                finally:
+                    acknowledge_item()
         finally:
+            if registered_consumer_task is not None:
+                registered_consumer_task.remove_done_callback(consumer_task_done)
+            unregister_consumer()
             try:
-                if cancelled:
-                    # Cancellation should return promptly, so avoid waiting on long-running tasks.
-                    # Tasks have already been cancelled above.
-                    self._cleanup_tasks()
-                else:
-                    # Ensure main execution completes before cleanup to avoid race conditions
-                    # with session operations.
-                    await self._await_task_safely(self.run_loop_task)
-                    # Re-check for exceptions now that the run loop has fully settled.
-                    # _await_task_safely swallows exceptions; without this call, a run-loop
-                    # failure that races past the sentinel (e.g. early sandbox failures) would
-                    # be silently lost instead of surfaced via _stored_exception.
-                    self._check_errors()
-                    # Safely terminate all background tasks after main execution has finished.
-                    self._cleanup_tasks()
-
-                if not cancelled:
-                    await self._run_sandbox_cleanup()
+                try:
+                    if cancelled:
+                        # Queue-wait cancellation should return without awaiting long-running tasks.
+                        # Tasks have already been cancelled above.
+                        self._cleanup_tasks()
+                    else:
+                        # Ensure main execution completes before cleanup to avoid race conditions
+                        # with session operations.
+                        await self._await_task_safely(self.run_loop_task)
+                        # Re-check for exceptions now that the run loop has fully settled.
+                        # _await_task_safely leaves errors to _check_errors(); without this call,
+                        # a run-loop failure racing past the sentinel would be silently lost.
+                        self._check_errors()
+                        # Safely terminate background tasks after main execution has finished.
+                        self._cleanup_tasks()
+                finally:
+                    if not cancelled:
+                        await self._await_model_provider_cleanup()
+                        await self._run_sandbox_cleanup()
             finally:
                 # Allow any pending callbacks (e.g., cancellation handlers) to enqueue their
                 # completion sentinels before we clear the queues for observability.
@@ -857,19 +1136,37 @@ class RunResultStreaming(RunResultBase):
                 self._drain_event_queue()
                 self._drain_input_guardrail_queue()
 
-        if self._stored_exception:
-            raise self._stored_exception
+        stored_exception = self._stored_exception
+        if stored_exception is not None:
+            if _is_error_data_redacted(stored_exception):
+                _detach_data_redacted_error_traceback(stored_exception)
+                # The streaming result retains caller-visible run data. Drop the local reference
+                # before raising so the redacted exception cannot retain it through this frame.
+                self = cast(Any, None)
+                registered_consumer_task = None
+                item = cast(Any, None)
+                _raise_data_redacted_error(stored_exception)
+            raise stored_exception
 
-    def _create_error_details(self) -> RunErrorDetails:
-        """Return a `RunErrorDetails` object considering the current attributes of the class."""
+    def _create_error_details(self) -> RunErrorDetails | None:
+        """Return a `RunErrorDetails` object considering the current attributes of the class.
+        Returns ``None`` when the current agent can no longer be resolved, preserving the
+        original terminal exception.
+        """
+        try:
+            last_agent = self.last_agent
+        except AgentsException:
+            return None
         return RunErrorDetails(
             input=self.input,
             new_items=self.new_items,
             raw_responses=self.raw_responses,
-            last_agent=self.current_agent,
+            last_agent=last_agent,
             context_wrapper=self.context_wrapper,
             input_guardrail_results=self.input_guardrail_results,
             output_guardrail_results=self.output_guardrail_results,
+            tool_input_guardrail_results=self.tool_input_guardrail_results,
+            tool_output_guardrail_results=self.tool_output_guardrail_results,
         )
 
     def _check_errors(self):
@@ -881,11 +1178,12 @@ class RunResultStreaming(RunResultBase):
             max_turns_exc = MaxTurnsExceeded(f"Max turns ({self.max_turns}) exceeded")
             max_turns_exc.run_data = self._create_error_details()
             self._stored_exception = max_turns_exc
+            self._max_turns_handled = True
 
         # Fetch all the completed guardrail results from the queue and raise if needed
         while not self._input_guardrail_queue.empty():
             guardrail_result = self._input_guardrail_queue.get_nowait()
-            if guardrail_result.output.tripwire_triggered:
+            if guardrail_result.output.tripwire_triggered and not self._tool_error_selected:
                 tripwire_exc = InputGuardrailTripwireTriggered(guardrail_result)
                 tripwire_exc.run_data = self._create_error_details()
                 self._stored_exception = tripwire_exc
@@ -894,33 +1192,37 @@ class RunResultStreaming(RunResultBase):
         if self.run_loop_task and self.run_loop_task.done():
             if not self.run_loop_task.cancelled():
                 run_impl_exc = self.run_loop_task.exception()
-                if run_impl_exc and isinstance(run_impl_exc, Exception):
-                    if isinstance(run_impl_exc, AgentsException) and run_impl_exc.run_data is None:
+                if run_impl_exc is not None:
+                    if (
+                        isinstance(run_impl_exc, AgentsException)
+                        and run_impl_exc.run_data is None
+                        and not _is_error_data_redacted(run_impl_exc)
+                    ):
                         run_impl_exc.run_data = self._create_error_details()
                     self._stored_exception = run_impl_exc
 
-        if self._input_guardrails_task and self._input_guardrails_task.done():
+        if (
+            not self._tool_error_selected
+            and self._input_guardrails_task
+            and self._input_guardrails_task.done()
+        ):
             if not self._input_guardrails_task.cancelled():
                 in_guard_exc = self._input_guardrails_task.exception()
-                if in_guard_exc and isinstance(in_guard_exc, Exception):
-                    if isinstance(in_guard_exc, AgentsException) and in_guard_exc.run_data is None:
+                if isinstance(in_guard_exc, Exception):
+                    if (
+                        isinstance(in_guard_exc, AgentsException)
+                        and in_guard_exc.run_data is None
+                        and not _is_error_data_redacted(in_guard_exc)
+                    ):
                         in_guard_exc.run_data = self._create_error_details()
                     self._stored_exception = in_guard_exc
-
-        if self._output_guardrails_task and self._output_guardrails_task.done():
-            if not self._output_guardrails_task.cancelled():
-                out_guard_exc = self._output_guardrails_task.exception()
-                if out_guard_exc and isinstance(out_guard_exc, Exception):
-                    if (
-                        isinstance(out_guard_exc, AgentsException)
-                        and out_guard_exc.run_data is None
-                    ):
-                        out_guard_exc.run_data = self._create_error_details()
-                    self._stored_exception = out_guard_exc
 
     def _cleanup_tasks(self):
         if self.run_loop_task and not self.run_loop_task.done():
             self.run_loop_task.cancel()
+
+        if self._sandbox_wrapped_run_loop_task and not self._sandbox_wrapped_run_loop_task.done():
+            self._sandbox_wrapped_run_loop_task.cancel()
 
         if self._input_guardrails_task and not self._input_guardrails_task.done():
             self._input_guardrails_task.cancel()
@@ -932,20 +1234,20 @@ class RunResultStreaming(RunResultBase):
         return pretty_print_run_result_streaming(self)
 
     async def _await_task_safely(self, task: asyncio.Task[Any] | None) -> None:
-        """Await a task if present, ignoring cancellation and storing exceptions elsewhere.
+        """Wait for a task, leaving its cancellation and exceptions to _check_errors().
 
-        This ensures we do not lose late guardrail exceptions while not surfacing
-        CancelledError to callers of stream_events.
+        This ensures we do not lose late guardrail exceptions while not surfacing the task's
+        CancelledError to callers of stream_events. Consumer cancellation still propagates.
         """
         if task and not task.done():
             try:
-                await task
+                # Waiting directly would conflate child cancellation with consumer cancellation.
+                await asyncio.wait((task,))
             except asyncio.CancelledError:
-                # Task was cancelled (e.g., due to result.cancel()). Nothing to do here.
-                pass
-            except Exception:
-                # The exception will be surfaced via _check_errors() if needed.
-                pass
+                task.cancel()
+                # Preserve direct-await settlement before the consumer releases owned resources.
+                await asyncio.wait((task,))
+                raise
 
     def _drain_event_queue(self) -> None:
         """Remove any pending items from the event queue and mark them done."""
@@ -999,13 +1301,13 @@ class RunResultStreaming(RunResultBase):
         # Use _original_input (updated on handoffs/resume when input history changes).
         # This avoids serializing a mutated view of input history.
         state = RunState(
-            context=self.context_wrapper,
+            context=self.context_wrapper._copy_for_run_state(),
             original_input=self._original_input if self._original_input is not None else self.input,
             starting_agent=_starting_agent_for_state(self),
             max_turns=self.max_turns,
         )
 
-        return _populate_state_from_result(
+        state = _populate_state_from_result(
             state,
             self,
             current_turn=self.current_turn,
@@ -1016,3 +1318,20 @@ class RunResultStreaming(RunResultBase):
             previous_response_id=self._previous_response_id,
             auto_previous_response_id=self._auto_previous_response_id,
         )
+        if (
+            isinstance(self._state, RunState)
+            and self._last_processed_response is not None
+            and self._state._last_processed_response is self._last_processed_response
+        ):
+            # The checkpoint retains records withheld from the public result until guardrails pass.
+            error = self.run_loop_exception
+            if error is not None and _is_error_data_redacted(error):
+                state._tool_input_guardrail_results = list(
+                    self._state._tool_input_guardrail_results
+                )
+            if self._last_processed_response.tool_output_guardrail_result_start is not None:
+                state._tool_output_guardrail_results = list(
+                    self._state._tool_output_guardrail_results
+                )
+        _copy_pending_nested_agent_tool_states(state, self)
+        return state

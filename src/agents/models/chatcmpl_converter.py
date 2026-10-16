@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
+from copy import deepcopy
 from typing import Any, Literal, cast
 
 from openai import Omit, omit
@@ -41,6 +42,9 @@ from openai.types.responses import (
     ResponseReasoningItemParam,
 )
 from openai.types.responses.response_input_param import FunctionCallOutput, ItemReference, Message
+from openai.types.responses.response_output_text import (
+    Annotation as ResponseOutputTextAnnotation,
+)
 from openai.types.responses.response_reasoning_item import Content, Summary
 
 from ..agent_output import AgentOutputSchemaBase
@@ -55,7 +59,15 @@ from ..tool import (
     ensure_function_tool_supports_responses_only_features,
     ensure_tool_choice_supports_backend,
 )
+from .chatcmpl_helpers import ChatCmplHelpers
 from .fake_id import FAKE_RESPONSES_ID
+from .reasoning_content_replay import (
+    _CHAT_COMPLETIONS_REASONING_FIELD_KEY,
+    ReasoningContentReplayContext,
+    ReasoningContentSource,
+    ShouldReplayReasoningContent,
+    default_should_replay_reasoning_content,
+)
 
 ResponseInputContentWithAudioParam = (
     ResponseInputContentParam | ResponseInputAudioParam | dict[str, Any]
@@ -95,7 +107,7 @@ class Converter:
     def convert_response_format(
         cls, final_output_schema: AgentOutputSchemaBase | None
     ) -> ResponseFormat | Omit:
-        if not final_output_schema or final_output_schema.is_plain_text():
+        if final_output_schema is None or final_output_schema.is_plain_text():
             return omit
 
         return {
@@ -125,39 +137,68 @@ class Converter:
         """
         items: list[TResponseOutputItem] = []
 
-        # Check if message is agents.extentions.models.litellm_model.InternalChatCompletionMessage
-        # We can't actually import it here because litellm is an optional dependency
-        # So we use hasattr to check for reasoning_content and thinking_blocks
-        if hasattr(message, "reasoning_content") and message.reasoning_content:
+        # Check if message is agents.extensions.models.litellm_model.InternalChatCompletionMessage.
+        # We can't actually import it here because litellm is an optional dependency.
+        # So we use hasattr to check for provider-specific reasoning fields.
+        reasoning_content = getattr(message, "reasoning_content", "")
+        raw_reasoning = getattr(message, "reasoning", "")
+        raw_thinking_blocks = getattr(message, "thinking_blocks", None)
+        thinking_blocks = (
+            [deepcopy(block) for block in raw_thinking_blocks if isinstance(block, dict)]
+            if isinstance(raw_thinking_blocks, list)
+            else []
+        )
+
+        # Prefer the existing structured/provider-native representations when a provider
+        # includes more than one reasoning field on the same message.
+        reasoning = (
+            raw_reasoning
+            if isinstance(raw_reasoning, str)
+            and raw_reasoning
+            and not reasoning_content
+            and not thinking_blocks
+            else ""
+        )
+
+        if reasoning_content or reasoning or thinking_blocks:
             reasoning_kwargs: dict[str, Any] = {
                 "id": FAKE_RESPONSES_ID,
-                "summary": [Summary(text=message.reasoning_content, type="summary_text")],
+                "summary": (
+                    [Summary(text=reasoning_content, type="summary_text")]
+                    if reasoning_content
+                    else []
+                ),
                 "type": "reasoning",
             }
+            if reasoning:
+                reasoning_kwargs["content"] = [Content(text=reasoning, type="reasoning_text")]
 
-            # Add provider_data if available
-            if provider_data:
-                reasoning_kwargs["provider_data"] = provider_data
+            reasoning_provider_data = dict(provider_data or {})
+            if reasoning:
+                reasoning_provider_data[_CHAT_COMPLETIONS_REASONING_FIELD_KEY] = "reasoning"
+            if thinking_blocks:
+                # The normalized reasoning fields below cannot represent empty thinking text or
+                # redacted_thinking blocks. Keep the complete provider sequence as the replay
+                # source of truth while retaining those released fields as derived data.
+                reasoning_provider_data["thinking_blocks"] = thinking_blocks
+            if reasoning_provider_data:
+                reasoning_kwargs["provider_data"] = reasoning_provider_data
 
             reasoning_item = ResponseReasoningItem(**reasoning_kwargs)
 
-            # Store thinking blocks for Anthropic compatibility
-            if hasattr(message, "thinking_blocks") and message.thinking_blocks:
-                # Store thinking text in content and signature in encrypted_content
+            # Retain the released normalized representation for callers and legacy histories.
+            if thinking_blocks:
                 reasoning_item.content = []
                 signatures: list[str] = []
-                for block in message.thinking_blocks:
-                    if isinstance(block, dict):
-                        thinking_text = block.get("thinking", "")
-                        if thinking_text:
-                            reasoning_item.content.append(
-                                Content(text=thinking_text, type="reasoning_text")
-                            )
-                        # Store the signature if present
-                        if signature := block.get("signature"):
-                            signatures.append(signature)
+                for block in thinking_blocks:
+                    thinking_text = block.get("thinking", "")
+                    if thinking_text:
+                        reasoning_item.content.append(
+                            Content(text=thinking_text, type="reasoning_text")
+                        )
+                    if signature := block.get("signature"):
+                        signatures.append(signature)
 
-                # Store the signatures in encrypted_content with newline delimiter
                 if signatures:
                     reasoning_item.encrypted_content = "\n".join(signatures)
 
@@ -179,7 +220,10 @@ class Converter:
         if message.content:
             message_item.content.append(
                 ResponseOutputText(
-                    text=message.content, type="output_text", annotations=[], logprobs=[]
+                    text=message.content,
+                    type="output_text",
+                    annotations=cls._convert_annotations(message),
+                    logprobs=[],
                 )
             )
         if message.refusal:
@@ -231,6 +275,13 @@ class Converter:
                         )
 
         return items
+
+    @classmethod
+    def _convert_annotations(
+        cls, message: ChatCompletionMessage
+    ) -> list[ResponseOutputTextAnnotation]:
+        """Convert Chat Completions url citations into output text annotations."""
+        return ChatCmplHelpers.convert_url_citations(message.annotations)
 
     @classmethod
     def maybe_easy_input_message(cls, item: Any) -> EasyInputMessageParam | None:
@@ -454,11 +505,20 @@ class Converter:
                 out.append(cast(ChatCompletionContentPartInputAudioParam, audio_part))
             elif isinstance(c, dict) and c.get("type") == "input_file":
                 casted_file_param = cast(ResponseInputFileParam, c)
-                if "file_data" not in casted_file_param or not casted_file_param["file_data"]:
+                # The Chat Completions file content part accepts either inline file_data or a
+                # reference to an uploaded file_id. Prefer inline data when present, otherwise
+                # fall back to the file id (the SDK's own ToolOutputFileContent emits file-id
+                # only input_file items). A file_url is not representable here.
+                file_data = casted_file_param.get("file_data")
+                file_id = casted_file_param.get("file_id")
+                if file_data:
+                    filedata = FileFile(file_data=file_data)
+                elif file_id:
+                    filedata = FileFile(file_id=file_id)
+                else:
                     raise UserError(
-                        f"Only file_data is supported for input_file {casted_file_param}"
+                        f"Only file_data or file_id is supported for input_file {casted_file_param}"
                     )
-                filedata = FileFile(file_data=casted_file_param["file_data"])
 
                 if "filename" in casted_file_param and casted_file_param["filename"]:
                     filedata["filename"] = casted_file_param["filename"]
@@ -528,21 +588,77 @@ class Converter:
 
         result: list[ChatCompletionMessageParam] = []
         current_assistant_msg: ChatCompletionAssistantMessageParam | None = None
-        pending_thinking_blocks: list[dict[str, str]] | None = None
+        pending_thinking_blocks: list[dict[str, Any]] | None = None
+        pending_thinking_blocks_are_native = False
         pending_reasoning_content: str | None = None  # For DeepSeek reasoning_content
+        pending_reasoning: str | None = None
+        normalized_base_url = base_url.rstrip("/") if base_url is not None else None
 
-        def flush_assistant_message() -> None:
-            nonlocal current_assistant_msg, pending_reasoning_content
+        def clear_pending_reasoning_state() -> None:
+            nonlocal pending_reasoning, pending_reasoning_content
+            nonlocal pending_thinking_blocks, pending_thinking_blocks_are_native
+            pending_reasoning = None
+            pending_reasoning_content = None
+            pending_thinking_blocks = None
+            pending_thinking_blocks_are_native = False
+
+        def flush_assistant_message(*, clear_pending_reasoning: bool = True) -> None:
+            nonlocal current_assistant_msg, pending_reasoning, pending_reasoning_content
             if current_assistant_msg is not None:
                 # The API doesn't support empty arrays for tool_calls
                 if not current_assistant_msg.get("tool_calls"):
                     del current_assistant_msg["tool_calls"]
                     # prevents stale reasoning_content from contaminating later turns
                     pending_reasoning_content = None
+                    pending_reasoning = None
                 result.append(current_assistant_msg)
                 current_assistant_msg = None
+            if clear_pending_reasoning:
+                # Thinking blocks belong to the assistant turn that produced them, so a
+                # reasoning item that is not directly followed by that turn's assistant
+                # message must not leak its signed blocks into a later one.
+                clear_pending_reasoning_state()
+
+        def apply_pending_thinking_blocks(
+            assistant_msg: ChatCompletionAssistantMessageParam,
+        ) -> None:
+            nonlocal pending_thinking_blocks, pending_thinking_blocks_are_native
+            if not pending_thinking_blocks:
+                return
+
+            if pending_thinking_blocks_are_native:
+                # LiteLLM's native field preserves the complete Anthropic block sequence,
+                # including empty thinking and redacted_thinking blocks.
+                assistant_msg["thinking_blocks"] = pending_thinking_blocks  # type: ignore[typeddict-unknown-key]
             else:
+                # Legacy stored reasoning items only contain normalized text and signatures.
+                # Preserve their released inline-content reconstruction behavior.
+                current_content = assistant_msg.get("content")
+                if isinstance(current_content, str):
+                    text_content = ChatCompletionContentPartTextParam(
+                        text=current_content, type="text"
+                    )
+                    content_parts: list[Any] = [text_content]
+                elif current_content is None:
+                    content_parts = []
+                else:
+                    content_parts = list(current_content)
+
+                assistant_msg["content"] = pending_thinking_blocks + content_parts
+
+            pending_thinking_blocks = None
+            pending_thinking_blocks_are_native = False
+
+        def apply_pending_reasoning_content(
+            assistant_msg: ChatCompletionAssistantMessageParam,
+        ) -> None:
+            nonlocal pending_reasoning, pending_reasoning_content
+            if pending_reasoning_content:
+                assistant_msg["reasoning_content"] = pending_reasoning_content  # type: ignore[typeddict-unknown-key]
                 pending_reasoning_content = None
+            if pending_reasoning:
+                assistant_msg["reasoning"] = pending_reasoning  # type: ignore[typeddict-unknown-key]
+                pending_reasoning = None
 
         def ensure_assistant_message() -> ChatCompletionAssistantMessageParam:
             nonlocal current_assistant_msg, pending_thinking_blocks
@@ -550,6 +666,9 @@ class Converter:
                 current_assistant_msg = ChatCompletionAssistantMessageParam(role="assistant")
                 current_assistant_msg["content"] = None
                 current_assistant_msg["tool_calls"] = []
+
+            apply_pending_thinking_blocks(current_assistant_msg)
+            apply_pending_reasoning_content(current_assistant_msg)
 
             return current_assistant_msg
 
@@ -619,16 +738,15 @@ class Converter:
 
             # 3) response output message => assistant
             elif resp_msg := cls.maybe_response_output_message(item):
-                flush_assistant_message()
-                new_asst = ChatCompletionAssistantMessageParam(role="assistant")
                 contents = resp_msg["content"]
 
                 text_segments = []
+                refusal: str | None = None
                 for c in contents:
                     if c["type"] == "output_text":
                         text_segments.append(c["text"])
                     elif c["type"] == "refusal":
-                        new_asst["refusal"] = c["refusal"]
+                        refusal = c["refusal"]
                     elif c["type"] == "output_audio":
                         # Can't handle this, b/c chat completions expects an ID which we dont have
                         raise UserError(
@@ -637,30 +755,57 @@ class Converter:
                     else:
                         raise UserError(f"Unknown content type in ResponseOutputMessage: {c}")
 
-                if text_segments:
-                    combined = "\n".join(text_segments)
-                    new_asst["content"] = combined
+                # A streamed turn can order its function calls before its text message,
+                # and the pending assistant message then already carries the tool calls
+                # of this same turn: a function_call_output always flushes, so tool calls
+                # from a previous turn cannot still be pending here. Merge the message
+                # into that pending assistant message. Flushing instead would emit an
+                # assistant message with tool_calls directly followed by another
+                # assistant message, a sequence the Chat Completions API rejects.
+                pending_content = (
+                    current_assistant_msg.get("content")
+                    if current_assistant_msg is not None
+                    else None
+                )
+                if (
+                    current_assistant_msg is not None
+                    and current_assistant_msg.get("tool_calls")
+                    and "refusal" not in current_assistant_msg
+                    # None is the untouched state; a list means thinking blocks were
+                    # already reconstructed into content parts and text can be appended.
+                    and (pending_content is None or isinstance(pending_content, list))
+                ):
+                    merged_asst = current_assistant_msg
+                    if text_segments:
+                        combined = "\n".join(text_segments)
+                        if isinstance(pending_content, list):
+                            merged_asst["content"] = [
+                                *pending_content,
+                                ChatCompletionContentPartTextParam(text=combined, type="text"),
+                            ]
+                        else:
+                            merged_asst["content"] = combined
+                    if refusal is not None:
+                        merged_asst["refusal"] = refusal
+                    apply_pending_thinking_blocks(merged_asst)
+                    apply_pending_reasoning_content(merged_asst)
+                else:
+                    # A reasoning item can be followed by an assistant message and then
+                    # tool calls in the same turn, so preserve pending reasoning state
+                    # across this flush.
+                    flush_assistant_message(clear_pending_reasoning=False)
+                    new_asst = ChatCompletionAssistantMessageParam(role="assistant")
+                    if refusal is not None:
+                        new_asst["refusal"] = refusal
 
-                # If we have pending thinking blocks, prepend them to the content
-                # This is required for Anthropic API with interleaved thinking
-                if pending_thinking_blocks:
-                    # If there is a text content, convert it to a list to prepend thinking blocks
-                    if "content" in new_asst and isinstance(new_asst["content"], str):
-                        text_content = ChatCompletionContentPartTextParam(
-                            text=new_asst["content"], type="text"
-                        )
-                        new_asst["content"] = [text_content]
+                    if text_segments:
+                        combined = "\n".join(text_segments)
+                        new_asst["content"] = combined
 
-                    if "content" not in new_asst or new_asst["content"] is None:
-                        new_asst["content"] = []
-
-                    # Thinking blocks MUST come before any other content
-                    # We ignore type errors because pending_thinking_blocks is not openai standard
-                    new_asst["content"] = pending_thinking_blocks + new_asst["content"]  # type: ignore
-                    pending_thinking_blocks = None  # Clear after using
-
-                new_asst["tool_calls"] = []
-                current_assistant_msg = new_asst
+                    apply_pending_thinking_blocks(new_asst)
+                    new_asst["tool_calls"] = []
+                    apply_pending_reasoning_content(new_asst)
+                    current_assistant_msg = new_asst
 
             # 4) function/file-search calls => attach to assistant
             elif file_search := cls.maybe_file_search_call(item):
@@ -684,30 +829,6 @@ class Converter:
 
             elif func_call := cls.maybe_function_tool_call(item):
                 asst = ensure_assistant_message()
-
-                # If we have pending reasoning content for DeepSeek, add it to the assistant message
-                if pending_reasoning_content:
-                    asst["reasoning_content"] = pending_reasoning_content  # type: ignore[typeddict-unknown-key]
-                    pending_reasoning_content = None  # Clear after using
-
-                # If we have pending thinking blocks, use them as the content
-                # This is required for Anthropic API tool calls with interleaved thinking
-                if pending_thinking_blocks:
-                    # If there is a text content, save it to append after thinking blocks
-                    # content type is Union[str, Iterable[ContentArrayOfContentPart], None]
-                    if "content" in asst and isinstance(asst["content"], str):
-                        text_content = ChatCompletionContentPartTextParam(
-                            text=asst["content"], type="text"
-                        )
-                        asst["content"] = [text_content]
-
-                    if "content" not in asst or asst["content"] is None:
-                        asst["content"] = []
-
-                    # Thinking blocks MUST come before any other content
-                    # We ignore type errors because pending_thinking_blocks is not openai standard
-                    asst["content"] = pending_thinking_blocks + asst["content"]  # type: ignore
-                    pending_thinking_blocks = None  # Clear after using
 
                 tool_calls = list(asst.get("tool_calls", []))
                 arguments = func_call["arguments"] if func_call["arguments"] else "{}"
@@ -737,6 +858,13 @@ class Converter:
                 asst["tool_calls"] = tool_calls
             # 5) function call output => tool message
             elif func_output := cls.maybe_function_tool_call_output(item):
+                call_id = func_output.get("call_id")
+                if call_id is None:
+                    raise UserError(
+                        "Unpaired function outputs are supported by Responses but cannot be "
+                        "converted to Chat Completions tool messages. "
+                        "Use a Responses model to preserve this input."
+                    )
                 flush_assistant_message()
                 output_content = cast(
                     str | Iterable[ResponseInputContentWithAudioParam], func_output["output"]
@@ -768,7 +896,7 @@ class Converter:
                             tool_result_content = _OMITTED_TOOL_OUTPUT_PLACEHOLDER
                 msg: ChatCompletionToolMessageParam = {
                     "role": "tool",
-                    "tool_call_id": func_output["call_id"],
+                    "tool_call_id": call_id,
                     "content": tool_result_content,  # type: ignore[typeddict-item]
                 }
                 result.append(msg)
@@ -781,55 +909,88 @@ class Converter:
 
             # 7) reasoning message => extract thinking blocks if present
             elif reasoning_item := cls.maybe_reasoning_message(item):
+                clear_pending_reasoning_state()
                 # Reconstruct thinking blocks from content (text) and encrypted_content (signature)
                 content_items = reasoning_item.get("content", [])
                 encrypted_content = reasoning_item.get("encrypted_content")
 
                 item_provider_data: dict[str, Any] = reasoning_item.get("provider_data", {})  # type: ignore[assignment]
                 item_model = item_provider_data.get("model", "")
+                reasoning_field = item_provider_data.get(_CHAT_COMPLETIONS_REASONING_FIELD_KEY)
+                origin_provider_data = {
+                    key: value
+                    for key, value in item_provider_data.items()
+                    if key != "thinking_blocks"
+                }
+                should_replay = False
 
-                if (
-                    model
-                    and ("claude" in model.lower() or "anthropic" in model.lower())
-                    and content_items
-                    and preserve_thinking_blocks
-                    # Items may not all originate from Claude, so we need to check for model match.
-                    # For backward compatibility, if provider_data is missing, we ignore the check.
-                    and (model == item_model or item_provider_data == {})
-                ):
-                    signatures = encrypted_content.split("\n") if encrypted_content else []
-
-                    # Reconstruct thinking blocks from content and signature
-                    reconstructed_thinking_blocks = []
+                if reasoning_field == "reasoning" and model == item_model:
+                    reasoning_texts = []
                     for content_item in content_items:
                         if (
                             isinstance(content_item, dict)
                             and content_item.get("type") == "reasoning_text"
+                            and content_item.get("text")
                         ):
-                            thinking_block = {
-                                "type": "thinking",
-                                "thinking": content_item.get("text", ""),
-                            }
-                            # Add signatures if available
-                            if signatures:
-                                thinking_block["signature"] = signatures.pop(0)
-                            reconstructed_thinking_blocks.append(thinking_block)
+                            reasoning_texts.append(content_item["text"])
+                    if reasoning_texts:
+                        pending_reasoning = "\n".join(reasoning_texts)
 
-                    # Store thinking blocks as pending for the next assistant message
-                    # This preserves the original behavior
-                    pending_thinking_blocks = reconstructed_thinking_blocks
-
-                # DeepSeek requires reasoning_content field in assistant messages with tool calls
-                # Items may not all originate from DeepSeek, so need to check for model match.
-                # For backward compatibility, if provider_data is missing, ignore the check.
-                elif (
+                if (
                     model
-                    and "deepseek" in model.lower()
-                    and (
-                        (item_model and "deepseek" in item_model.lower())
-                        or item_provider_data == {}
-                    )
+                    and ("claude" in model.lower() or "anthropic" in model.lower())
+                    and preserve_thinking_blocks
+                    # Items may not all originate from Claude, so we need to check for model match.
+                    # New thinking-block metadata alone does not establish a conflicting origin,
+                    # but other provider metadata without a model must remain origin-unknown.
+                    and (model == item_model or not origin_provider_data)
                 ):
+                    complete_thinking_blocks = item_provider_data.get("thinking_blocks")
+                    if (
+                        isinstance(complete_thinking_blocks, list)
+                        and complete_thinking_blocks
+                        and all(isinstance(block, dict) for block in complete_thinking_blocks)
+                    ):
+                        pending_reasoning = None
+                        pending_thinking_blocks = deepcopy(complete_thinking_blocks)
+                        pending_thinking_blocks_are_native = True
+                    elif content_items and reasoning_field != "reasoning":
+                        signatures = encrypted_content.split("\n") if encrypted_content else []
+
+                        reconstructed_thinking_blocks: list[dict[str, Any]] = []
+                        for content_item in content_items:
+                            if (
+                                isinstance(content_item, dict)
+                                and content_item.get("type") == "reasoning_text"
+                            ):
+                                thinking_block = {
+                                    "type": "thinking",
+                                    "thinking": content_item.get("text", ""),
+                                }
+                                if signatures:
+                                    thinking_block["signature"] = signatures.pop(0)
+                                reconstructed_thinking_blocks.append(thinking_block)
+
+                        pending_thinking_blocks = reconstructed_thinking_blocks
+                        pending_thinking_blocks_are_native = False
+
+                if model is not None:
+                    replay_context = ReasoningContentReplayContext(
+                        model=model,
+                        base_url=normalized_base_url,
+                        reasoning=ReasoningContentSource(
+                            item=reasoning_item,
+                            origin_model=item_model or None,
+                            provider_data=item_provider_data,
+                        ),
+                    )
+                    should_replay = (
+                        should_replay_reasoning_content(replay_context)
+                        if should_replay_reasoning_content is not None
+                        else default_should_replay_reasoning_content(replay_context)
+                    )
+
+                if should_replay:
                     summary_items = reasoning_item.get("summary", [])
                     if summary_items:
                         reasoning_texts = []

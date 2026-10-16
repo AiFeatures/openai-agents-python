@@ -1,9 +1,5 @@
 # Quickstart
 
-!!! warning "Beta feature"
-
-    Sandbox agents are in beta. Expect details of the API, defaults, and supported capabilities to change before general availability, and expect more advanced features over time.
-
 Modern agents work best when they can operate on real files in a filesystem. **Sandbox Agents** in the Agents SDK give the model a persistent workspace where it can search large document sets, edit files, run commands, generate artifacts, and pick work back up from saved sandbox state.
 
 The SDK gives you that execution harness without making you wire together file staging, filesystem tools, shell access, sandbox lifecycle, snapshots, and provider-specific glue yourself. You keep the normal `Agent` and `Runner` flow, then add a `Manifest` for the workspace, capabilities for sandbox-native tools, and `SandboxRunConfig` for where the work runs.
@@ -12,7 +8,7 @@ The SDK gives you that execution harness without making you wire together file s
 
 - Python 3.10 or higher
 - Basic familiarity with the OpenAI Agents SDK
-- A sandbox client. For local development, start with `UnixLocalSandboxClient`.
+- A sandbox client. For trusted local development, start with `UnixLocalSandboxClient`.
 
 ## Installation
 
@@ -30,7 +26,11 @@ pip install "openai-agents[docker]"
 
 ## Create a local sandbox agent
 
-This example stages a local repo under `repo/`, loads local skills lazily, and lets the runner create a Unix-local sandbox session for the run.
+This example stages a local repo under `repo/`, loads local skills lazily, and has the runner create a Unix-local sandbox session for the run.
+
+!!! warning "Local commands use host permissions"
+
+    On Linux, `UnixLocalSandboxClient` adds no OS-level confinement to commands. On macOS, it applies filesystem restrictions through `sandbox-exec`, but does not provide network isolation. Use this example for trusted local development or within an externally isolated environment. For untrusted commands, including commands influenced by untrusted inputs, choose an appropriately configured Docker or hosted sandbox, or provide external isolation. See [Unix-local execution limits](sandbox/clients.md#decision-guide).
 
 ```python
 import asyncio
@@ -62,7 +62,8 @@ def build_agent(model: str) -> SandboxAgent[None]:
                 "repo": LocalDir(src=HOST_REPO_DIR),
             }
         ),
-        capabilities=Capabilities.default() + [
+        capabilities=Capabilities.default()
+        + [
             Skills(
                 lazy_from=LocalDirLazySkillSource(
                     # This is a host path read by the SDK process.
@@ -99,8 +100,8 @@ Once the basic run works, the choices most people reach for next are:
 - `default_manifest`: the files, repos, directories, and mounts for fresh sandbox sessions
 - `instructions`: short workflow rules that should apply across prompts
 - `base_instructions`: an advanced escape hatch for replacing the SDK sandbox prompt
-- `capabilities`: sandbox-native tools such as filesystem editing/image inspection, shell, skills, memory, and compaction
-- `run_as`: the sandbox user identity for model-facing tools
+- `capabilities`: sandbox-native tools such as filesystem editing/image inspection, shell, skills, memory, and the SDK's compaction mechanism
+- `run_as`: the sandbox user account under which model-facing tools execute
 - `SandboxRunConfig.client`: the sandbox backend
 - `SandboxRunConfig.session`, `session_state`, or `snapshot`: how later runs reconnect to prior work
 
@@ -110,4 +111,4 @@ Once the basic run works, the choices most people reach for next are:
 - [Sandbox clients](sandbox/clients.md): choose Unix-local, Docker, hosted providers, and mount strategies.
 - [Agent memory](sandbox/memory.md): preserve and reuse lessons from previous sandbox runs.
 
-If shell access is only one occasional tool, start with hosted shell in the [tools guide](tools.md). Reach for sandbox agents when workspace isolation, sandbox client choice, or sandbox-session resume behavior are part of the design.
+If shell access is just one tool that you use occasionally, start with hosted shell in the [tools guide](tools.md). Reach for sandbox agents when workspace isolation, sandbox client choice, or sandbox-session resume behavior are part of the design.

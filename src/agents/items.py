@@ -6,12 +6,15 @@ import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeAlias, TypeVar, cast
+from uuid import uuid4
 
 import pydantic
 from openai.types.responses import (
     Response,
     ResponseComputerToolCall,
+    ResponseCustomToolCall,
     ResponseFileSearchToolCall,
+    ResponseFunctionShellToolCall,
     ResponseFunctionShellToolCallOutput,
     ResponseFunctionToolCall,
     ResponseFunctionWebSearch,
@@ -147,14 +150,20 @@ class RunItemBase(Generic[T], abc.ABC):
 
     def to_input_item(self) -> TResponseInputItem:
         """Converts this item into an input item suitable for passing to the model."""
-        if isinstance(self.raw_item, dict):
-            # We know that input items are dicts, so we can ignore the type error
-            return self.raw_item  # type: ignore
-        elif isinstance(self.raw_item, BaseModel):
-            # All output items are Pydantic models that can be converted to input items.
-            return self.raw_item.model_dump(exclude_unset=True)  # type: ignore
-        else:
-            raise AgentsException(f"Unexpected raw item type: {type(self.raw_item)}")
+        return _output_item_to_input_item(self.raw_item)
+
+
+@dataclass
+class InputItem(RunItemBase[TResponseInputItem]):
+    """Represents input admitted while resuming a run."""
+
+    raw_item: TResponseInputItem
+    """The normalized input item admitted before the next model call."""
+
+    type: Literal["input_item"] = "input_item"
+
+    input_id: str = field(default_factory=lambda: uuid4().hex)
+    """A durable occurrence identifier used for exactly-once conversation tracking."""
 
 
 @dataclass
@@ -211,7 +220,7 @@ def _tool_search_item_to_input_item(
 
 
 def _output_item_to_input_item(raw_item: Any) -> TResponseInputItem:
-    """Convert an output item into replayable input, normalizing tool_search items."""
+    """Convert an output item into replayable input, stripping output-only metadata."""
     item_type = (
         raw_item.get("type") if isinstance(raw_item, dict) else getattr(raw_item, "type", None)
     )
@@ -219,11 +228,32 @@ def _output_item_to_input_item(raw_item: Any) -> TResponseInputItem:
         return _tool_search_item_to_input_item(raw_item)
 
     if isinstance(raw_item, dict):
-        return cast(TResponseInputItem, dict(raw_item))
-    if isinstance(raw_item, BaseModel):
-        return cast(TResponseInputItem, raw_item.model_dump(exclude_unset=True))
+        payload = dict(raw_item)
+    elif isinstance(raw_item, BaseModel):
+        payload = raw_item.model_dump(exclude_unset=True)
+    else:
+        raise AgentsException(f"Unexpected raw item type: {type(raw_item)}")
 
-    raise AgentsException(f"Unexpected raw item type: {type(raw_item)}")
+    # ``created_by`` is server-assigned, output-only metadata that is absent from the Responses
+    # input-item schema, so it must not be replayed back to the API. Several output item types
+    # carry it (apply_patch/shell calls and tool-call outputs); the tool_search branch above
+    # already drops it, so do the same for every other item type.
+    payload.pop("created_by", None)
+    if item_type == "shell_call_output":
+        # ``shell_call_output.output`` is a list of content chunks that each carry their own
+        # output-only ``created_by``. ``payload`` was only shallow-copied above, so rebuild the
+        # list with fresh chunk copies to strip the nested field without mutating the caller's
+        # original mapping. Mirrors the two-level stripping the runner already does in
+        # ``turn_resolution``.
+        chunks = payload.get("output")
+        if isinstance(chunks, list):
+            payload["output"] = [
+                {key: value for key, value in chunk.items() if key != "created_by"}
+                if isinstance(chunk, dict)
+                else chunk
+                for chunk in chunks
+            ]
+    return cast(TResponseInputItem, payload)
 
 
 def _copy_tool_search_mapping(raw_item: Mapping[str, Any]) -> dict[str, Any]:
@@ -367,9 +397,14 @@ class ToolCallItem(RunItemBase[Any]):
     tool_origin: ToolOrigin | None = None
     """Optional metadata describing the source of a function-tool-backed item."""
 
+    _resolved_tool_name: str | None = field(default=None, kw_only=True, repr=False)
+    """SDK-resolved tool name when the provider payload does not carry one."""
+
     @property
     def tool_name(self) -> str | None:
         """Return the tool name from the raw item, if available."""
+        if self._resolved_tool_name is not None:
+            return self._resolved_tool_name
         if isinstance(self.raw_item, dict):
             return self.raw_item.get("name")
         return getattr(self.raw_item, "name", None)
@@ -413,7 +448,7 @@ class ToolCallOutputItem(RunItemBase[Any]):
     """SDK-only custom data attached to this tool output.
 
     This data is not part of ``raw_item`` and is not sent back to the model when the output item is
-    replayed as input.
+    replayed as input. On a failed run, unfinished custom-data extraction may leave this unset.
     """
 
     @property
@@ -449,7 +484,7 @@ class ToolCallOutputItem(RunItemBase[Any]):
                         if isinstance(outcome, dict):
                             if outcome.get("type") == "exit":
                                 entry["outcome"] = outcome
-            return cast(TResponseInputItem, payload)
+            return _output_item_to_input_item(payload)
 
         return super().to_input_item()
 
@@ -507,7 +542,13 @@ class CompactionItem(RunItemBase[TResponseInputItem]):
 
 # Union type for tool approval raw items - supports function tools, hosted tools, shell tools, etc.
 ToolApprovalRawItem: TypeAlias = (
-    ResponseFunctionToolCall | McpCall | McpApprovalRequest | LocalShellCall | dict[str, Any]
+    ResponseFunctionToolCall
+    | ResponseCustomToolCall
+    | ResponseFunctionShellToolCall
+    | McpCall
+    | McpApprovalRequest
+    | LocalShellCall
+    | dict[str, Any]
 )
 
 
@@ -643,7 +684,8 @@ class ToolApprovalItem(RunItemBase[Any]):
 
 
 RunItem: TypeAlias = (
-    MessageOutputItem
+    InputItem
+    | MessageOutputItem
     | ToolSearchCallItem
     | ToolSearchOutputItem
     | HandoffCallItem
@@ -678,11 +720,21 @@ class ModelResponse:
     request_id: str | None = None
     """The transport request ID for this model call, if provided by the model SDK."""
 
+    raw_usage: dict[str, Any] | None = None
+    """A JSON-compatible snapshot of the provider usage payload, when preservation is enabled.
+
+    The snapshot is captured only while the unnormalized provider payload is available, before the
+    Agents SDK normalizes missing usage fields. It is ``None`` when preservation is disabled, no
+    usage payload reaches the model adapter, or upstream normalization has already discarded
+    field-presence information.
+    """
+
     def to_input_items(self) -> list[TResponseInputItem]:
         """Convert the output into a list of input items suitable for passing to the model."""
-        # Most output items can be replayed via a direct model_dump. Tool-search items carry
-        # output-only metadata such as `created_by`, so they must go through the same replay
-        # sanitizer used elsewhere in the runtime.
+        # Most output items can be replayed via a direct model_dump, but several types (tool
+        # search, apply_patch/shell calls, and tool-call outputs) carry output-only metadata
+        # such as `created_by` that is not part of the input schema, so they go through the
+        # replay sanitizer that strips it before the items are sent back to the model.
         return [_output_item_to_input_item(it) for it in self.output]
 
 
@@ -914,7 +966,9 @@ class ItemHelpers:
             # An empty list/tuple has no structured items; ``all([])`` is ``True``,
             # so guard against it to avoid emitting an empty structured-output list
             # (which would drop the tool result) and stringify instead.
-            if maybe_converted_output_list and all(maybe_converted_output_list):
+            if maybe_converted_output_list and all(
+                item is not None for item in maybe_converted_output_list
+            ):
                 return [
                     cls._convert_single_tool_output_pydantic_model(item)
                     for item in maybe_converted_output_list
@@ -923,7 +977,7 @@ class ItemHelpers:
             return None
 
         maybe_converted_output = cls._maybe_get_output_as_structured_function_output(output)
-        if maybe_converted_output:
+        if maybe_converted_output is not None:
             return [cls._convert_single_tool_output_pydantic_model(maybe_converted_output)]
         return None
 

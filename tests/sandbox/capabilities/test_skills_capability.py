@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import io
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 from typing import cast
 
 import pytest
 
 from agents.sandbox import Manifest, SandboxPathGrant
-from agents.sandbox.capabilities import LocalDirLazySkillSource, Skill, Skills
+from agents.sandbox.capabilities import (
+    LazySkillSource,
+    LocalDirLazySkillSource,
+    Skill,
+    SkillMetadata,
+    Skills,
+)
 from agents.sandbox.entries import Dir, File, LocalDir
 from agents.sandbox.errors import (
     SkillsConfigError,
@@ -19,8 +25,13 @@ from agents.sandbox.files import EntryKind, FileEntry
 from agents.sandbox.session.base_sandbox_session import BaseSandboxSession
 from agents.sandbox.session.sandbox_session import SandboxSession
 from agents.sandbox.snapshot import NoopSnapshot
-from agents.sandbox.types import ExecResult, Permissions, User
-from agents.sandbox.workspace_paths import coerce_posix_path
+from agents.sandbox.types import ExecResult, FileMode, Group, Permissions, User
+from agents.sandbox.workspace_paths import (
+    SandboxWorkspaceScope,
+    coerce_posix_path,
+    sandbox_path_str,
+)
+from agents.testing import scripted_sandbox_session
 from agents.tool import FunctionTool
 from agents.tool_context import ToolContext
 from agents.tracing import trace
@@ -44,6 +55,39 @@ def _user_name(user: object) -> str | None:
     if isinstance(user, str):
         return user
     return str(user)
+
+
+class _StaticResultLazySkillSource(LazySkillSource):
+    result: dict[str, str]
+    metadata_path: PurePath | None = None
+
+    def list_skill_metadata(
+        self,
+        *,
+        skills_path: str,
+        source_grants: tuple[SandboxPathGrant, ...] = (),
+    ) -> list[SkillMetadata]:
+        _ = (skills_path, source_grants)
+        if self.metadata_path is None:
+            return []
+        return [
+            SkillMetadata(
+                name="dynamic-skill",
+                description="dynamic description",
+                path=self.metadata_path,
+            )
+        ]
+
+    async def load_skill(
+        self,
+        *,
+        skill_name: str,
+        session: BaseSandboxSession,
+        skills_path: str,
+        user: str | User | None = None,
+    ) -> dict[str, str]:
+        _ = (skill_name, session, skills_path, user)
+        return dict(self.result)
 
 
 class _SkillsSession(BaseSandboxSession):
@@ -140,6 +184,20 @@ class _WorkspaceNotFoundSkillsSession(_SkillsSession):
             return await super().read(path, user=user)
         except FileNotFoundError as exc:
             raise WorkspaceReadNotFoundError(path=path, cause=exc) from exc
+
+
+class _ExecRecordingSkillsSession(_SkillsSession):
+    def __init__(self, manifest: Manifest) -> None:
+        super().__init__(manifest)
+        self.commands: list[tuple[str, ...]] = []
+
+    async def _exec_internal(
+        self,
+        *command: str | Path,
+        timeout: float | None = None,
+    ) -> ExecResult:
+        self.commands.append(tuple(str(part) for part in command))
+        return await super()._exec_internal(*command, timeout=timeout)
 
 
 class _ArchiveReadErrorSkillsSession(_SkillsSession):
@@ -377,6 +435,7 @@ class TestSkillsInstructions:
         assert "### How to use skills" in instructions
         assert "- a-skill: a description (file: .agents/a-skill)" in instructions
         assert "- z-skill: z description (file: .agents/z-skill)" in instructions
+        assert "### Run-scoped skill paths" not in instructions
         assert instructions.index(
             "- a-skill: a description (file: .agents/a-skill)"
         ) < instructions.index("- z-skill: z description (file: .agents/z-skill)")
@@ -392,6 +451,20 @@ class TestSkillsInstructions:
 
         assert instructions is not None
         assert "- my-skill: desc (file: .sandbox/skills/my-skill)" in instructions
+
+    @pytest.mark.asyncio
+    async def test_instructions_render_session_owned_paths_as_absolute_with_run_cwd(self) -> None:
+        capability = Skills(
+            skills=[Skill(name="my-skill", description="desc", content="literal")],
+        )
+        capability.bind_workspace_scope(SandboxWorkspaceScope.from_cwd("tasks/task-a"))
+
+        instructions = await capability.instructions(Manifest(root="/workspace"))
+
+        assert instructions is not None
+        assert "- my-skill: desc (file: /workspace/.agents/my-skill)" in instructions
+        assert "Treat each listed path as the skill root" in instructions
+        assert "write task inputs, outputs, caches, and temporary files" in instructions
 
     @pytest.mark.asyncio
     async def test_instructions_return_none_when_metadata_is_empty(self) -> None:
@@ -442,12 +515,14 @@ class TestSkillsInstructions:
         session = _SkillsSession(manifest)
         await session.apply_manifest()
         capability.bind(session)
+        capability.bind_workspace_scope(SandboxWorkspaceScope.from_cwd("tasks/task-a"))
 
         instructions = await capability.instructions(session.state.manifest)
 
         assert instructions is not None
         assert (
-            "- discovered-skill: loaded from runtime frontmatter (file: .agents/dynamic-skill)"
+            "- discovered-skill: loaded from runtime frontmatter "
+            f"(file: {workspace_root.as_posix()}/.agents/dynamic-skill)"
         ) in instructions
 
     @pytest.mark.asyncio
@@ -476,6 +551,473 @@ class TestSkillsInstructions:
         )
         assert "Call `load_skill` with a single skill name from the list" in instructions
         assert "loaded on demand instead of being present up front" in instructions
+
+    @pytest.mark.parametrize(
+        ("frontmatter_description", "expected_description"),
+        [
+            pytest.param(
+                "description: >\n  Use for GitHub issue triage.\n  Triggers: /triage, bug report",
+                "Use for GitHub issue triage. Triggers: /triage, bug report",
+                id="folded_block_scalar",
+            ),
+            pytest.param(
+                "description: |\n  Use for GitHub issue triage.\n  Triggers: /triage, bug report",
+                "Use for GitHub issue triage.\nTriggers: /triage, bug report",
+                id="literal_block_scalar",
+            ),
+            pytest.param(
+                "description: >-\n  Use for GitHub issue triage.\n  Triggers: /triage, bug report",
+                "Use for GitHub issue triage. Triggers: /triage, bug report",
+                id="folded_block_scalar_with_chomping_indicator",
+            ),
+            pytest.param(
+                "description: Use for GitHub issue\n  triage, not for PR review.",
+                "Use for GitHub issue triage, not for PR review.",
+                id="wrapped_plain_scalar",
+            ),
+            pytest.param(
+                "description: >\n  Use for GitHub issue triage.\n\n  Not for PR review.",
+                "Use for GitHub issue triage.\nNot for PR review.",
+                id="folded_block_scalar_with_blank_line",
+            ),
+            pytest.param(
+                "description: >\n  first\n    indented\n  last",
+                "first\n  indented\nlast",
+                id="folded_more_indented_line",
+            ),
+            pytest.param(
+                "description: >\n  first\n\n    indented\n\n  last",
+                "first\n\n  indented\n\nlast",
+                id="folded_blank_lines_around_more_indented_line",
+            ),
+            pytest.param(
+                "description: >\n  first\n    one\n    two\n  last",
+                "first\n  one\n  two\nlast",
+                id="folded_more_indented_run",
+            ),
+            pytest.param(
+                "description: >\n  first\n\n\n  last",
+                "first\n\nlast",
+                id="folded_multiple_blank_lines",
+            ),
+            pytest.param(
+                "description: |\n  first\n    indented\n\n  last",
+                "first\n  indented\n\nlast",
+                id="literal_indentation_and_paragraph",
+            ),
+            pytest.param(
+                "description: > # a multi-line description + comment\n  first\n  last",
+                "first last",
+                id="block_header_comment",
+            ),
+            pytest.param(
+                "description: >\n  first\n  ---\n  last",
+                "first --- last",
+                id="folded_document_marker",
+            ),
+            pytest.param(
+                "description: |\n  first\n  ---\n  name: content\n  last",
+                "first\n---\nname: content\nlast",
+                id="literal_document_marker_and_key",
+            ),
+            pytest.param(
+                "description: >2\n    indented\n  last",
+                "indented\nlast",
+                id="explicit_indent_preserves_later_less_indented_text",
+            ),
+            pytest.param(
+                "description: |2\n    indented\n  last",
+                "indented\nlast",
+                id="literal_explicit_indent",
+            ),
+            pytest.param(
+                "description: >\n  first\n  # content\n  last",
+                "first # content last",
+                id="block_comment_is_content",
+            ),
+            pytest.param(
+                "description: >\n    first\n    last\n  # maintainer note\n    # name: ignored",
+                "first last",
+                id="folded_dedented_trailing_comments",
+            ),
+            pytest.param(
+                "description: |\n\n    first\n    last\n\n  # maintainer note",
+                "first\nlast",
+                id="literal_dedented_trailing_comment",
+            ),
+            pytest.param(
+                "description: >4-\n      first\n    last\n  # maintainer note",
+                "first\nlast",
+                id="explicit_indent_dedented_trailing_comment",
+            ),
+            pytest.param(
+                "description: |2\n  first\n  last\n # maintainer note",
+                "first\nlast",
+                id="literal_explicit_indent_dedented_trailing_comment",
+            ),
+            pytest.param(
+                "description: >2\n # maintainer note\n  # name: ignored",
+                "",
+                id="empty_explicit_block_before_trailing_comments",
+            ),
+            pytest.param(
+                "description: |\n  # content\n  last",
+                "# content\nlast",
+                id="leading_hash_line_is_block_content",
+            ),
+            pytest.param(
+                "description: first\n\n  last",
+                "first\nlast",
+                id="plain_paragraph",
+            ),
+            pytest.param(
+                'description: "  quoted content  "\n\n  # explanation',
+                "  quoted content  ",
+                id="quoted_scalar_with_blank_line_before_comment",
+            ),
+            pytest.param(
+                "description: >\n\n  first  \n  last\n\n",
+                "first   last",
+                id="folded_trailing_content_spaces",
+            ),
+            pytest.param(
+                "description: >\n  first\n    \n  last",
+                "first\n  \nlast",
+                id="folded_space_only_more_indented_content",
+            ),
+            pytest.param(
+                "description: |\n  first\n    \n  last",
+                "first\n  \nlast",
+                id="literal_space_only_more_indented_content",
+            ),
+            pytest.param(
+                "description: >\n  first\n  \tindented\n  last",
+                "first\n\tindented\nlast",
+                id="tab_content_is_more_indented",
+            ),
+            pytest.param(
+                "description: >\n  Investigate issues.\n  Keep emoji 🐍 and accented café text.",
+                "Investigate issues. Keep emoji 🐍 and accented café text.",
+                id="unicode_content",
+            ),
+            *[
+                pytest.param(
+                    f"description: {style}{indicator} # header\n  first\n  last\n\n",
+                    "first last" if style == ">" else "first\nlast",
+                    id=f"block_header_{style}_{indicator or 'clip'}",
+                )
+                for style in (">", "|")
+                for indicator in ("", "-", "+", "2", "2-", "-2", "2+", "+2")
+            ],
+        ],
+    )
+    @pytest.mark.parametrize("source_mode", ["lazy", "runtime"])
+    @pytest.mark.asyncio
+    async def test_instructions_keep_multi_line_frontmatter_descriptions(
+        self,
+        tmp_path: Path,
+        frontmatter_description: str,
+        expected_description: str,
+        source_mode: str,
+    ) -> None:
+        src_root = tmp_path / "skills"
+        skill_dir = src_root / "dynamic-skill"
+        skill_dir.mkdir(parents=True)
+        # The name follows the description so the test also covers where the value ends.
+        (skill_dir / "SKILL.md").write_text(
+            f"---\n{frontmatter_description}\nname: discovered-skill\n---\n# Skill\n",
+            encoding="utf-8",
+        )
+
+        if source_mode == "lazy":
+            source = LocalDirLazySkillSource(source=LocalDir(src=src_root))
+            manifest = _source_granted_manifest(source=src_root)
+            metadata = source.list_skill_metadata(
+                skills_path=".agents", source_grants=manifest.extra_path_grants
+            )
+            assert metadata == [
+                SkillMetadata(
+                    name="discovered-skill",
+                    description=expected_description,
+                    path=Path(".agents/dynamic-skill"),
+                )
+            ]
+            capability = Skills(lazy_from=source)
+        else:
+            workspace_root = tmp_path / "workspace"
+            workspace_root.mkdir()
+            capability = Skills(
+                from_=Dir(
+                    children={
+                        "dynamic-skill": Dir(
+                            children={
+                                "SKILL.md": File(
+                                    content=(skill_dir / "SKILL.md").read_text(encoding="utf-8")
+                                )
+                            }
+                        )
+                    }
+                )
+            )
+            manifest = capability.process_manifest(Manifest(root=str(workspace_root)))
+            session = _SkillsSession(manifest)
+            await session.apply_manifest()
+            capability.bind(session)
+
+        instructions = await capability.instructions(manifest)
+
+        assert instructions is not None
+        assert (
+            f"- discovered-skill: {expected_description} (file: .agents/dynamic-skill)"
+            in instructions
+        )
+
+    @pytest.mark.parametrize(
+        ("frontmatter", "expected_line"),
+        [
+            pytest.param(
+                "name: discovered-skill\n  # explanation\ndescription: local dir metadata",
+                "- discovered-skill: local dir metadata",
+                id="indented_comment_after_plain_value",
+            ),
+            pytest.param(
+                'name: discovered-skill\ndescription: "local dir metadata"\n  # note',
+                "- discovered-skill: local dir metadata",
+                id="indented_comment_after_quoted_value",
+            ),
+            pytest.param(
+                "name: discovered-skill\ndescription: >\n  Use for triage.\n  # kept as content",
+                "- discovered-skill: Use for triage. # kept as content",
+                id="comment_line_inside_block_scalar_is_content",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_instructions_treat_comment_lines_the_way_yaml_does(
+        self,
+        tmp_path: Path,
+        frontmatter: str,
+        expected_line: str,
+    ) -> None:
+        src_root = tmp_path / "skills"
+        skill_dir = src_root / "dynamic-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\n{frontmatter}\n---\n# Skill\n",
+            encoding="utf-8",
+        )
+
+        capability = Skills(
+            lazy_from=LocalDirLazySkillSource(source=LocalDir(src=src_root)),
+        )
+
+        instructions = await capability.instructions(_source_granted_manifest(source=src_root))
+
+        assert instructions is not None
+        assert f"{expected_line} (file: .agents/dynamic-skill)" in instructions
+
+    @pytest.mark.asyncio
+    async def test_instructions_keep_skill_name_when_a_description_line_looks_like_a_key(
+        self, tmp_path: Path
+    ) -> None:
+        src_root = tmp_path / "skills"
+        skill_dir = src_root / "dynamic-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: discovered-skill\n"
+            "description: >\n"
+            "  Use for GitHub issue triage.\n"
+            "  name: not-the-skill-name\n"
+            "---\n# Skill\n",
+            encoding="utf-8",
+        )
+
+        capability = Skills(
+            lazy_from=LocalDirLazySkillSource(source=LocalDir(src=src_root)),
+        )
+
+        instructions = await capability.instructions(_source_granted_manifest(source=src_root))
+
+        assert instructions is not None
+        assert (
+            "- discovered-skill: Use for GitHub issue triage. name: not-the-skill-name "
+            "(file: .agents/dynamic-skill)"
+        ) in instructions
+
+    @pytest.mark.parametrize(
+        ("frontmatter", "expected_name", "expected_description"),
+        [
+            pytest.param(
+                'name: "discovered-skill"\n\n  # explanation\ndescription: triage',
+                "discovered-skill",
+                "triage",
+                id="quoted_name_before_blank_and_comment",
+            ),
+            pytest.param(
+                "name: 'discovered-skill'\n\n  # explanation\ndescription: triage",
+                "discovered-skill",
+                "triage",
+                id="single_quoted_name_before_blank_and_comment",
+            ),
+            pytest.param(
+                'name: discovered-skill\ndescription: "  keep spaces  "',
+                "discovered-skill",
+                "  keep spaces  ",
+                id="quoted_interior_spaces",
+            ),
+            pytest.param(
+                "name: discovered-skill\ndescription: use the #triage tag",
+                "discovered-skill",
+                "use the #triage tag",
+                id="released_inline_hash_text",
+            ),
+            pytest.param(
+                'name: discovered-skill\ndescription: "literal \\n escape"',
+                "discovered-skill",
+                "literal \\n escape",
+                id="released_quoted_escape_text",
+            ),
+            pytest.param(
+                "name: discovered-skill\ndescription: false",
+                "discovered-skill",
+                "false",
+                id="boolean_looking_string",
+            ),
+            pytest.param(
+                "name: discovered-skill\ndescription: 123",
+                "discovered-skill",
+                "123",
+                id="numeric_looking_string",
+            ),
+            pytest.param(
+                "name: discovered-skill\ndescription:",
+                "discovered-skill",
+                "",
+                id="empty_plain_string",
+            ),
+            pytest.param(
+                "description: >\nname: discovered-skill",
+                "discovered-skill",
+                "",
+                id="empty_folded_block",
+            ),
+            pytest.param(
+                "description: |+\n\n  \nname: discovered-skill",
+                "discovered-skill",
+                "",
+                id="blank_literal_block",
+            ),
+            pytest.param(
+                "metadata:\n  name: nested\n  description: nested\n"
+                "name: discovered-skill\ndescription: triage",
+                "discovered-skill",
+                "triage",
+                id="nested_mapping_before_metadata",
+            ),
+            pytest.param(
+                "name: discovered-skill\ndescription: triage\n"
+                "metadata:\n  name: nested\n  description: nested",
+                "discovered-skill",
+                "triage",
+                id="nested_mapping_after_metadata",
+            ),
+            pytest.param(
+                "metadata:\n  name: nested\n  description: nested",
+                "dynamic-skill",
+                "No description provided.",
+                id="nested_metadata_not_promoted",
+            ),
+            pytest.param(
+                "metadata:\n  - name: nested\n    description: nested\n"
+                "name: discovered-skill\ndescription: triage",
+                "discovered-skill",
+                "triage",
+                id="nested_sequence_not_promoted",
+            ),
+            pytest.param(
+                "  name: discovered-skill\n  description: >2\n    first\n    last",
+                "discovered-skill",
+                "first last",
+                id="indented_top_level_fields",
+            ),
+            pytest.param(
+                'name: discovered-skill\ndescription: |\n  "quoted content"',
+                "discovered-skill",
+                '"quoted content"',
+                id="literal_quotes_are_content",
+            ),
+            pytest.param(
+                "name: discovered-skill\ndescription: |\n  \\n is literal",
+                "discovered-skill",
+                "\\n is literal",
+                id="literal_escape_is_content",
+            ),
+            pytest.param(
+                "name: discovered-skill\ndescription: >\n  first\n# trailing comment\n"
+                "metadata:\n  name: nested",
+                "discovered-skill",
+                "first",
+                id="dedented_comment_ends_block",
+            ),
+            pytest.param(
+                "name: discovered-skill\nmetadata: &ignored\n  name: nested\ndescription: *ignored",
+                "discovered-skill",
+                "*ignored",
+                id="aliases_are_not_resolved",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+    def test_local_metadata_preserves_scalar_boundaries(
+        self,
+        tmp_path: Path,
+        frontmatter: str,
+        expected_name: str,
+        expected_description: str,
+        newline: str,
+    ) -> None:
+        skill_dir = tmp_path / "dynamic-skill"
+        skill_dir.mkdir()
+        markdown = f"---\n{frontmatter}\n---\n# Body\nname: body-only\n"
+        (skill_dir / "SKILL.md").write_bytes(markdown.replace("\n", newline).encode("utf-8"))
+        source = LocalDirLazySkillSource(source=LocalDir(src=tmp_path))
+
+        metadata = source.list_skill_metadata(
+            skills_path=".agents", source_grants=(SandboxPathGrant(path=str(tmp_path)),)
+        )
+
+        assert metadata == [
+            SkillMetadata(
+                name=expected_name,
+                description=expected_description,
+                path=Path(".agents/dynamic-skill"),
+            )
+        ]
+
+    @pytest.mark.parametrize(
+        "markdown",
+        ["# No frontmatter\n", "---\nname: unfinished\n", "\n---\nname: not-frontmatter\n---"],
+    )
+    def test_local_metadata_keeps_missing_frontmatter_fallbacks(
+        self,
+        tmp_path: Path,
+        markdown: str,
+    ) -> None:
+        skill_dir = tmp_path / "dynamic-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(markdown, encoding="utf-8")
+        source = LocalDirLazySkillSource(source=LocalDir(src=tmp_path))
+
+        assert source.list_skill_metadata(
+            skills_path=".agents", source_grants=(SandboxPathGrant(path=str(tmp_path)),)
+        ) == [
+            SkillMetadata(
+                name="dynamic-skill",
+                description="No description provided.",
+                path=Path(".agents/dynamic-skill"),
+            )
+        ]
 
     @pytest.mark.asyncio
     async def test_lazy_local_dir_metadata_skips_symlinked_skill_directory(
@@ -542,8 +1084,169 @@ class TestSkillsInstructions:
         loaded_skill = workspace_root / ".agents" / "dynamic-skill" / "SKILL.md"
         assert loaded_skill.read_text(encoding="utf-8") == "# dynamic skill\n"
 
+    @pytest.mark.asyncio
+    async def test_lazy_load_reports_absolute_path_without_relocating_skill(
+        self, tmp_path: Path
+    ) -> None:
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        src_root = tmp_path / "skills"
+        skill_dir = src_root / "dynamic-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# dynamic skill\n", encoding="utf-8")
+        capability = Skills(
+            lazy_from=LocalDirLazySkillSource(source=LocalDir(src=src_root)),
+        )
+        session = _SkillsSession(
+            capability.process_manifest(_source_granted_manifest(workspace_root, source=src_root))
+        )
+        capability.bind(session)
+        capability.bind_workspace_scope(SandboxWorkspaceScope.from_cwd("tasks/task-a"))
+
+        output = await capability.load_skill("dynamic-skill")
+
+        assert output == {
+            "status": "loaded",
+            "skill_name": "dynamic-skill",
+            "path": f"{workspace_root.as_posix()}/.agents/dynamic-skill",
+        }
+        assert (workspace_root / ".agents" / "dynamic-skill" / "SKILL.md").is_file()
+        assert not (workspace_root / "tasks" / "task-a" / ".agents").exists()
+
+    @pytest.mark.asyncio
+    async def test_lazy_local_dir_load_skill_applies_source_metadata(self, tmp_path: Path) -> None:
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        src_root = tmp_path / "skills"
+        skill_dir = src_root / "dynamic-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# dynamic skill\n", encoding="utf-8")
+
+        source = LocalDir(
+            src=src_root,
+            permissions=Permissions(owner=FileMode.ALL, group=0, other=0),
+            group=Group(name="staff", users=[]),
+        )
+        capability = Skills(lazy_from=LocalDirLazySkillSource(source=source))
+        manifest = capability.process_manifest(
+            _source_granted_manifest(workspace_root, source=src_root)
+        )
+        session = _ExecRecordingSkillsSession(manifest)
+        capability.bind(session)
+        tool = cast(FunctionTool, capability.tools()[0])
+
+        await tool.on_invoke_tool(
+            cast(ToolContext[object], None),
+            '{"skill_name":"dynamic-skill"}',
+        )
+
+        skill_dest = sandbox_path_str(workspace_root / ".agents" / "dynamic-skill")
+        assert ("chmod", "0700", skill_dest) in session.commands
+        assert ("chgrp", "staff", skill_dest) in session.commands
+        # The configured source entry must not be repointed at the loaded skill.
+        assert source.src == src_root
+
+    @pytest.mark.asyncio
+    async def test_lazy_local_dir_load_skill_keeps_default_permissions(
+        self, tmp_path: Path
+    ) -> None:
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        src_root = tmp_path / "skills"
+        skill_dir = src_root / "dynamic-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# dynamic skill\n", encoding="utf-8")
+
+        capability = Skills(
+            lazy_from=LocalDirLazySkillSource(source=LocalDir(src=src_root)),
+        )
+        manifest = capability.process_manifest(
+            _source_granted_manifest(workspace_root, source=src_root)
+        )
+        session = _ExecRecordingSkillsSession(manifest)
+        capability.bind(session)
+        tool = cast(FunctionTool, capability.tools()[0])
+
+        await tool.on_invoke_tool(
+            cast(ToolContext[object], None),
+            '{"skill_name":"dynamic-skill"}',
+        )
+
+        skill_dest = sandbox_path_str(workspace_root / ".agents" / "dynamic-skill")
+        assert ("chmod", "0755", skill_dest) in session.commands
+        assert not any(command[:1] == ("chgrp",) for command in session.commands)
+
 
 class TestSkillsLazyLoading:
+    @pytest.mark.asyncio
+    async def test_custom_lazy_result_is_unchanged_without_run_cwd(self) -> None:
+        expected = {"status": "loaded", "detail": "opaque"}
+        capability = Skills(lazy_from=_StaticResultLazySkillSource(result=expected))
+        capability.bind(scripted_sandbox_session(manifest=Manifest(root="/workspace")))
+
+        output = await capability.load_skill("dynamic-skill")
+
+        assert output == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("result", "reason"),
+        [
+            ({"status": "loaded"}, "missing"),
+            ({"status": "loaded", "path": "../escape"}, "invalid"),
+            ({"status": "loaded", "path": r".agents\dynamic-skill"}, "invalid"),
+        ],
+    )
+    async def test_custom_lazy_result_requires_valid_path_with_run_cwd(
+        self,
+        result: dict[str, str],
+        reason: str,
+    ) -> None:
+        capability = Skills(lazy_from=_StaticResultLazySkillSource(result=result))
+        capability.bind(scripted_sandbox_session(manifest=Manifest(root="/workspace")))
+        capability.bind_workspace_scope(SandboxWorkspaceScope.from_cwd("tasks/task-a"))
+
+        with pytest.raises(SkillsConfigError) as exc_info:
+            await capability.load_skill("dynamic-skill")
+
+        assert exc_info.value.message == (
+            "skill path must be non-empty and workspace-relative when sandbox.cwd is configured"
+        )
+        assert exc_info.value.context["skill_name"] == "dynamic-skill"
+        assert exc_info.value.context["field"] == "path"
+        assert exc_info.value.context["reason"] == reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "metadata_path",
+        [Path("../outside"), PureWindowsPath("../outside")],
+    )
+    async def test_custom_lazy_metadata_reports_invalid_scoped_path_as_config_error(
+        self,
+        metadata_path: PurePath,
+    ) -> None:
+        capability = Skills(
+            lazy_from=_StaticResultLazySkillSource(
+                result={"status": "loaded", "path": ".agents/dynamic-skill"},
+                metadata_path=metadata_path,
+            )
+        )
+        capability.bind_workspace_scope(SandboxWorkspaceScope.from_cwd("tasks/task-a"))
+
+        with pytest.raises(SkillsConfigError) as exc_info:
+            await capability.instructions(Manifest(root="/workspace"))
+
+        assert exc_info.value.message == (
+            "skill path must be non-empty and workspace-relative when sandbox.cwd is configured"
+        )
+        assert exc_info.value.context == {
+            "skill_name": "dynamic-skill",
+            "field": "path",
+            "path": "../outside",
+            "reason": "invalid",
+        }
+        assert isinstance(exc_info.value.cause, ValueError)
+
     def test_tools_returns_empty_without_lazy_source(self) -> None:
         capability = Skills(skills=[Skill(name="my-skill", description="desc", content="literal")])
 
@@ -567,7 +1270,11 @@ class TestSkillsLazyLoading:
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
         capability = Skills(lazy_from=LocalDirLazySkillSource(source=LocalDir(src=src_root)))
-        capability.bind(_SkillsSession(_source_granted_manifest(workspace_root, source=src_root)))
+        capability.bind(
+            scripted_sandbox_session(
+                manifest=_source_granted_manifest(workspace_root, source=src_root)
+            )
+        )
 
         tools = capability.tools()
 
@@ -708,8 +1415,10 @@ class TestSkillsLazyLoading:
             lazy_from=LocalDirLazySkillSource(source=LocalDir(src=tmp_path / "missing-skills"))
         )
         capability.bind(
-            _SkillsSession(
-                _source_granted_manifest(workspace_root, source=tmp_path / "missing-skills")
+            scripted_sandbox_session(
+                manifest=_source_granted_manifest(
+                    workspace_root, source=tmp_path / "missing-skills"
+                )
             )
         )
 
@@ -734,7 +1443,11 @@ class TestSkillsLazyLoading:
             encoding="utf-8",
         )
         capability = Skills(lazy_from=LocalDirLazySkillSource(source=LocalDir(src=src_root)))
-        capability.bind(_SkillsSession(_source_granted_manifest(workspace_root, source=src_root)))
+        capability.bind(
+            scripted_sandbox_session(
+                manifest=_source_granted_manifest(workspace_root, source=src_root)
+            )
+        )
 
         with pytest.raises(SkillsConfigError):
             await capability.load_skill("shared-skill")
@@ -763,7 +1476,11 @@ class TestSkillsLazyLoading:
         second_instructions = await capability.instructions(
             _source_granted_manifest(workspace_root, source=src_root)
         )
-        capability.bind(_SkillsSession(_source_granted_manifest(workspace_root, source=src_root)))
+        capability.bind(
+            scripted_sandbox_session(
+                manifest=_source_granted_manifest(workspace_root, source=src_root)
+            )
+        )
         third_instructions = await capability.instructions(
             _source_granted_manifest(workspace_root, source=src_root)
         )
@@ -776,3 +1493,48 @@ class TestSkillsLazyLoading:
             "- cached-skill: old description (file: .agents/dynamic-skill)" in second_instructions
         )
         assert "- cached-skill: new description (file: .agents/dynamic-skill)" in third_instructions
+
+    @pytest.mark.asyncio
+    async def test_lazy_metadata_cache_is_invalidated_when_host_path_changes(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        src_root = tmp_path / "skills"
+        skill_dir = src_root / "dynamic-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: cached-skill\ndescription: cached description\n---\n# Skill\n",
+            encoding="utf-8",
+        )
+        other_root = tmp_path / "other-skills"
+        other_root.mkdir()
+        capability = Skills(lazy_from=LocalDirLazySkillSource(source=LocalDir(src=src_root)))
+
+        first_instructions = await capability.instructions(
+            Manifest(
+                root="/workspace",
+                extra_path_grants=(
+                    SandboxPathGrant(
+                        path="/mnt/skills",
+                        host_path=str(src_root),
+                    ),
+                ),
+            )
+        )
+        second_instructions = await capability.instructions(
+            Manifest(
+                root="/workspace",
+                extra_path_grants=(
+                    SandboxPathGrant(
+                        path="/mnt/skills",
+                        host_path=str(other_root),
+                    ),
+                ),
+            )
+        )
+
+        assert first_instructions is not None
+        assert (
+            "- cached-skill: cached description (file: .agents/dynamic-skill)" in first_instructions
+        )
+        assert second_instructions is None

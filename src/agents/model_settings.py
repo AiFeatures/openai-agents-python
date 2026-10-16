@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 from collections.abc import Mapping
 from dataclasses import fields, replace
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias, cast
@@ -10,7 +9,7 @@ from openai._types import Body, Query
 from openai.types.responses import ResponseIncludable
 from openai.types.responses.response_create_params import ContextManagement, PromptCacheOptions
 from openai.types.shared import Reasoning
-from pydantic import BaseModel, GetCoreSchemaHandler
+from pydantic import Field, FiniteFloat, GetCoreSchemaHandler, TypeAdapter
 from pydantic.dataclasses import dataclass
 from pydantic_core import core_schema
 
@@ -82,6 +81,7 @@ _TRACEABLE_MODEL_SETTING_FIELDS = (
     "retry",
     "context_management",
     "prompt_cache_options",
+    "timeout",
 )
 
 
@@ -144,7 +144,8 @@ class ModelSettings:
     store: bool | None = None
     """Whether to store the generated model response for later retrieval.
     For Responses API: automatically enabled when not specified.
-    For Chat Completions API: disabled when not specified."""
+    For Chat Completions API: enabled when not specified for the official OpenAI API, and
+    omitted for other providers so their own default applies."""
 
     prompt_cache_retention: Literal["in_memory", "24h"] | None = None
     """The retention policy for the prompt cache. Set to `24h` to enable extended
@@ -201,6 +202,24 @@ class ModelSettings:
     control which prompt prefixes are eligible for caching.
     """
 
+    preserve_raw_usage: bool | None = None
+    """Whether to preserve the provider usage payload on completed model responses.
+
+    When enabled and the model adapter still has the unnormalized provider payload,
+    ``ModelResponse.raw_usage`` contains a JSON-compatible snapshot captured before the Agents
+    SDK normalizes missing usage fields. It remains ``None`` when usage is absent or upstream
+    normalization has already discarded field-presence information. This setting does not request
+    usage from the provider; use ``include_usage`` separately when a streaming provider requires it.
+    """
+
+    timeout: Annotated[FiniteFloat, Field(gt=0)] | None = None
+    """Maximum duration in seconds for each model-call attempt.
+
+    The timeout is enforced cooperatively through normal asyncio cancellation. It bounds the
+    complete model attempt, including transport waits, but does not replace provider-specific
+    phase timeout configuration or bound the full run, tool calls, or retry backoff.
+    """
+
     if TYPE_CHECKING:
 
         def __init__(
@@ -228,6 +247,8 @@ class ModelSettings:
             retry: ModelRetrySettings | dict[str, Any] | None = None,
             context_management: list[ContextManagement] | None = None,
             prompt_cache_options: PromptCacheOptions | None = None,
+            preserve_raw_usage: bool | None = None,
+            timeout: Annotated[FiniteFloat, Field(gt=0)] | None = None,
         ) -> None: ...
 
     def resolve(self, override: ModelSettings | dict[str, Any] | None) -> ModelSettings:
@@ -268,11 +289,16 @@ class ModelSettings:
         return replace(self, **changes)
 
     def to_json_dict(self) -> dict[str, Any]:
-        dataclass_dict = dataclasses.asdict(self)
+        return cast(dict[str, Any], TypeAdapter(ModelSettings).dump_python(self, mode="json"))
 
     def to_traceable_dict(self) -> dict[str, Any]:
         """Serialize settings for tracing without provider-specific request extras."""
-        payload = self.to_json_dict()
+        payload = cast(
+            dict[str, Any],
+            TypeAdapter(ModelSettings).dump_python(
+                self, mode="json", include=set(_TRACEABLE_MODEL_SETTING_FIELDS)
+            ),
+        )
         return {key: payload[key] for key in _TRACEABLE_MODEL_SETTING_FIELDS if key in payload}
 
 
@@ -362,4 +388,29 @@ def _merge_retry_settings(
     if override is None:
         return inherited
 
-        return json_dict
+    merged_backoff = _merge_backoff_settings(inherited.backoff, override.backoff)
+    retry_changes = {
+        field.name: getattr(override, field.name)
+        for field in fields(inherited)
+        if field.name != "backoff" and getattr(override, field.name) is not None
+    }
+    return replace(inherited, **retry_changes, backoff=merged_backoff)
+
+
+def _merge_backoff_settings(
+    inherited: ModelRetryBackoffInput | None,
+    override: ModelRetryBackoffInput | None,
+) -> ModelRetryBackoffSettings | None:
+    inherited = _coerce_backoff_settings(inherited)
+    override = _coerce_backoff_settings(override)
+    if inherited is None:
+        return override
+    if override is None:
+        return inherited
+
+    changes = {
+        field.name: getattr(override, field.name)
+        for field in fields(inherited)
+        if getattr(override, field.name) is not None
+    }
+    return replace(inherited, **changes)

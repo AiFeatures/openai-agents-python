@@ -3,13 +3,49 @@
 import asyncio
 import sqlite3
 import tempfile
+import threading
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
 from agents import Agent, RunConfig, Runner, SessionSettings, SQLiteSession, TResponseInputItem
-from tests.fake_model import FakeModel
+from agents.memory.sqlite_session import _await_mutation
+from agents.testing import ScriptedModel
 from tests.test_responses import get_text_message
+
+
+@pytest.mark.asyncio
+async def test_await_mutation_cancellation_hides_later_failure_without_loop_error() -> None:
+    """A failed mutation must not leak a false loop error after caller cancellation."""
+    mutation_started = asyncio.Event()
+    allow_failure = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    previous_exception_handler = loop.get_exception_handler()
+    loop_errors: list[dict[str, Any]] = []
+
+    async def mutation() -> None:
+        mutation_started.set()
+        await allow_failure.wait()
+        raise RuntimeError("mutation failed")
+
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    task = asyncio.create_task(_await_mutation(mutation()))
+    try:
+        await mutation_started.wait()
+        task.cancel("caller-cancelled")
+        allow_failure.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+        assert loop_errors == []
+    finally:
+        loop.set_exception_handler(previous_exception_handler)
+        allow_failure.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 # Helper functions for parametrized testing of different Runner methods
@@ -59,11 +95,11 @@ async def test_session_memory_basic_functionality_parametrized(runner_method):
         session_id = "test_session_123"
         session = SQLiteSession(session_id, db_path)
 
-        model = FakeModel()
+        model = ScriptedModel()
         agent = Agent(name="test", model=model)
 
         # First turn
-        model.set_next_output([get_text_message("San Francisco")])
+        model.enqueue([get_text_message("San Francisco")])
         result1 = await run_agent_async(
             runner_method,
             agent,
@@ -73,7 +109,7 @@ async def test_session_memory_basic_functionality_parametrized(runner_method):
         assert result1.final_output == "San Francisco"
 
         # Second turn - should have conversation history
-        model.set_next_output([get_text_message("California")])
+        model.enqueue([get_text_message("California")])
         result2 = await run_agent_async(
             runner_method,
             agent,
@@ -84,7 +120,7 @@ async def test_session_memory_basic_functionality_parametrized(runner_method):
 
         # Verify that the input to the second turn includes the previous conversation
         # The model should have received the full conversation history
-        last_input = model.last_turn_args["input"]
+        last_input = model.calls[-1].input
         assert len(last_input) > 1  # Should have more than just the current message
 
         session.close()
@@ -99,16 +135,16 @@ async def test_session_memory_with_explicit_instance_parametrized(runner_method)
         session_id = "test_session_456"
         session = SQLiteSession(session_id, db_path)
 
-        model = FakeModel()
+        model = ScriptedModel()
         agent = Agent(name="test", model=model)
 
         # First turn
-        model.set_next_output([get_text_message("Hello")])
+        model.enqueue([get_text_message("Hello")])
         result1 = await run_agent_async(runner_method, agent, "Hi there", session=session)
         assert result1.final_output == "Hello"
 
         # Second turn
-        model.set_next_output([get_text_message("I remember you said hi")])
+        model.enqueue([get_text_message("I remember you said hi")])
         result2 = await run_agent_async(
             runner_method,
             agent,
@@ -124,21 +160,21 @@ async def test_session_memory_with_explicit_instance_parametrized(runner_method)
 @pytest.mark.asyncio
 async def test_session_memory_disabled_parametrized(runner_method):
     """Test that session memory is disabled when session=None across all runner methods."""
-    model = FakeModel()
+    model = ScriptedModel()
     agent = Agent(name="test", model=model)
 
     # First turn (no session parameters = disabled)
-    model.set_next_output([get_text_message("Hello")])
+    model.enqueue([get_text_message("Hello")])
     result1 = await run_agent_async(runner_method, agent, "Hi there")
     assert result1.final_output == "Hello"
 
     # Second turn - should NOT have conversation history
-    model.set_next_output([get_text_message("I don't remember")])
+    model.enqueue([get_text_message("I don't remember")])
     result2 = await run_agent_async(runner_method, agent, "Do you remember what I said?")
     assert result2.final_output == "I don't remember"
 
     # Verify that the input to the second turn is just the current message
-    last_input = model.last_turn_args["input"]
+    last_input = model.calls[-1].input
     assert len(last_input) == 1  # Should only have the current message
 
 
@@ -150,14 +186,14 @@ async def test_session_memory_different_sessions_parametrized(runner_method):
     with tempfile.TemporaryDirectory() as temp_dir:
         db_path = Path(temp_dir) / "test_memory.db"
 
-        model = FakeModel()
+        model = ScriptedModel()
         agent = Agent(name="test", model=model)
 
         # Session 1
         session_id_1 = "session_1"
         session_1 = SQLiteSession(session_id_1, db_path)
 
-        model.set_next_output([get_text_message("I like cats")])
+        model.enqueue([get_text_message("I like cats")])
         result1 = await run_agent_async(runner_method, agent, "I like cats", session=session_1)
         assert result1.final_output == "I like cats"
 
@@ -165,12 +201,12 @@ async def test_session_memory_different_sessions_parametrized(runner_method):
         session_id_2 = "session_2"
         session_2 = SQLiteSession(session_id_2, db_path)
 
-        model.set_next_output([get_text_message("I like dogs")])
+        model.enqueue([get_text_message("I like dogs")])
         result2 = await run_agent_async(runner_method, agent, "I like dogs", session=session_2)
         assert result2.final_output == "I like dogs"
 
         # Back to Session 1 - should remember cats, not dogs
-        model.set_next_output([get_text_message("Yes, you mentioned cats")])
+        model.enqueue([get_text_message("Yes, you mentioned cats")])
         result3 = await run_agent_async(
             runner_method,
             agent,
@@ -231,6 +267,147 @@ async def test_sqlite_session_close_closes_worker_thread_connections():
         assert session._connections == set()
         with pytest.raises(sqlite3.ProgrammingError):
             connections[0].execute("SELECT 1")
+
+
+def test_sqlite_session_reaps_connections_from_exited_worker_threads():
+    """Test that a session closes connections owned by exited worker threads."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "exited_worker_threads.db"
+        session = SQLiteSession("exited_worker_threads", db_path)
+
+        try:
+            # Each asyncio.run shuts down its default executor, so the worker that served
+            # the session exits and its connection is unreachable from the next turn on.
+            asyncio.run(session.add_items([{"role": "user", "content": "turn 0"}]))
+            (abandoned,) = session._connections
+
+            for turn in range(1, 5):
+                asyncio.run(session.add_items([{"role": "user", "content": f"turn {turn}"}]))
+                assert len(session._connections) == 1
+
+            assert abandoned not in session._connections
+            with pytest.raises(sqlite3.ProgrammingError):
+                abandoned.execute("SELECT 1")
+
+            items = asyncio.run(session.get_items())
+            assert [item["content"] for item in items] == [f"turn {turn}" for turn in range(5)]
+        finally:
+            session.close()
+
+
+def test_sqlite_session_closes_retired_connections_before_the_next_allocation(monkeypatch):
+    """Test that connections left by a burst of retired workers close before the next one opens."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "retired_workers.db"
+        session = SQLiteSession("retired_workers", db_path)
+        # Each worker holds at the barrier until all of them have registered a
+        # connection, so they retire together instead of one at a time.
+        registered = threading.Barrier(3)
+
+        def serve_one_turn(index: int) -> None:
+            async def turn() -> None:
+                await session.add_items([{"role": "user", "content": f"worker {index}"}])
+                await asyncio.to_thread(registered.wait)
+
+            # asyncio.run waits for its executor to shut down, so this worker has
+            # exited by the time the thread is joined.
+            asyncio.run(turn())
+
+        workers = [threading.Thread(target=serve_one_turn, args=(index,)) for index in range(3)]
+        try:
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=5)
+                assert not worker.is_alive()
+
+            retired = list(session._connections)
+            assert len(retired) == 3
+
+            def still_open() -> int:
+                open_count = 0
+                for connection in retired:
+                    try:
+                        connection.execute("SELECT 1")
+                    except sqlite3.ProgrammingError:
+                        continue
+                    open_count += 1
+                return open_count
+
+            retired_open_at_allocation: list[int] = []
+            connect = sqlite3.connect
+
+            def recording_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+                retired_open_at_allocation.append(still_open())
+                return connect(*args, **kwargs)
+
+            with monkeypatch.context() as allocation:
+                allocation.setattr(sqlite3, "connect", recording_connect)
+                asyncio.run(session.add_items([{"role": "user", "content": "after they retired"}]))
+
+            # The replacement connection must not be allocated while the retired ones
+            # still hold their descriptors.
+            assert retired_open_at_allocation == [0]
+            assert len(session._connections) == 1
+
+            # The workers write concurrently, so only the final turn has a fixed position.
+            contents = [item["content"] for item in asyncio.run(session.get_items())]
+            assert sorted(contents[:-1]) == ["worker 0", "worker 1", "worker 2"]
+            assert contents[-1] == "after they retired"
+        finally:
+            registered.abort()
+            for worker in workers:
+                worker.join(timeout=5)
+            session.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_session_keeps_connections_of_live_worker_threads():
+    """Test that connections owned by running worker threads are never closed."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "live_worker_threads.db"
+        session = SQLiteSession("live_worker_threads", db_path)
+        # A second running loop has its own default executor, so its worker is a
+        # different thread that stays alive for as long as that loop does.
+        other_loop = asyncio.new_event_loop()
+        other_thread = threading.Thread(target=other_loop.run_forever)
+        other_thread.start()
+
+        try:
+            asyncio.run_coroutine_threadsafe(
+                session.add_items([{"role": "user", "content": "from the other loop"}]),
+                other_loop,
+            ).result(timeout=5)
+            (held,) = session._connections
+
+            # Registering from this loop's worker sweeps while the other worker lives.
+            await session.add_items([{"role": "user", "content": "from this loop"}])
+
+            assert held in session._connections
+            held.execute("SELECT 1").fetchone()
+
+            items = await session.get_items()
+            assert [item["content"] for item in items] == [
+                "from the other loop",
+                "from this loop",
+            ]
+        finally:
+            other_loop.call_soon_threadsafe(other_loop.stop)
+            other_thread.join(timeout=5)
+            other_loop.close()
+            session.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_session_closed_rejects_empty_add_items():
+    """add_items([]) must not bypass the closed check through the empty-list fast path."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "closed_empty_add.db"
+        session = SQLiteSession("closed_empty_add_test", db_path)
+        session.close()
+
+        with pytest.raises(RuntimeError, match="SQLiteSession is closed"):
+            await session.add_items([])
 
 
 @pytest.mark.asyncio
@@ -430,6 +607,67 @@ async def test_sqlite_session_get_items_with_limit():
         session.close()
 
 
+@pytest.mark.asyncio
+async def test_sqlite_session_get_items_limit_skips_corrupt_newest_rows():
+    """limit counts valid items, expanding past corrupt newest rows."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_limit_corrupt.db"
+        session = SQLiteSession("limit_corrupt", db_path)
+
+        await session.add_items(
+            [
+                {"role": "user", "content": "valid 0"},
+                {"role": "assistant", "content": "valid 1"},
+                {"role": "user", "content": "valid 2"},
+            ]
+        )
+
+        with session._locked_connection() as conn:
+            conn.execute(
+                f"INSERT INTO {session.messages_table} (session_id, message_data) VALUES (?, ?)",
+                (session.session_id, "not valid json {{{"),
+            )
+            conn.commit()
+
+        # Newest row is corrupt; limit=2 should still return the two latest valid items.
+        limited = await session.get_items(limit=2)
+        assert [item.get("content") for item in limited] == ["valid 1", "valid 2"]
+
+        session.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_session_get_items_session_settings_limit_skips_corrupt_rows():
+    """session_settings.limit also counts valid items when newest rows are corrupt."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_settings_limit_corrupt.db"
+        session = SQLiteSession(
+            "settings_limit_corrupt",
+            db_path,
+            session_settings=SessionSettings(limit=2),
+        )
+
+        await session.add_items(
+            [
+                {"role": "user", "content": "valid 0"},
+                {"role": "assistant", "content": "valid 1"},
+                {"role": "user", "content": "valid 2"},
+            ]
+        )
+
+        with session._locked_connection() as conn:
+            conn.execute(
+                f"INSERT INTO {session.messages_table} (session_id, message_data) VALUES (?, ?)",
+                (session.session_id, "not valid json {{{"),
+            )
+            conn.commit()
+
+        limited = await session.get_items()
+        assert [item.get("content") for item in limited] == ["valid 1", "valid 2"]
+
+        session.close()
+
+
 @pytest.mark.parametrize("runner_method", ["run", "run_sync", "run_streamed"])
 @pytest.mark.asyncio
 async def test_session_memory_appends_list_input_by_default(runner_method):
@@ -439,7 +677,7 @@ async def test_session_memory_appends_list_input_by_default(runner_method):
         session_id = "test_validation_parametrized"
         session = SQLiteSession(session_id, db_path)
 
-        model = FakeModel()
+        model = ScriptedModel()
         agent = Agent(name="test", model=model)
 
         initial_history: list[TResponseInputItem] = [
@@ -450,10 +688,10 @@ async def test_session_memory_appends_list_input_by_default(runner_method):
 
         list_input = [{"role": "user", "content": "Test message"}]
 
-        model.set_next_output([get_text_message("This should run")])
+        model.enqueue([get_text_message("This should run")])
         await run_agent_async(runner_method, agent, list_input, session=session)
 
-        assert model.last_turn_args["input"] == initial_history + list_input
+        assert model.calls[-1].input == initial_history + list_input
 
         session.close()
 
@@ -465,7 +703,7 @@ async def test_session_callback_prepared_input(runner_method):
     with tempfile.TemporaryDirectory() as temp_dir:
         db_path = Path(temp_dir) / "test_memory.db"
 
-        model = FakeModel()
+        model = ScriptedModel()
         agent = Agent(name="test", model=model)
 
         # Session
@@ -485,7 +723,7 @@ async def test_session_callback_prepared_input(runner_method):
                 return [item for item in history if item["role"] == "user"] + new_input
 
             new_turn_input = [{"role": "user", "content": "What your name?"}]
-            model.set_next_output([get_text_message("I'm gpt-4o")])
+            model.enqueue([get_text_message("I'm gpt-4o")])
 
             # Run the agent with the callable
             await run_agent_async(
@@ -501,8 +739,45 @@ async def test_session_callback_prepared_input(runner_method):
                 new_turn_input[0],  # New input
             ]
 
-            assert len(model.last_turn_args["input"]) == 2
-            assert model.last_turn_args["input"] == expected_model_input
+            assert len(model.calls[-1].input) == 2
+            assert model.calls[-1].input == expected_model_input
+        finally:
+            session.close()
+
+
+@pytest.mark.parametrize("runner_method", ["run", "run_sync", "run_streamed"])
+@pytest.mark.asyncio
+async def test_session_callback_repeating_history_does_not_grow_session(runner_method):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_memory.db"
+        model = ScriptedModel()
+        agent = Agent(name="test", model=model)
+        session = SQLiteSession("session_repeat", db_path)
+
+        def repeat_first(history, new_input):
+            if not history:
+                return new_input
+            return history + [history[0]] + new_input
+
+        try:
+            for turn in range(3):
+                model.enqueue([get_text_message(f"assistant {turn}")])
+                await run_agent_async(
+                    runner_method,
+                    agent,
+                    f"user {turn}",
+                    session=session,
+                    run_config=RunConfig(session_input_callback=repeat_first),
+                )
+
+            stored = await session.get_items()
+            user_messages = [item for item in stored if item.get("role") == "user"]
+            assert [item.get("content") for item in user_messages] == [
+                "user 0",
+                "user 1",
+                "user 2",
+            ]
+            assert len(stored) == 6
         finally:
             session.close()
 
@@ -633,6 +908,40 @@ async def test_sqlite_session_file_lock_is_shared_across_instances():
 
 
 @pytest.mark.asyncio
+async def test_sqlite_session_failed_add_items_releases_write_lock():
+    """A failed add_items must not leave an open write transaction on the cached connection."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "test_rollback.db"
+        session = SQLiteSession("rollback_test", db_path)
+
+        # json.dumps() fails only after _insert_items() has already opened a write
+        # transaction with the sessions-table upsert.
+        unserializable = cast(TResponseInputItem, {"role": "user", "content": object()})
+        with pytest.raises(TypeError):
+            await session.add_items([unserializable])
+
+        # timeout=0 disables the busy handler, so this raises immediately if the failed
+        # write is still holding the SQLite write lock.
+        probe = sqlite3.connect(str(db_path), timeout=0)
+        try:
+            probe.execute("INSERT INTO agent_sessions (session_id) VALUES ('probe')")
+            probe.commit()
+            rolled_back = probe.execute(
+                "SELECT COUNT(*) FROM agent_sessions WHERE session_id = 'rollback_test'"
+            ).fetchone()[0]
+        finally:
+            probe.close()
+
+        assert rolled_back == 0
+
+        # The session must remain usable after the failure.
+        await session.add_items([{"role": "user", "content": "after failure"}])
+        assert [item.get("content") for item in await session.get_items()] == ["after failure"]
+
+        session.close()
+
+
+@pytest.mark.asyncio
 async def test_session_add_items_exception_propagates_in_streamed():
     """Test that exceptions from session.add_items are properly propagated
     in run_streamed instead of causing the stream to hang forever.
@@ -645,9 +954,9 @@ async def test_session_add_items_exception_propagates_in_streamed():
 
     session.add_items = _failing_add_items  # type: ignore[method-assign]
 
-    model = FakeModel()
+    model = ScriptedModel()
     agent = Agent(name="test", model=model)
-    model.set_next_output([get_text_message("This should not be reached")])
+    model.enqueue([get_text_message("This should not be reached")])
 
     result = Runner.run_streamed(agent, "Hello", session=session)
 
@@ -801,9 +1110,9 @@ async def test_runner_with_session_settings_override():
         ]
         await session.add_items(items)
 
-        model = FakeModel()
+        model = ScriptedModel()
         agent = Agent(name="test", model=model)
-        model.set_next_output([get_text_message("Got it")])
+        model.enqueue([get_text_message("Got it")])
 
         await Runner.run(
             agent,
@@ -815,10 +1124,220 @@ async def test_runner_with_session_settings_override():
         )
 
         # Verify the agent received only the last 2 history items + new question
-        last_input = model.last_turn_args["input"]
+        last_input = model.calls[-1].input
         # Filter out the new "New question" input
         history_items = [item for item in last_input if item.get("content") != "New question"]
         # Should have 2 history items (last two from the 10 we added)
         assert len(history_items) == 2
 
         session.close()
+
+
+def _drop_sqlite_table(db_path: Path, table: str) -> None:
+    """Drop a table from an independent connection to make a later statement fail."""
+    helper = sqlite3.connect(str(db_path))
+    try:
+        helper.execute(f"DROP TABLE {table}")
+        helper.commit()
+    finally:
+        helper.close()
+
+
+def _sqlite_write_lock_is_free(db_path: Path) -> bool:
+    """Return whether an independent writer can take the SQLite write lock."""
+    probe = sqlite3.connect(str(db_path), timeout=0)
+    try:
+        probe.execute("CREATE TABLE IF NOT EXISTS probe_lock (x INTEGER)")
+        probe.commit()
+        return True
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        probe.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_session_failed_clear_session_rolls_back():
+    """A failed clear must restore earlier statements and release the cached write lock."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "clear_rollback.db"
+        session = SQLiteSession("clear_rollback", db_path)
+        await session.add_items([{"role": "user", "content": "kept"}])
+
+        _drop_sqlite_table(db_path, "agent_sessions")
+
+        with pytest.raises(sqlite3.OperationalError):
+            await session.clear_session()
+
+        assert all(not conn.in_transaction for conn in session._connections)
+        assert _sqlite_write_lock_is_free(db_path)
+        session.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_session_failed_pop_item_releases_write_lock():
+    """A failed pop must not leave a write transaction on the cached connection."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "pop_rollback.db"
+        session = SQLiteSession("pop_rollback", db_path)
+        await session.add_items([{"role": "user", "content": "kept"}])
+
+        _drop_sqlite_table(db_path, "agent_messages")
+
+        with pytest.raises(sqlite3.OperationalError):
+            await session.pop_item()
+
+        assert all(not conn.in_transaction for conn in session._connections)
+        assert _sqlite_write_lock_is_free(db_path)
+        session.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_session_rollback_failure_evicts_connection(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A file connection that cannot roll back must be closed and replaced."""
+
+    class FailingRollbackConnection(sqlite3.Connection):
+        def rollback(self) -> None:
+            raise RuntimeError("rollback failed")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "rollback_failure.db"
+        session = SQLiteSession("rollback_failure", db_path)
+        conn = sqlite3.connect(
+            str(db_path),
+            check_same_thread=False,
+            factory=FailingRollbackConnection,
+        )
+        with session._connections_lock:
+            session._connections.add(conn)
+        real_get_connection = session._get_connection
+        monkeypatch.setattr(session, "_get_connection", lambda: conn)
+        unserializable = cast(TResponseInputItem, {"role": "user", "content": object()})
+
+        with pytest.raises(TypeError):
+            await session.add_items([unserializable])
+
+        assert conn not in session._connections
+        assert _sqlite_write_lock_is_free(db_path)
+
+        monkeypatch.setattr(session, "_get_connection", real_get_connection)
+        await session.add_items([{"role": "user", "content": "after failure"}])
+        assert [item.get("content") for item in await session.get_items()] == ["after failure"]
+        session.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_session_close_retries_quarantined_connection(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A failed invalidation close must remain owned until a later close succeeds."""
+
+    class FailingRollbackAndCloseConnection(sqlite3.Connection):
+        fail_close = True
+
+        def rollback(self) -> None:
+            raise RuntimeError("rollback failed")
+
+        def close(self) -> None:
+            if self.fail_close:
+                raise RuntimeError("close failed")
+            super().close()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "close_retry.db"
+        session = SQLiteSession("close_retry", db_path)
+        conn = sqlite3.connect(
+            str(db_path),
+            check_same_thread=False,
+            factory=FailingRollbackAndCloseConnection,
+        )
+        with session._connections_lock:
+            session._connections.add(conn)
+        monkeypatch.setattr(session, "_get_connection", lambda: conn)
+        unserializable = cast(TResponseInputItem, {"role": "user", "content": object()})
+
+        with pytest.raises(TypeError):
+            await session.add_items([unserializable])
+
+        assert session._closed is True
+        assert conn in session._quarantined_connections
+        assert _sqlite_write_lock_is_free(db_path) is False
+
+        conn.fail_close = False
+        session.close()
+
+        assert session._quarantined_connections == set()
+        assert _sqlite_write_lock_is_free(db_path)
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["add", "pop", "clear"])
+async def test_sqlite_session_post_commit_cancellation_propagates_after_known_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+):
+    """Cancellation after a worker commit must propagate without inviting a retry."""
+
+    class PausingCommitConnection(sqlite3.Connection):
+        pause_commit = False
+        commit_finished = threading.Event()
+        allow_return = threading.Event()
+
+        def commit(self) -> None:
+            super().commit()
+            if self.pause_commit:
+                self.pause_commit = False
+                self.commit_finished.set()
+                assert self.allow_return.wait(timeout=10)
+
+    db_path = tmp_path / f"post_commit_{operation}.db"
+    session = SQLiteSession(f"post_commit_{operation}", db_path)
+    item: TResponseInputItem = {"role": "user", "content": "once"}
+    if operation != "add":
+        await session.add_items([item])
+
+    conn = sqlite3.connect(
+        str(db_path),
+        check_same_thread=False,
+        factory=PausingCommitConnection,
+    )
+    with session._connections_lock:
+        session._connections.add(conn)
+    monkeypatch.setattr(session, "_get_connection", lambda: conn)
+    conn.pause_commit = True
+
+    if operation == "add":
+        mutation: asyncio.Task[Any] = asyncio.create_task(session.add_items([item]))
+    elif operation == "pop":
+        mutation = asyncio.create_task(session.pop_item())
+    else:
+        mutation = asyncio.create_task(session.clear_session())
+
+    try:
+        assert await asyncio.to_thread(conn.commit_finished.wait, 10)
+        mutation.cancel()
+        await asyncio.sleep(0)
+        mutation.cancel()
+        await asyncio.sleep(0)
+        conn.allow_return.set()
+        with pytest.raises(asyncio.CancelledError):
+            await mutation
+    finally:
+        conn.allow_return.set()
+        if not mutation.done():
+            mutation.cancel()
+            await asyncio.gather(mutation, return_exceptions=True)
+
+    if operation == "add":
+        assert await session.get_items() == [item]
+    elif operation == "pop":
+        assert await session.get_items() == []
+    else:
+        assert await session.get_items() == []
+    assert mutation.cancelled()
+    session.close()

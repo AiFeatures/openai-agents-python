@@ -6,7 +6,6 @@ Features:
 * Auto mode (``EXAMPLES_INTERACTIVE_MODE=auto``) enables deterministic inputs,
   auto-approvals, and turns on interactive examples by default.
 * Writes per-example logs to ``.tmp/examples-start-logs`` and a main summary log.
-* Generates a rerun list of failures at ``.tmp/examples-rerun.txt``.
 """
 
 from __future__ import annotations
@@ -36,7 +35,6 @@ MAIN_PATTERN = re.compile(r"__name__\s*==\s*['\"]__main__['\"]")
 
 LOG_DIR_DEFAULT = ROOT_DIR / ".tmp" / "examples-start-logs"
 ARTIFACTS_DIR_DEFAULT = ROOT_DIR / ".tmp" / "examples-artifacts"
-RERUN_FILE_DEFAULT = ROOT_DIR / ".tmp" / "examples-rerun.txt"
 DEFAULT_MAIN_LOG = LOG_DIR_DEFAULT / f"main_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
 REDIS_SESSION_EXAMPLE = "examples/memory/redis_session_example.py"
 DAPR_SESSION_EXAMPLE = "examples/memory/dapr_session_example.py"
@@ -61,6 +59,8 @@ DEFAULT_AUTO_SKIP = {
     "examples/agent_patterns/llm_as_a_judge.py",
     "examples/hosted_mcp/connectors.py",
     "examples/mcp/git_example/main.py",
+    # Dapr setup requires separate PostgreSQL credentials.
+    "examples/memory/dapr_session_example.py",
     # These are helper daemons or multi-process components exercised by sibling examples.
     "examples/mcp/manager_example/app.py",
     "examples/mcp/manager_example/mcp_server.py",
@@ -68,20 +68,37 @@ DEFAULT_AUTO_SKIP = {
     "examples/mcp/sse_example/server.py",
     "examples/mcp/streamablehttp_custom_client_example/server.py",
     "examples/mcp/streamablehttp_example/server.py",
+    # These provider examples default to OpenRouter and require its API key.
+    "examples/model_providers/any_llm_auto.py",
+    "examples/model_providers/any_llm_provider.py",
     "examples/model_providers/custom_example_agent.py",
     "examples/model_providers/custom_example_global.py",
     "examples/model_providers/custom_example_provider.py",
+    "examples/model_providers/litellm_auto.py",
+    "examples/model_providers/litellm_provider.py",
+    "examples/reasoning_content/gpt_oss_stream.py",
     "examples/realtime/app/server.py",
     "examples/realtime/cli/demo.py",
     "examples/realtime/twilio/server.py",
     "examples/sandbox/misc/reference_policy_mcp_server.py",
     "examples/sandbox/docker/mounts/azure_mount_read_write.py",
     "examples/sandbox/docker/mounts/gcs_mount_read_write.py",
-    "examples/sandbox/docker/mounts/s3_files_mount_read_write.py",
     "examples/sandbox/docker/mounts/s3_mount_read_write.py",
+    # Blaxel 0.3.2 still imports an MCP v1 module that was removed in MCP v2.
+    "examples/sandbox/extensions/blaxel_runner.py",
+    "examples/sandbox/extensions/cloudflare_runner.py",
+    # Cloud backends require provider credentials in addition to OPENAI_API_KEY.
+    "examples/sandbox/extensions/daytona/daytona_runner.py",
+    "examples/sandbox/extensions/daytona/usaspending_text2sql/agent.py",
     "examples/sandbox/extensions/daytona/usaspending_text2sql/setup_db.py",
+    "examples/sandbox/extensions/e2b_runner.py",
+    "examples/sandbox/extensions/modal_runner.py",
+    "examples/sandbox/extensions/runloop/capabilities.py",
+    "examples/sandbox/extensions/runloop/runner.py",
+    # This local workflow gives model-selected shell commands access to the host.
+    "examples/sandbox/extensions/temporal/local_hello_workflow.py",
     "examples/sandbox/extensions/temporal/temporal_sandbox_agent.py",
-    # Temporarily disabled due to credential issues.
+    # Vercel also requires its own provider credentials.
     "examples/sandbox/extensions/vercel_runner.py",
     "examples/sandbox/memory_s3.py",
     "examples/sandbox/sandbox_agent_with_remote_snapshot.py",
@@ -93,6 +110,10 @@ DEFAULT_AUTO_SKIP = {
     "examples/sandbox/tutorials/repo_code_review/main.py",
     "examples/sandbox/tutorials/vision_website_clone/main.py",
     "examples/tools/codex_same_thread.py",
+    # Host shell execution requires a person to review every command batch.
+    "examples/tools/local_shell_skill.py",
+    "examples/tools/shell.py",
+    "examples/tools/shell_human_in_the_loop.py",
     "examples/voice/static/main.py",
     "examples/voice/streamed/main.py",
 }
@@ -115,7 +136,11 @@ class ExampleScript:
     @property
     def command(self) -> list[str]:
         # Run via module path so relative imports inside examples work.
-        return [*build_uv_run_command(), "python", "-u", "-m", self.module]
+        command = build_uv_run_command()
+        if self.relpath.startswith("examples/decisions/"):
+            # These recipes need the native Decisions resource without changing the lockfile.
+            command.extend(["--with", "openai>=3.26.0,<4"])
+        return [*command, "python", "-u", "-m", self.module]
 
 
 @dataclass
@@ -232,11 +257,15 @@ def choose_loopback_port() -> int:
 
 
 def redis_url_host_port(url: str) -> tuple[str, int] | None:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"redis", "rediss"}:
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"redis", "rediss"}:
+            return None
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 6379
+    except ValueError:
+        # Leave invalid configuration to the example without logging URL parser errors.
         return None
-    host = parsed.hostname or "localhost"
-    port = parsed.port or 6379
     return host, port
 
 
@@ -352,11 +381,11 @@ def prepare_redis_for_example(
     redis_url = configured_url or DEFAULT_REDIS_URL
     if redis_url_is_local(redis_url) and redis_ping_url(redis_url):
         env["REDIS_URL"] = redis_url
-        return None, [f"Using existing Redis server at {redis_url}."]
+        return None, ["Using existing local Redis server."]
 
     if configured_url:
         env["REDIS_URL"] = redis_url
-        return None, [f"REDIS_URL is set but not reachable before example start: {redis_url}."]
+        return None, ["Using configured REDIS_URL; local preflight did not confirm availability."]
 
     server = start_temporary_redis_server()
     if server is None:
@@ -422,23 +451,6 @@ def parse_args() -> argparse.Namespace:
         help="Directory for example-generated artifacts.",
     )
     parser.add_argument(
-        "--rerun-file",
-        help="Only run examples listed in this file (one relative path per line).",
-    )
-    parser.add_argument(
-        "--write-rerun",
-        action="store_true",
-        help="Write failures to .tmp/examples-rerun.txt after the run.",
-    )
-    parser.add_argument(
-        "--collect",
-        help="Parse a previous main log to emit a rerun list instead of running examples.",
-    )
-    parser.add_argument(
-        "--output",
-        help="Output path for --collect rerun list (defaults to stdout).",
-    )
-    parser.add_argument(
         "--print-auto-skip",
         action="store_true",
         help="Show the current auto-skip list and exit.",
@@ -472,6 +484,8 @@ def detect_tags(path: Path, source: str) -> set[str]:
         re.search(r"\binput\s*\(", source)
         or "input_with_fallback(" in lower_source
         or "confirm_with_fallback(" in lower_source
+        or "on_shell_approval" in lower_source
+        or "prompt_shell_approval" in lower_source
     ):
         tags.add("interactive")
     if "prompt_toolkit" in lower_source or "questionary" in lower_source:
@@ -591,24 +605,6 @@ def artifact_dir_for_example(relpath: str, artifacts_dir: Path) -> Path:
     return artifacts_dir / stem.replace("/", "__")
 
 
-def parse_rerun_from_log(log_path: Path) -> list[str]:
-    if not log_path.exists():
-        raise FileNotFoundError(log_path)
-    rerun: list[str] = []
-    with log_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            parts = stripped.split()
-            if len(parts) < 2:
-                continue
-            status, relpath = parts[0].upper(), parts[1]
-            if status in {"FAILED", "ERROR", "UNKNOWN"}:
-                rerun.append(normalize_relpath(relpath))
-    return rerun
-
-
 def run_examples(examples: Sequence[ExampleScript], args: argparse.Namespace) -> int:
     overrides: set[str] = set()
     if args.include_interactive or env_flag("EXAMPLES_INCLUDE_INTERACTIVE"):
@@ -632,8 +628,6 @@ def run_examples(examples: Sequence[ExampleScript], args: argparse.Namespace) ->
     ensure_dirs(logs_dir, is_file=False)
     ensure_dirs(artifacts_dir, is_file=False)
     ensure_dirs(main_log_path, is_file=True)
-    rerun_entries: list[str] = []
-
     if not examples:
         print("No example entry points found that match the filters.")
         return 0
@@ -676,7 +670,6 @@ def run_examples(examples: Sequence[ExampleScript], args: argparse.Namespace) ->
         if auto_mode:
             env["EXAMPLES_INTERACTIVE_MODE"] = "auto"
             env["APPLY_PATCH_AUTO_APPROVE"] = "1"
-            env.setdefault("SHELL_AUTO_APPROVE", "1")
             env.setdefault("AUTO_APPROVE_MCP", "1")
 
         force_prompt_stream = (not auto_mode) and ("interactive" in example.tags)
@@ -840,17 +833,7 @@ def run_examples(examples: Sequence[ExampleScript], args: argparse.Namespace) ->
                 executed += 1
             elif result.status == "failed":
                 failed += 1
-                rerun_entries.append(ex.relpath)
         safe_write_main(f"# summary executed={executed} skipped={skipped} failed={failed}")
-
-    if args.write_rerun:
-        ensure_dirs(RERUN_FILE_DEFAULT, is_file=True)
-        if rerun_entries:
-            contents = "\n".join(rerun_entries) + "\n"
-        else:
-            contents = ""
-        RERUN_FILE_DEFAULT.write_text(contents, encoding="utf-8")
-        print(f"Wrote rerun list to {RERUN_FILE_DEFAULT}")
 
     print(f"Main log: {main_log_path}")
     print(f"Done. Ran {executed} example(s), skipped {skipped}, failed {failed}.")
@@ -881,31 +864,7 @@ def main() -> int:
             print(entry)
         return 0
 
-    if args.collect:
-        paths = parse_rerun_from_log(Path(args.collect))
-        if args.output:
-            out = Path(args.output)
-            ensure_dirs(out, is_file=True)
-            out.write_text("\n".join(paths) + "\n", encoding="utf-8")
-            print(f"Wrote {len(paths)} entries to {out}")
-        else:
-            for p in paths:
-                print(p)
-        return 0
-
     examples = discover_examples(args.filter)
-    if args.rerun_file:
-        rerun_set = {
-            line.strip()
-            for line in Path(args.rerun_file).read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        }
-        examples = [ex for ex in examples if ex.relpath in rerun_set]
-        if not examples:
-            print("Rerun list is empty; nothing to do.")
-            return 0
-        print(f"Rerun mode: {len(examples)} example(s) from {args.rerun_file}")
-
     return run_examples(examples, args)
 
 

@@ -37,7 +37,11 @@ from agents.handoffs import (
     reset_conversation_history_wrappers,
     set_conversation_history_wrappers,
 )
-from agents.handoffs.history import _get_nested_history_owned_items
+from agents.handoffs.history import (
+    _extract_nested_history_transcript,
+    _get_nested_history_owned_items,
+    get_conversation_history_wrappers,
+)
 from agents.items import (
     HandoffCallItem,
     HandoffOutputItem,
@@ -48,6 +52,7 @@ from agents.items import (
     ToolCallOutputItem,
     TResponseInputItem,
 )
+from agents.models.chatcmpl_converter import Converter
 from agents.result import RunResult, RunResultStreaming
 from agents.run_internal.items import (
     NestedHistoryOwnedItem,
@@ -57,8 +62,9 @@ from agents.run_internal.items import (
 from agents.run_internal.session_persistence import (
     resolve_nested_history_owned_session_item_refs,
 )
+from agents.testing import ScriptedModel
 
-from .fake_model import FakeModel
+from .model_test_helpers import get_exact_output_stream_step
 from .test_responses import get_function_tool_call, get_handoff_tool_call, get_text_message
 from .utils.simple_session import SimpleListSession
 
@@ -522,16 +528,14 @@ class TestHandoffHistoryDuplicationFix:
 
 @pytest.mark.asyncio
 async def test_to_input_list_normalized_uses_filtered_continuation_after_nested_handoff() -> None:
-    triage_model = FakeModel()
-    delegate_model = FakeModel()
+    triage_model = ScriptedModel()
+    delegate_model = ScriptedModel()
 
     delegate = Agent(name="delegate", model=delegate_model)
     triage = Agent(name="triage", model=triage_model, handoffs=[delegate])
 
-    triage_model.add_multiple_turn_outputs(
-        [[get_text_message("triage summary"), get_handoff_tool_call(delegate)]]
-    )
-    delegate_model.add_multiple_turn_outputs(
+    triage_model.extend([[get_text_message("triage summary"), get_handoff_tool_call(delegate)]])
+    delegate_model.extend(
         [
             [get_text_message("resolution")],
             [get_text_message("followup answer")],
@@ -561,13 +565,13 @@ async def test_to_input_list_normalized_uses_filtered_continuation_after_nested_
     assert "function_call" not in normalized_types
     assert "function_call_output" not in normalized_types
 
-    replay_model = FakeModel()
+    replay_model = ScriptedModel()
     replay_agent = Agent(name="replay", model=replay_model)
-    replay_model.add_multiple_turn_outputs([[get_text_message("replayed")]])
+    replay_model.extend([[get_text_message("replayed")]])
     replay_result = await Runner.run(replay_agent, input=preserve_all_input)
 
-    assert replay_model.first_turn_args is not None
-    replay_input = replay_model.first_turn_args["input"]
+    assert bool(replay_model.calls)
+    replay_input = replay_model.calls[0].input
     assert isinstance(replay_input, list)
     assert sum(_input_item_text(item) == "triage summary" for item in replay_input) == 1
     assert replay_result.final_output == "replayed"
@@ -576,7 +580,7 @@ async def test_to_input_list_normalized_uses_filtered_continuation_after_nested_
     follow_up_result = await Runner.run(delegate, input=follow_up_input)
 
     assert follow_up_result.final_output == "followup answer"
-    assert delegate_model.last_turn_args["input"] == follow_up_input
+    assert delegate_model.calls[-1].input == follow_up_input
 
 
 @pytest.mark.asyncio
@@ -584,8 +588,8 @@ async def test_to_input_list_normalized_keeps_delegate_tool_items_after_nested_h
     async def lookup_weather(city: str) -> str:
         return f"weather:{city}"
 
-    triage_model = FakeModel()
-    delegate_model = FakeModel()
+    triage_model = ScriptedModel()
+    delegate_model = ScriptedModel()
 
     delegate = Agent(
         name="delegate",
@@ -594,10 +598,8 @@ async def test_to_input_list_normalized_keeps_delegate_tool_items_after_nested_h
     )
     triage = Agent(name="triage", model=triage_model, handoffs=[delegate])
 
-    triage_model.add_multiple_turn_outputs(
-        [[get_text_message("triage summary"), get_handoff_tool_call(delegate)]]
-    )
-    delegate_model.add_multiple_turn_outputs(
+    triage_model.extend([[get_text_message("triage summary"), get_handoff_tool_call(delegate)]])
+    delegate_model.extend(
         [
             [
                 get_text_message("delegate preamble"),
@@ -653,8 +655,8 @@ async def test_to_input_list_normalized_uses_custom_filter_input_items() -> None
             )
         )
 
-    triage_model = FakeModel()
-    delegate_model = FakeModel()
+    triage_model = ScriptedModel()
+    delegate_model = ScriptedModel()
 
     delegate = Agent(name="delegate", model=delegate_model)
     triage = Agent(
@@ -663,10 +665,8 @@ async def test_to_input_list_normalized_uses_custom_filter_input_items() -> None
         handoffs=[handoff(delegate, input_filter=keep_messages_only)],
     )
 
-    triage_model.add_multiple_turn_outputs(
-        [[get_text_message("triage summary"), get_handoff_tool_call(delegate)]]
-    )
-    delegate_model.add_multiple_turn_outputs([[get_text_message("resolution")]])
+    triage_model.extend([[get_text_message("triage summary"), get_handoff_tool_call(delegate)]])
+    delegate_model.extend([[get_text_message("resolution")]])
 
     result = await Runner.run(triage, input="user_question")
     preserve_all_input = result.to_input_list()
@@ -696,18 +696,16 @@ async def test_non_nested_filtered_handoff_does_not_add_occurrence_lineage(
     def identity_filter(data: HandoffInputData) -> HandoffInputData:
         return data
 
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(
         name="first",
         model=first_model,
         handoffs=[handoff(second_agent, input_filter=identity_filter)],
     )
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("same"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("same"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     if streamed:
         streamed_result = Runner.run_streamed(first_agent, input="start")
@@ -739,18 +737,16 @@ async def test_custom_filter_summary_shape_does_not_claim_equal_session_item() -
             input_items=(),
         )
 
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(
         name="first",
         model=first_model,
         handoffs=[handoff(second_agent, input_filter=custom_filter)],
     )
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("same"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("same"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     result = await Runner.run(first_agent, input="start")
 
@@ -760,14 +756,12 @@ async def test_custom_filter_summary_shape_does_not_claim_equal_session_item() -
 @pytest.mark.asyncio
 async def test_wrapper_reset_does_not_change_nested_history_ownership() -> None:
     """Replay ownership must not depend on wrappers that are current after the run."""
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("handoff message"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("handoff message"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     set_conversation_history_wrappers(start="<<START>>", end="<<END>>")
     try:
@@ -791,18 +785,16 @@ async def test_public_nested_history_filter_preserves_ownership(chained: bool) -
         return remove_all_tools(nest_handoff_history(data))
 
     input_filter = chained_filter if chained else nest_handoff_history
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(
         name="first",
         model=first_model,
         handoffs=[handoff(second_agent, input_filter=input_filter)],
     )
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("handoff message"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("handoff message"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     result = await Runner.run(first_agent, input="start")
 
@@ -818,18 +810,16 @@ async def test_public_nested_history_filter_preserves_ownership_after_deepcopy()
         assert not isinstance(nested.input_history, str)
         return nested.clone(input_history=deepcopy(nested.input_history))
 
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(
         name="first",
         model=first_model,
         handoffs=[handoff(second_agent, input_filter=copied_filter)],
     )
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("same"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("same"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     result = await Runner.run(first_agent, input="start")
 
@@ -850,18 +840,16 @@ async def test_public_nested_history_filter_preserves_ownership_after_dict_rebui
             )
         )
 
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(
         name="first",
         model=first_model,
         handoffs=[handoff(second_agent, input_filter=rebuilt_filter)],
     )
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("same"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("same"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     result = await Runner.run(first_agent, input="start")
 
@@ -885,18 +873,16 @@ async def test_public_nested_history_filter_rebases_owned_input_after_insertion(
         )
         return nested.clone(input_history=(inserted, *rebuilt_history))
 
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(
         name="first",
         model=first_model,
         handoffs=[handoff(second_agent, input_filter=inserting_filter)],
     )
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("same"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("same"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     if streamed:
         streamed_result = Runner.run_streamed(first_agent, input="start")
@@ -924,18 +910,16 @@ async def test_public_nested_history_filter_data_rebuild_drops_private_ownership
             input_items=nested.input_items,
         )
 
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(
         name="first",
         model=first_model,
         handoffs=[handoff(second_agent, input_filter=rebuilt_filter)],
     )
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("same"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("same"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     result = await Runner.run(first_agent, input="start")
 
@@ -950,18 +934,16 @@ async def test_public_nested_history_filter_preserves_ownership_after_new_items_
         nested = nest_handoff_history(data)
         return nested.clone(new_items=deepcopy(nested.new_items))
 
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(
         name="first",
         model=first_model,
         handoffs=[handoff(second_agent, input_filter=copied_filter)],
     )
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("same"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("same"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     result = await Runner.run(first_agent, input="start")
 
@@ -981,18 +963,16 @@ async def test_public_nested_history_filter_does_not_own_equal_replacement() -> 
         )
         return nested.clone(new_items=(replacement, *nested.new_items[1:]))
 
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(
         name="first",
         model=first_model,
         handoffs=[handoff(second_agent, input_filter=replacement_filter)],
     )
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("same"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("same"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     result = await Runner.run(first_agent, input="start")
 
@@ -1054,18 +1034,16 @@ async def test_nested_history_preserves_repeated_run_item_reference_occurrences(
         message = data.new_items[0]
         return nest_handoff_history(data.clone(new_items=(message, message, *data.new_items[1:])))
 
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(
         name="first",
         model=first_model,
         handoffs=[handoff(second_agent, input_filter=duplicate_message_filter)],
     )
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("same"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("same"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     if streamed:
         streamed_result = Runner.run_streamed(first_agent, input="start")
@@ -1085,8 +1063,8 @@ async def test_nested_history_retains_forwarded_pre_handoff_item_provenance(
     streamed: bool,
 ) -> None:
     """Lossless items from earlier turns must retain one replay occurrence."""
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
     tool_search_call = ResponseToolSearchCall(
@@ -1105,13 +1083,14 @@ async def test_nested_history_retains_forwarded_pre_handoff_item_provenance(
         tools=[],
         type="tool_search_output",
     )
-    first_model.add_multiple_turn_outputs(
+    first_output = [tool_search_call, tool_search_output]
+    first_model.extend(
         [
-            [tool_search_call, tool_search_output],
+            get_exact_output_stream_step(first_output) if streamed else first_output,
             [get_handoff_tool_call(second_agent)],
         ]
     )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    second_model.extend([[get_text_message("done")]])
     run_config = RunConfig(nest_handoff_history=True)
     run_result: RunResult | RunResultStreaming
 
@@ -1150,14 +1129,12 @@ async def test_nested_history_retains_forwarded_pre_handoff_item_provenance(
 @pytest.mark.asyncio
 async def test_to_input_list_during_active_stream_does_not_mutate_input() -> None:
     """Inspecting an active stream must not mutate its eventual public input."""
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("handoff message"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("handoff message"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     result = Runner.run_streamed(
         first_agent,
@@ -1180,14 +1157,12 @@ async def test_to_input_list_during_active_stream_does_not_mutate_input() -> Non
 @pytest.mark.asyncio
 async def test_nested_history_ownership_remaps_after_new_items_insertion() -> None:
     """A caller inserting a public new_items entry must not make ownership drop the new item."""
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("handoff message"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("handoff message"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     result = await Runner.run(
         first_agent,
@@ -1204,14 +1179,12 @@ async def test_nested_history_ownership_remaps_after_new_items_insertion() -> No
 @pytest.mark.asyncio
 async def test_nested_history_input_removal_does_not_claim_an_unmarked_equal_occurrence() -> None:
     """An equal replacement input must not retain ownership of the removed occurrence."""
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("same"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("same"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     result = await Runner.run(
         first_agent,
@@ -1231,14 +1204,12 @@ async def test_nested_history_input_removal_does_not_claim_an_unmarked_equal_occ
 @pytest.mark.asyncio
 async def test_nested_history_new_item_removal_does_not_claim_an_equal_item() -> None:
     """Removing the owned RunItem must not transfer ownership to an equal RunItem."""
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("same"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("same"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     result = await Runner.run(
         first_agent,
@@ -1266,14 +1237,12 @@ async def test_nested_history_new_item_removal_does_not_claim_an_equal_item() ->
 @pytest.mark.asyncio
 async def test_nested_history_ownership_survives_result_new_items_copy() -> None:
     """Copying result run items must not replay a nested session occurrence twice."""
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("same"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("same"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     result = await Runner.run(
         first_agent,
@@ -1293,14 +1262,12 @@ async def test_nested_history_input_copy_does_not_infer_occurrence_ownership(
     streamed: bool,
 ) -> None:
     """An unmarked public-input copy must remain distinct from its session occurrence."""
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("same"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("same"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     result: RunResult | RunResultStreaming
     if streamed:
@@ -1335,14 +1302,12 @@ async def test_nested_history_input_copy_and_reorder_does_not_infer_ownership(
     streamed: bool,
 ) -> None:
     """Payload equality must not transfer ownership after a copied input reorder."""
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("owned once"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("owned once"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
     run_config = RunConfig(nest_handoff_history=True)
 
     result: RunResult | RunResultStreaming
@@ -1374,14 +1339,12 @@ async def test_result_input_mutation_does_not_change_state_snapshot_ownership(
     def approval_tool() -> str:
         return "approved"
 
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model, tools=[approval_tool])
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("owned once"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs(
+    first_model.extend([[get_text_message("owned once"), get_handoff_tool_call(second_agent)]])
+    second_model.extend(
         [
             [get_function_tool_call("approval_tool", "{}", call_id="approval")],
             [get_text_message("done")],
@@ -1432,14 +1395,12 @@ async def test_result_input_mutation_does_not_change_state_snapshot_ownership(
 @pytest.mark.asyncio
 async def test_nested_history_ownership_revalidates_after_input_removal() -> None:
     """Removing an owned input occurrence must restore its session copy during replay."""
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("handoff message"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("handoff message"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     result = await Runner.run(
         first_agent,
@@ -1560,9 +1521,9 @@ def test_nested_history_normalizes_forwarded_status_before_ownership() -> None:
 @pytest.mark.asyncio
 async def test_plain_handoff_preserves_prior_nested_history_ownership(streamed: bool) -> None:
     """A later non-nesting handoff must not clear ownership established by an earlier handoff."""
-    first_model = FakeModel()
-    second_model = FakeModel()
-    final_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
+    final_model = ScriptedModel()
     final_agent = Agent(name="final", model=final_model)
     second_agent = Agent(
         name="second",
@@ -1570,13 +1531,9 @@ async def test_plain_handoff_preserves_prior_nested_history_ownership(streamed: 
         handoffs=[handoff(final_agent, nest_handoff_history=False)],
     )
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("first message"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs(
-        [[get_text_message("second message"), get_handoff_tool_call(final_agent)]]
-    )
-    final_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("first message"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("second message"), get_handoff_tool_call(final_agent)]])
+    final_model.extend([[get_text_message("done")]])
     run_config = RunConfig(nest_handoff_history=True)
 
     if streamed:
@@ -1603,9 +1560,9 @@ async def test_non_nested_copying_filter_preserves_prior_nested_history_ownershi
             return data
         return data.clone(input_history=deepcopy(data.input_history))
 
-    first_model = FakeModel()
-    second_model = FakeModel()
-    final_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
+    final_model = ScriptedModel()
     final_agent = Agent(name="final", model=final_model)
     second_agent = Agent(
         name="second",
@@ -1619,13 +1576,9 @@ async def test_non_nested_copying_filter_preserves_prior_nested_history_ownershi
         ],
     )
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("first message"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs(
-        [[get_text_message("second message"), get_handoff_tool_call(final_agent)]]
-    )
-    final_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("first message"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("second message"), get_handoff_tool_call(final_agent)]])
+    final_model.extend([[get_text_message("done")]])
     run_config = RunConfig(nest_handoff_history=True)
 
     if streamed:
@@ -1654,9 +1607,9 @@ async def test_copied_custom_input_items_keep_session_occurrence_for_later_nesti
     def copy_model_items(data: HandoffInputData) -> HandoffInputData:
         return data.clone(input_items=deepcopy(data.new_items))
 
-    first_model = FakeModel()
-    second_model = FakeModel()
-    final_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
+    final_model = ScriptedModel()
     final_agent = Agent(name="final", model=final_model)
     second_agent = Agent(name="second", model=second_model, handoffs=[final_agent])
     first_agent = Agent(
@@ -1664,11 +1617,9 @@ async def test_copied_custom_input_items_keep_session_occurrence_for_later_nesti
         model=first_model,
         handoffs=[handoff(second_agent, input_filter=copy_model_items)],
     )
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("copied once"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_handoff_tool_call(final_agent)]])
-    final_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("copied once"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_handoff_tool_call(final_agent)]])
+    final_model.extend([[get_text_message("done")]])
     run_config = RunConfig(nest_handoff_history=True)
 
     if streamed:
@@ -1691,9 +1642,9 @@ async def test_identity_filter_preserves_prior_nested_history_ownership(streamed
     def identity_filter(data: HandoffInputData) -> HandoffInputData:
         return data
 
-    first_model = FakeModel()
-    second_model = FakeModel()
-    final_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
+    final_model = ScriptedModel()
     final_agent = Agent(name="final", model=final_model)
     second_agent = Agent(
         name="second",
@@ -1701,13 +1652,9 @@ async def test_identity_filter_preserves_prior_nested_history_ownership(streamed
         handoffs=[handoff(final_agent, input_filter=identity_filter)],
     )
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("first message"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs(
-        [[get_text_message("second message"), get_handoff_tool_call(final_agent)]]
-    )
-    final_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("first message"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("second message"), get_handoff_tool_call(final_agent)]])
+    final_model.extend([[get_text_message("done")]])
     run_config = RunConfig(nest_handoff_history=True)
 
     if streamed:
@@ -1733,9 +1680,9 @@ async def test_nested_handoff_history_preserves_identical_messages_across_turns(
     def continue_work() -> str:
         return "continue"
 
-    first_model = FakeModel()
-    second_model = FakeModel()
-    final_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
+    final_model = ScriptedModel()
     final_agent = Agent(name="final", model=final_model)
     second_agent = Agent(
         name="second",
@@ -1745,16 +1692,14 @@ async def test_nested_handoff_history_preserves_identical_messages_across_turns(
     )
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
 
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("same"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs(
+    first_model.extend([[get_text_message("same"), get_handoff_tool_call(second_agent)]])
+    second_model.extend(
         [
             [get_text_message("same"), get_function_tool_call("continue_work", "{}")],
             [get_text_message("same"), get_handoff_tool_call(final_agent)],
         ]
     )
-    final_model.add_multiple_turn_outputs([[get_text_message("same")]])
+    final_model.extend([[get_text_message("same")]])
 
     if streamed:
         streamed_result = Runner.run_streamed(
@@ -1773,7 +1718,7 @@ async def test_nested_handoff_history_preserves_identical_messages_across_turns(
         )
         replay_input = result.to_input_list()
 
-    final_input = final_model.last_turn_args["input"]
+    final_input = final_model.calls[-1].input
     summary = str(cast(dict[str, Any], final_input[0])["content"])
     assert summary.count("same") == 2
     assert sum(_input_item_text(item) == "same" for item in replay_input) == 4
@@ -1782,15 +1727,13 @@ async def test_nested_handoff_history_preserves_identical_messages_across_turns(
 @pytest.mark.asyncio
 async def test_explicit_default_handoff_history_mapper_is_honored() -> None:
     """An explicitly configured mapper should own the exact model input."""
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
 
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("handoff message"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    first_model.extend([[get_text_message("handoff message"), get_handoff_tool_call(second_agent)]])
+    second_model.extend([[get_text_message("done")]])
 
     await Runner.run(
         first_agent,
@@ -1801,8 +1744,8 @@ async def test_explicit_default_handoff_history_mapper_is_honored() -> None:
         ),
     )
 
-    assert second_model.first_turn_args is not None
-    second_input = second_model.first_turn_args["input"]
+    assert bool(second_model.calls)
+    second_input = second_model.calls[0].input
     assert isinstance(second_input, list)
     assert len(second_input) == 1
     summary = str(cast(dict[str, Any], second_input[0])["content"])
@@ -1818,9 +1761,9 @@ async def test_nested_handoff_history_partition_survives_interruption_resume() -
     def approval_tool() -> str:
         return "approved"
 
-    first_model = FakeModel()
-    second_model = FakeModel()
-    final_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
+    final_model = ScriptedModel()
     final_agent = Agent(name="final", model=final_model)
     second_agent = Agent(
         name="second",
@@ -1831,16 +1774,14 @@ async def test_nested_handoff_history_partition_survives_interruption_resume() -
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
     run_config = RunConfig(nest_handoff_history=True)
 
-    first_model.add_multiple_turn_outputs(
-        [[get_text_message("once"), get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs(
+    first_model.extend([[get_text_message("once"), get_handoff_tool_call(second_agent)]])
+    second_model.extend(
         [
             [get_function_tool_call("approval_tool", "{}", call_id="approval")],
             [get_text_message("once"), get_handoff_tool_call(final_agent)],
         ]
     )
-    final_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    final_model.extend([[get_text_message("done")]])
 
     interrupted = await Runner.run(first_agent, input="start", run_config=run_config)
     assert len(interrupted.interruptions) == 1
@@ -1864,7 +1805,7 @@ async def test_nested_handoff_history_partition_survives_interruption_resume() -
     resumed = await Runner.run(first_agent, restored, run_config=run_config)
 
     assert resumed.final_output == "done"
-    final_input = final_model.last_turn_args["input"]
+    final_input = final_model.calls[-1].input
     summary = str(cast(dict[str, Any], final_input[0])["content"])
     assert summary.count("once") == 1
     assert sum(_input_item_text(item) == "once" for item in resumed.to_input_list()) == 2
@@ -1887,9 +1828,9 @@ async def test_pending_handoff_in_interrupted_turn_survives_run_state(
     def approval_tool() -> str:
         return "approved"
 
-    first_model = FakeModel()
-    second_model = FakeModel()
-    final_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
+    final_model = ScriptedModel()
     final_agent = Agent(name="final", model=final_model)
     second_agent = Agent(
         name="second",
@@ -1904,8 +1845,8 @@ async def test_pending_handoff_in_interrupted_turn_survives_run_state(
     first_handoff.call_id = "first-handoff"
     final_handoff = cast(ResponseFunctionToolCall, get_handoff_tool_call(final_agent))
     final_handoff.call_id = "final-handoff"
-    first_model.add_multiple_turn_outputs([[get_text_message("first once"), first_handoff]])
-    second_model.add_multiple_turn_outputs(
+    first_model.extend([[get_text_message("first once"), first_handoff]])
+    second_model.extend(
         [
             [
                 get_text_message("second once"),
@@ -1914,7 +1855,7 @@ async def test_pending_handoff_in_interrupted_turn_survives_run_state(
             ]
         ]
     )
-    final_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    final_model.extend([[get_text_message("done")]])
 
     interrupted: RunResult | RunResultStreaming
     if streamed:
@@ -1958,7 +1899,7 @@ async def test_pending_handoff_in_interrupted_turn_survives_run_state(
         == 1
     )
     if nest_handoff_history:
-        final_input = final_model.last_turn_args["input"]
+        final_input = final_model.calls[-1].input
         summary = str(cast(dict[str, Any], final_input[0])["content"])
         assert summary.count("first once") == 1
         assert summary.count("second once") == 1
@@ -2002,8 +1943,8 @@ async def test_resumed_handoff_persists_all_staged_approval_outputs(
             nonlocal handoff_count
             handoff_count += 1
 
-    source_model = FakeModel()
-    target_model = FakeModel()
+    source_model = ScriptedModel()
+    target_model = ScriptedModel()
     target_agent = Agent(name="target", model=target_model)
     source_agent = Agent(
         name="source",
@@ -2024,8 +1965,8 @@ async def test_resumed_handoff_persists_all_staged_approval_outputs(
     second_call.id = "item-second"
     handoff_call.id = "item-handoff"
     handoff_call.call_id = "handoff"
-    source_model.add_multiple_turn_outputs([[first_call, second_call, handoff_call]])
-    target_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    source_model.extend([[first_call, second_call, handoff_call]])
+    target_model.extend([[get_text_message("done")]])
 
     run_config = RunConfig(nest_handoff_history=nest_handoff_history)
     hooks = RecordingHooks()
@@ -2146,8 +2087,8 @@ async def test_nested_history_resume_to_final_preserves_status_less_ownership(
     def approval_tool() -> str:
         return "approved"
 
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model, tools=[approval_tool])
     first_agent = Agent(name="first", model=first_model, handoffs=[second_agent])
     run_config = RunConfig(nest_handoff_history=True)
@@ -2158,10 +2099,8 @@ async def test_nested_history_resume_to_final_preserves_status_less_ownership(
         status=None,
         type="message",
     )
-    first_model.add_multiple_turn_outputs(
-        [[status_less_message, get_handoff_tool_call(second_agent)]]
-    )
-    second_model.add_multiple_turn_outputs(
+    first_model.extend([[status_less_message, get_handoff_tool_call(second_agent)]])
+    second_model.extend(
         [
             [get_function_tool_call("approval_tool", "{}", call_id="approval")],
             [get_text_message("done")],
@@ -2205,10 +2144,8 @@ async def test_nested_history_resume_to_final_preserves_status_less_ownership(
     assert final_output == "done"
     assert sum(_input_item_text(item) == "once" for item in replay_input) == 1
     assert all("_agents_nested_history_token" not in item for item in replay_input)
-    assert second_model.last_turn_args is not None
-    assert all(
-        "_agents_nested_history_token" not in item for item in second_model.last_turn_args["input"]
-    )
+    assert bool(second_model.calls)
+    assert all("_agents_nested_history_token" not in item for item in second_model.calls[-1].input)
 
 
 @pytest.mark.parametrize("streamed", [False, True], ids=["non_streamed", "streamed"])
@@ -2228,8 +2165,8 @@ async def test_first_nested_handoff_after_restore_uses_explicit_occurrence_linea
     def approval_tool() -> str:
         return "approved"
 
-    first_model = FakeModel()
-    second_model = FakeModel()
+    first_model = ScriptedModel()
+    second_model = ScriptedModel()
     second_agent = Agent(name="second", model=second_model)
     first_agent = Agent(
         name="first",
@@ -2253,17 +2190,18 @@ async def test_first_nested_handoff_after_restore_uses_explicit_occurrence_linea
         tools=[],
         type="tool_search_output",
     )
-    first_model.add_multiple_turn_outputs(
+    first_output = [
+        tool_search_call,
+        tool_search_output,
+        get_function_tool_call("approval_tool", "{}", call_id="approval"),
+    ]
+    first_model.extend(
         [
-            [
-                tool_search_call,
-                tool_search_output,
-                get_function_tool_call("approval_tool", "{}", call_id="approval"),
-            ],
+            get_exact_output_stream_step(first_output) if streamed else first_output,
             [get_handoff_tool_call(second_agent)],
         ]
     )
-    second_model.add_multiple_turn_outputs([[get_text_message("done")]])
+    second_model.extend([[get_text_message("done")]])
     run_config = RunConfig(nest_handoff_history=True)
     interrupted: RunResult | RunResultStreaming
 
@@ -2280,6 +2218,8 @@ async def test_first_nested_handoff_after_restore_uses_explicit_occurrence_linea
     state._session_items.insert(0, _create_message_item(first_agent, text="session only"))
     state_json = state.to_json()
     if legacy_snapshot:
+        for entry in state_json["context"].pop("function_tool_approvals", []):
+            state_json["context"]["approvals"][entry["tool_key"]] = entry["decision"]
         state_json["$schemaVersion"] = "1.12"
         state_json.pop("nested_history_owned_session_item_refs")
         state_json.pop("generated_session_item_indexes")
@@ -2297,3 +2237,175 @@ async def test_first_nested_handoff_after_restore_uses_explicit_occurrence_linea
     expected_occurrences = 2 if legacy_snapshot else 1
     assert replay_types.count("tool_search_call") == expected_occurrences
     assert replay_types.count("tool_search_output") == expected_occurrences
+
+
+@pytest.mark.parametrize(
+    "empty_item",
+    [
+        {"role": "user", "content": ""},
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": None},
+        {"role": "user", "name": "bob", "content": ""},
+    ],
+    ids=["user_empty", "assistant_empty", "user_none", "named_empty"],
+)
+def test_nested_history_keeps_turns_with_no_content(empty_item: dict[str, Any]) -> None:
+    """A turn with no content must survive being summarized and flattened again.
+
+    An empty turn was rendered as a bare role with no separator, and the parser that
+    flattens the summary on the next handoff requires one, so the turn was dropped. The
+    next agent then saw a transcript with a turn missing, which also breaks the
+    user/assistant alternation.
+    """
+    history = (
+        {"role": "user", "content": "first question"},
+        empty_item,
+        {"role": "user", "content": "second question"},
+    )
+    data = HandoffInputData(
+        input_history=cast(Any, history),
+        pre_handoff_items=(),
+        new_items=(),
+        run_context=None,
+    )
+
+    nested = nest_handoff_history(data)
+    transcript = _extract_nested_history_transcript(cast(Any, nested.input_history)[0])
+
+    assert transcript is not None
+    assert len(transcript) == len(history)
+    assert [item.get("role") for item in transcript] == ["user", empty_item["role"], "user"]
+
+
+def test_nested_history_survives_repeated_handoffs() -> None:
+    """Flattening and re-nesting must not shed the empty turn on each hop."""
+    history = (
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": "second question"},
+    )
+    data = HandoffInputData(
+        input_history=cast(Any, history),
+        pre_handoff_items=(),
+        new_items=(),
+        run_context=None,
+    )
+
+    nested = nest_handoff_history(data)
+    for _ in range(3):
+        nested = nest_handoff_history(nested)
+        transcript = _extract_nested_history_transcript(cast(Any, nested.input_history)[0])
+        assert transcript is not None
+        assert len(transcript) == len(history)
+
+
+def test_bare_role_record_from_an_older_summary_is_recovered() -> None:
+    """Summaries written before the separator was always emitted must still flatten."""
+    start_marker, end_marker = get_conversation_history_wrappers()
+    legacy = {
+        "role": "assistant",
+        "content": "\n".join(
+            [
+                "For context, here is the conversation so far between the user and the "
+                "previous agent:",
+                start_marker,
+                "1. user: first question",
+                "2. assistant",
+                "3. user: second question",
+                end_marker,
+            ]
+        ),
+    }
+
+    transcript = _extract_nested_history_transcript(cast(Any, legacy))
+
+    assert transcript is not None
+    assert [item.get("role") for item in transcript] == ["user", "assistant", "user"]
+
+
+def test_prose_inside_the_summary_block_is_still_rejected() -> None:
+    """The bare-role recovery must not turn arbitrary text into a fabricated turn.
+
+    The prose is numbered so it becomes its own record. An unnumbered line is folded into
+    the previous record as continuation text and never reaches the rejection branch.
+    """
+    start_marker, end_marker = get_conversation_history_wrappers()
+    with_prose = {
+        "role": "assistant",
+        "content": "\n".join(
+            [
+                "For context, here is the conversation so far between the user and the "
+                "previous agent:",
+                start_marker,
+                "1. user: first question",
+                "2. some stray prose with no separator",
+                "3. user: second question",
+                end_marker,
+            ]
+        ),
+    }
+
+    transcript = _extract_nested_history_transcript(cast(Any, with_prose))
+
+    assert transcript is not None
+    assert [item.get("role") for item in transcript] == ["user", "user"]
+    assert [item.get("content") for item in transcript] == [
+        "first question",
+        "second question",
+    ]
+
+
+def test_recovered_empty_turn_keeps_explicit_content() -> None:
+    """A recovered turn must carry content, not just a role.
+
+    Adapters such as the Chat Completions converter only recognize a message when both
+    keys are present, so a role-only item is not replayable.
+    """
+    start_marker, end_marker = get_conversation_history_wrappers()
+    legacy = {
+        "role": "assistant",
+        "content": "\n".join(
+            [
+                "For context, here is the conversation so far between the user and the "
+                "previous agent:",
+                start_marker,
+                "1. user: first question",
+                "2. assistant",
+                "3. assistant: ",
+                end_marker,
+            ]
+        ),
+    }
+
+    transcript = _extract_nested_history_transcript(cast(Any, legacy))
+
+    assert transcript is not None
+    # Both the recovered bare role and the separator-only record keep empty content.
+    assert transcript[1] == {"role": "assistant", "content": ""}
+    assert transcript[2] == {"role": "assistant", "content": ""}
+
+
+def test_second_pass_nesting_keeps_empty_turns_provider_valid() -> None:
+    """After a second handoff the empty turn must still convert for a real adapter."""
+    history = (
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": "second question"},
+    )
+    data = HandoffInputData(
+        input_history=cast(Any, history),
+        pre_handoff_items=(),
+        new_items=(),
+        run_context=None,
+    )
+
+    nested = nest_handoff_history(nest_handoff_history(data))
+    transcript = _extract_nested_history_transcript(cast(Any, nested.input_history)[0])
+
+    assert transcript is not None
+    assert transcript[1] == {"role": "assistant", "content": ""}
+
+    # The reconstructed transcript must convert through a supported adapter.
+    messages = Converter.items_to_messages(cast(Any, transcript))
+    assert [message["role"] for message in messages] == ["user", "assistant", "user"]
+    assert messages[1].get("content") == ""

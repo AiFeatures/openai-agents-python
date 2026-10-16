@@ -4,6 +4,7 @@ import asyncio
 import builtins
 import errno
 import io
+import os
 import queue
 import shutil
 import socket
@@ -12,7 +13,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import cast
 
 import docker.errors  # type: ignore[import-untyped]
@@ -20,7 +21,11 @@ import pytest
 from pydantic import Field, PrivateAttr
 
 import agents.sandbox.sandboxes.docker as docker_sandbox
+from agents import Agent
+from agents.run_context import RunContextWrapper
+from agents.run_state import CURRENT_SCHEMA_VERSION, RunState
 from agents.sandbox import SandboxPathGrant
+from agents.sandbox._mount_security import REDACTED_MOUNT_AUTHORITY_KEY
 from agents.sandbox.config import DEFAULT_PYTHON_SANDBOX_IMAGE
 from agents.sandbox.entries import (
     AzureBlobMount,
@@ -41,6 +46,7 @@ from agents.sandbox.entries import (
 )
 from agents.sandbox.entries.mounts.base import InContainerMountAdapter
 from agents.sandbox.errors import (
+    ErrorCode,
     ExecTimeoutError,
     ExecTransportError,
     InvalidManifestPathError,
@@ -51,10 +57,11 @@ from agents.sandbox.errors import (
     WorkspaceReadNotFoundError,
 )
 from agents.sandbox.files import EntryKind, FileEntry
-from agents.sandbox.manifest import Manifest
+from agents.sandbox.manifest import Environment, Manifest
 from agents.sandbox.materialization import MaterializedFile
 from agents.sandbox.sandboxes.docker import (
     DockerSandboxClient,
+    DockerSandboxClientOptions,
     DockerSandboxSession,
     DockerSandboxSessionState,
 )
@@ -236,15 +243,41 @@ class _FakeCreateDockerClient(_FakeDockerClient):
 class _DeleteVolume:
     def __init__(self) -> None:
         self.remove_calls = 0
+        self._on_remove: Callable[[], None] | None = None
+
+    def bind_remove(self, callback: Callable[[], None]) -> None:
+        self._on_remove = callback
 
     def remove(self) -> None:
         self.remove_calls += 1
+        if self._on_remove is not None:
+            self._on_remove()
+
+
+class _FailingDeleteVolume(_DeleteVolume):
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self._error = error
+
+    def remove(self) -> None:
+        self.remove_calls += 1
+        raise self._error
 
 
 class _DeleteVolumeCollection:
     def __init__(self, volumes: dict[str, _DeleteVolume]) -> None:
-        self._volumes = volumes
+        self._volumes: dict[str, _DeleteVolume] = {}
         self.get_calls: list[str] = []
+        for name, volume in volumes.items():
+            self.set(name, volume)
+
+    def set(self, name: str, volume: _DeleteVolume) -> None:
+        self._volumes[name] = volume
+
+        def remove_from_collection() -> None:
+            self._volumes.pop(name, None)
+
+        volume.bind_remove(remove_from_collection)
 
     def get(self, name: str) -> _DeleteVolume:
         self.get_calls.append(name)
@@ -270,6 +303,34 @@ class _DeleteContainer:
         self.remove_calls.append(kwargs)
 
 
+class _FailingDeleteContainer(_DeleteContainer):
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self._error = error
+
+    def remove(self, **kwargs: object) -> None:
+        super().remove(**kwargs)
+        raise self._error
+
+
+class _FailedStartContainer(_DeleteContainer):
+    id = "failed-start-container"
+
+    def start(self) -> None:
+        raise RuntimeError("container startup failed")
+
+
+class _StartedContainer(_DeleteContainer):
+    id = "started-container"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.start_calls = 0
+
+    def start(self) -> None:
+        self.start_calls += 1
+
+
 class _DeleteContainerCollection:
     def __init__(self, container: _DeleteContainer) -> None:
         self._container = container
@@ -289,6 +350,29 @@ class _DeleteDockerClient(_FakeDockerClient):
     ) -> None:
         super().__init__()
         self.containers = _DeleteContainerCollection(container)
+        self.volumes = _DeleteVolumeCollection(volumes)
+
+
+class _MissingDeleteContainerCollection:
+    def get(self, container_id: str) -> object:
+        _ = container_id
+        raise docker.errors.NotFound("container not found")
+
+
+class _FailingDeleteContainerCollection:
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+        self.get_calls: list[str] = []
+
+    def get(self, container_id: str) -> object:
+        self.get_calls.append(container_id)
+        raise self._error
+
+
+class _MissingDeleteDockerClient(_FakeDockerClient):
+    def __init__(self, *, volumes: dict[str, _DeleteVolume]) -> None:
+        super().__init__()
+        self.containers = _MissingDeleteContainerCollection()
         self.volumes = _DeleteVolumeCollection(volumes)
 
 
@@ -418,9 +502,10 @@ class _HostBackedDockerSession(DockerSandboxSession):
             src = self._host_path(cmd[3])
             dst = self._host_path(cmd[4])
             if src.is_dir():
-                shutil.copytree(src, dst)
+                # Like `cp -R`, keep symlinks as symlinks instead of following them.
+                shutil.copytree(src, dst, symlinks=True)
             else:
-                shutil.copy2(src, dst)
+                shutil.copy2(src, dst, follow_symlinks=False)
             return ExecResult(stdout=b"", stderr=b"", exit_code=0)
         if cmd[:2] == ["cat", "--"]:
             src = self._host_path(cmd[2])
@@ -500,6 +585,18 @@ class _CleanupTrackingDockerSession(_HostBackedDockerSession):
     async def _rm_best_effort(self, path: Path) -> None:
         self.stage_cleanup_calls.append(path)
         await super()._rm_best_effort(path)
+
+
+@pytest.fixture(autouse=True)
+def _trust_recording_mounts_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agents.sandbox import _mount_security
+
+    original = _mount_security._mount_class_is_trusted
+    monkeypatch.setattr(
+        _mount_security,
+        "_mount_class_is_trusted",
+        lambda mount: isinstance(mount, _RecordingMount) or original(mount),
+    )
 
 
 class _RecordingMount(Mount):
@@ -654,6 +751,106 @@ async def test_docker_persist_workspace_stages_copy_before_get_archive(
     assert "." in names
     assert "README.md" in names
     assert not any(name == "workspace" or name.startswith("workspace/") for name in names)
+
+
+@pytest.mark.asyncio
+async def test_docker_persist_and_hydrate_keep_absolute_workspace_symlinks_resolving(
+    tmp_path: Path,
+) -> None:
+    """Persist stages the workspace with `cp -R`, the daemon archives the copy, and the
+    archive is normalized for the strict hydrate extractor. An absolute in-workspace
+    symlink whose target is a plain path the archive establishes comes back relative
+    (`/workspace/sub/data.txt` from `sub/abs_up` as `../sub/data.txt`); a target whose
+    destination depends on another link (`/workspace/alias/../data.txt`) is left absolute
+    and refused by strict hydration, see the sibling test."""
+    host_root = tmp_path / "container"
+    workspace = host_root / "workspace"
+    (workspace / "sub" / "deep").mkdir(parents=True)
+    (workspace / "data.txt").write_text("wrong", encoding="utf-8")
+    (workspace / "sub" / "data.txt").write_text("right", encoding="utf-8")
+    (workspace / "alias").symlink_to("sub/deep")
+    (workspace / "sub" / "abs_up").symlink_to("/workspace/sub/data.txt")
+    session = _HostBackedDockerSession(host_root=host_root, manifest=Manifest(root="/workspace"))
+
+    archive = await session.persist_workspace()
+
+    restored_host_root = tmp_path / "restored-container"
+    (restored_host_root / "workspace").mkdir(parents=True)
+    restored = _HostBackedDockerSession(
+        host_root=restored_host_root, manifest=Manifest(root="/workspace")
+    )
+
+    async def _extract_like_tar(
+        *,
+        cmd: list[str],
+        stream: io.IOBase,
+        error_path: Path,
+        user: object = None,
+    ) -> None:
+        _ = (error_path, user)
+        assert cmd[:3] == ["tar", "-x", "-C"]
+        # The container runs GNU tar, which restores link targets verbatim. Spell that out
+        # instead of relying on `extractall`, whose default filter rewrites symlink targets
+        # on Python 3.14.
+        root = restored._host_path(cmd[3])
+        with tarfile.open(fileobj=stream, mode="r|*") as tar:
+            for member in tar:
+                dest = root / member.name
+                if member.isdir():
+                    dest.mkdir(parents=True, exist_ok=True)
+                elif member.issym():
+                    os.symlink(member.linkname, dest)
+                elif member.isreg():
+                    payload = tar.extractfile(member)
+                    assert payload is not None
+                    with payload:
+                        dest.write_bytes(payload.read())
+                else:
+                    raise AssertionError(f"unexpected member type: {member.name}")
+
+    restored._stream_into_exec = _extract_like_tar  # type: ignore[method-assign]
+    await restored.hydrate_workspace(archive)
+
+    # Assert on the restored link metadata: the targets are POSIX paths that only the
+    # sandbox's own filesystem resolves the way these assertions describe.
+    restored_workspace = restored_host_root / "workspace"
+    assert os.readlink(restored_workspace / "sub" / "abs_up") == "../sub/data.txt"
+    assert os.readlink(restored_workspace / "alias") == "sub/deep"
+    assert (restored_workspace / "sub" / "data.txt").read_text(encoding="utf-8") == "right"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target", ["/workspace/alias/../data.txt", "/workspace/sub/deep", "/workspace"]
+)
+async def test_docker_persist_keeps_unsupported_symlink_targets_absolute_for_hydrate(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    """Directory and link-dependent targets stay absolute for strict hydration to refuse."""
+    host_root = tmp_path / "container"
+    workspace = host_root / "workspace"
+    (workspace / "sub" / "deep").mkdir(parents=True)
+    (workspace / "data.txt").write_text("wrong", encoding="utf-8")
+    (workspace / "sub" / "data.txt").write_text("right", encoding="utf-8")
+    (workspace / "alias").symlink_to("sub/deep")
+    (workspace / "abs_alias").symlink_to(target)
+    session = _HostBackedDockerSession(host_root=host_root, manifest=Manifest(root="/workspace"))
+
+    archive = await session.persist_workspace()
+
+    with tarfile.open(fileobj=archive, mode="r:*") as tar:
+        assert tar.getmember("abs_alias").linkname == target
+        assert tar.getmember("alias").linkname == "sub/deep"
+    archive.seek(0)
+
+    restored_host_root = tmp_path / "restored-container"
+    (restored_host_root / "workspace").mkdir(parents=True)
+    restored = _HostBackedDockerSession(
+        host_root=restored_host_root, manifest=Manifest(root="/workspace")
+    )
+    with pytest.raises(WorkspaceArchiveWriteError):
+        await restored.hydrate_workspace(archive)
 
 
 @pytest.mark.asyncio
@@ -1404,19 +1601,21 @@ async def test_docker_normalize_path_preserves_safe_leaf_symlink_path(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_docker_read_allows_extra_path_grant(tmp_path: Path) -> None:
+async def test_docker_read_uses_sandbox_target_for_split_path_grant(tmp_path: Path) -> None:
     host_root = tmp_path / "container"
     workspace = host_root / "workspace"
     extra_root = host_root / "tmp"
+    native_source = tmp_path / "native-source"
     workspace.mkdir(parents=True)
     extra_root.mkdir(parents=True)
+    native_source.mkdir()
     (extra_root / "result.txt").write_text("scratch output", encoding="utf-8")
 
     session = _HostBackedDockerSession(
         host_root=host_root,
         manifest=Manifest(
             root="/workspace",
-            extra_path_grants=(SandboxPathGrant(path="/tmp"),),
+            extra_path_grants=(SandboxPathGrant(path="/tmp", host_path=str(native_source)),),
         ),
     )
 
@@ -1734,6 +1933,499 @@ async def test_docker_create_container_publishes_exposed_ports(
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_docker_create_container_applies_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container = _ResumeContainer(status="created")
+    docker_client = _FakeCreateDockerClient(container)
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+    labels = {"com.example.owner": "worker-123"}
+
+    monkeypatch.setattr(client, "image_exists", lambda _image: True)
+
+    created = await client._create_container(
+        DEFAULT_PYTHON_SANDBOX_IMAGE,
+        labels=labels,
+    )
+
+    assert created is container
+    assert docker_client.containers.calls[0]["labels"] == labels
+
+
+@pytest.mark.asyncio
+async def test_docker_create_container_omits_empty_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container = _ResumeContainer(status="created")
+    docker_client = _FakeCreateDockerClient(container)
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+
+    monkeypatch.setattr(client, "image_exists", lambda _image: True)
+
+    await client._create_container(DEFAULT_PYTHON_SANDBOX_IMAGE, labels={})
+
+    assert "labels" not in docker_client.containers.calls[0]
+
+
+def test_docker_session_state_roundtrip_preserves_labels() -> None:
+    client = DockerSandboxClient(docker_client=cast(object, _FakeDockerClient()))
+    labels = {"com.example.owner": "worker-123"}
+    state = DockerSandboxSessionState(
+        manifest=Manifest(),
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="container",
+        labels=labels,
+    )
+
+    restored = client.deserialize_session_state(client.serialize_session_state(state))
+
+    assert isinstance(restored, DockerSandboxSessionState)
+    assert restored.labels == labels
+
+
+def test_docker_session_state_without_labels_preserves_old_payloads() -> None:
+    client = DockerSandboxClient(docker_client=cast(object, _FakeDockerClient()))
+    state = DockerSandboxSessionState(
+        manifest=Manifest(),
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="container",
+    )
+    payload = client.serialize_session_state(state)
+    payload.pop("labels", None)
+
+    restored = client.deserialize_session_state(payload)
+
+    assert isinstance(restored, DockerSandboxSessionState)
+    assert restored.labels == {}
+
+
+@pytest.mark.asyncio
+async def test_docker_labels_roundtrip_through_run_state() -> None:
+    agent = Agent(name="sandbox")
+    labels = {"com.example.owner": "worker-123"}
+    run_state = RunState(
+        context=RunContextWrapper(context={}),
+        original_input="resume sandbox",
+        starting_agent=agent,
+    )
+    run_state._sandbox = {
+        "backend_id": "docker",
+        "current_agent_name": agent.name,
+        "session_state": DockerSandboxSessionState(
+            manifest=Manifest(),
+            snapshot=NoopSnapshot(id="snapshot"),
+            image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+            container_id="container",
+            labels=labels,
+        ).model_dump(mode="json"),
+    }
+
+    serialized = run_state.to_json()
+    restored = await RunState.from_json(agent, serialized)
+
+    assert serialized["$schemaVersion"] == CURRENT_SCHEMA_VERSION
+    assert restored._sandbox is not None
+    restored_session_state = restored._sandbox["session_state"]
+    assert isinstance(restored_session_state, dict)
+    assert restored_session_state["labels"] == labels
+
+
+@pytest.mark.asyncio
+async def test_docker_create_persists_configured_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container = _StartedContainer()
+    client = DockerSandboxClient(docker_client=cast(object, _FakeDockerClient()))
+    labels = {"com.example.owner": "worker-123"}
+    forwarded_labels: list[dict[str, str] | None] = []
+
+    async def _fake_create_container(
+        image: str,
+        *,
+        manifest: Manifest | None = None,
+        exposed_ports: tuple[int, ...] = (),
+        network_mode: str | None = None,
+        session_id: uuid.UUID | None = None,
+        labels: dict[str, str] | None = None,
+    ) -> _StartedContainer:
+        _ = (image, manifest, exposed_ports, network_mode, session_id)
+        forwarded_labels.append(labels)
+        return container
+
+    monkeypatch.setattr(client, "_create_container", _fake_create_container)
+
+    session = await client.create(
+        options=DockerSandboxClientOptions(
+            image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+            labels=labels,
+        )
+    )
+
+    assert isinstance(session._inner, DockerSandboxSession)
+    assert session._inner.state.labels == labels
+    assert forwarded_labels == [labels]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root", ["/workspace", "/mnt/sibling/../workspace"])
+async def test_docker_create_container_mounts_explicit_host_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root: str,
+) -> None:
+    host_path = tmp_path / "shared-data"
+    host_path.mkdir()
+    container = _ResumeContainer(status="created")
+    docker_client = _FakeCreateDockerClient(container)
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+    manifest = Manifest(
+        root=root,
+        extra_path_grants=(
+            SandboxPathGrant(
+                path="/mnt/shared-data",
+                host_path=str(host_path),
+                read_only=True,
+            ),
+        ),
+    )
+
+    monkeypatch.setattr(client, "image_exists", lambda _image: True)
+
+    created = await client._create_container(
+        DEFAULT_PYTHON_SANDBOX_IMAGE,
+        manifest=manifest,
+    )
+
+    assert created is container
+    mounts = cast(list[dict[str, object]], docker_client.containers.calls[0]["mounts"])
+    assert mounts == [
+        {
+            "Target": "/mnt/shared-data",
+            "Source": str(host_path),
+            "Type": "bind",
+            "ReadOnly": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["create", "resume"])
+@pytest.mark.parametrize(
+    "storage_mount",
+    [
+        AzureBlobMount(
+            account="account",
+            container="container",
+            mount_strategy=InContainerMountStrategy(pattern=FuseMountPattern()),
+        ),
+        S3Mount(
+            bucket="bucket",
+            mount_strategy=InContainerMountStrategy(pattern=MountpointMountPattern()),
+        ),
+        S3Mount(
+            bucket="bucket", mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern())
+        ),
+        S3Mount(
+            bucket="bucket",
+            mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern(mode="nfs")),
+        ),
+        S3FilesMount(
+            file_system_id="fs-1234567890abcdef0",
+            mount_strategy=InContainerMountStrategy(pattern=S3FilesMountPattern()),
+        ),
+    ],
+    ids=["fuse", "mountpoint", "rclone-fuse", "rclone-nfs", "s3-files"],
+)
+async def test_docker_rejects_read_only_host_grant_with_privileged_storage_before_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    storage_mount: Mount,
+) -> None:
+    container = _StartedContainer()
+    docker_client = _FakeCreateDockerClient(container)
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+    manifest = Manifest(
+        entries={"nested": Dir(children={"data": storage_mount})},
+        extra_path_grants=(
+            SandboxPathGrant(path="/mnt/shared-data", host_path=str(tmp_path), read_only=True),
+        ),
+    )
+    if isinstance(storage_mount.mount_strategy.pattern, MountpointMountPattern):
+        manifest = manifest.with_in_container_mount_credential_exposure_acknowledged("nested/data")
+    else:
+        manifest = manifest.with_in_container_mount_broad_credential_exposure_acknowledged(
+            "nested/data"
+        )
+    state = DockerSandboxSessionState(
+        manifest=manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="existing-container",
+        workspace_root_ready=True,
+    )
+    original_session_id = state.session_id
+
+    def unexpected_provider_access(*args: object, **kwargs: object) -> None:
+        pytest.fail("incompatible grants must fail before Docker access or cleanup")
+
+    async def unexpected_environment_resolution(self: Environment) -> dict[str, str]:
+        pytest.fail("incompatible grants must fail before environment resolution")
+
+    monkeypatch.setattr(client, "image_exists", unexpected_provider_access)
+    monkeypatch.setattr(client, "get_container", unexpected_provider_access)
+    monkeypatch.setattr(client, "_cleanup_failed_create_resources", unexpected_provider_access)
+    monkeypatch.setattr(Environment, "resolve", unexpected_environment_resolution)
+
+    with pytest.raises(MountConfigError, match="read-only host_path grants.*SYS_ADMIN"):
+        if operation == "create":
+            await client.create(
+                manifest=manifest,
+                options=DockerSandboxClientOptions(image=DEFAULT_PYTHON_SANDBOX_IMAGE),
+            )
+        else:
+            await client.resume(state)
+
+    assert docker_client.containers.calls == []
+    assert container.start_calls == 0
+    assert state.session_id == original_session_id
+    assert state.container_id == "existing-container"
+    assert state.workspace_root_ready is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("storage", "explicit_host_path", "read_only"),
+    [
+        ("none", True, True),
+        ("in-container", True, False),
+        ("in-container", False, True),
+        ("docker-volume", True, True),
+    ],
+    ids=["ordinary-read-only-bind", "writable-bind", "path-only-grant", "external-storage"],
+)
+async def test_docker_create_preserves_compatible_host_grants_and_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    storage: str,
+    explicit_host_path: bool,
+    read_only: bool,
+) -> None:
+    container = _StartedContainer()
+    docker_client = _FakeCreateDockerClient(container)
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+    manifest = Manifest(
+        extra_path_grants=(
+            SandboxPathGrant(
+                path="/mnt/shared-data",
+                host_path=str(tmp_path) if explicit_host_path else None,
+                read_only=read_only,
+            ),
+        ),
+    )
+    if storage != "none":
+        manifest.entries["data"] = S3Mount(
+            bucket="bucket",
+            mount_strategy=(
+                InContainerMountStrategy(pattern=RcloneMountPattern())
+                if storage == "in-container"
+                else DockerVolumeMountStrategy(driver="rclone")
+            ),
+        )
+    monkeypatch.setattr(client, "image_exists", lambda _image: True)
+
+    session = await client.create(
+        manifest=manifest,
+        options=DockerSandboxClientOptions(image=DEFAULT_PYTHON_SANDBOX_IMAGE),
+    )
+
+    assert isinstance(session._inner, DockerSandboxSession)
+    assert container.start_calls == 1
+    kwargs = docker_client.containers.calls[0]
+    mounts = cast(list[dict[str, object]], kwargs.get("mounts", []))
+    binds = [mount for mount in mounts if mount["Type"] == "bind"]
+    assert binds == (
+        [
+            {
+                "Target": "/mnt/shared-data",
+                "Source": str(tmp_path),
+                "Type": "bind",
+                "ReadOnly": read_only,
+            }
+        ]
+        if explicit_host_path
+        else []
+    )
+    assert kwargs.get("cap_add") == (["SYS_ADMIN"] if storage == "in-container" else None)
+    assert any(mount["Type"] == "volume" for mount in mounts) == (storage == "docker-volume")
+
+
+@pytest.mark.asyncio
+async def test_docker_create_container_keeps_path_only_grant_unmounted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container = _ResumeContainer(status="created")
+    docker_client = _FakeCreateDockerClient(container)
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+    manifest = Manifest(extra_path_grants=(SandboxPathGrant(path="/tmp", read_only=True),))
+
+    monkeypatch.setattr(client, "image_exists", lambda _image: True)
+
+    await client._create_container(
+        DEFAULT_PYTHON_SANDBOX_IMAGE,
+        manifest=manifest,
+    )
+
+    assert "mounts" not in docker_client.containers.calls[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_first", [False, True])
+async def test_docker_rejects_duplicate_target_shared_by_split_and_path_only_grants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    explicit_first: bool,
+) -> None:
+    path_only = SandboxPathGrant(path="/mnt/shared-data")
+    explicit = SandboxPathGrant(
+        path="/mnt/shared-data",
+        host_path=str(tmp_path),
+    )
+    grants = (explicit, path_only) if explicit_first else (path_only, explicit)
+    client = DockerSandboxClient(docker_client=cast(object, _FakeDockerClient()))
+    image_lookups = 0
+
+    def _image_exists(_image: str) -> bool:
+        nonlocal image_lookups
+        image_lookups += 1
+        return True
+
+    monkeypatch.setattr(client, "image_exists", _image_exists)
+
+    with pytest.raises(ValueError, match="duplicate Docker sandbox path grant target"):
+        await client._create_container(
+            DEFAULT_PYTHON_SANDBOX_IMAGE,
+            manifest=Manifest(extra_path_grants=grants),
+        )
+
+    assert image_lookups == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("root", "target"),
+    [
+        ("/workspace", "/workspace/shared-data"),
+        ("/workspace/project", "/workspace"),
+        ("/mnt/sibling/..", "/mnt/shared-data"),
+        ("/mnt/sibling/../shared-data", "/mnt/shared-data"),
+        ("/outside/../workspace/project", "/workspace"),
+        ("/mnt/sibling/..", PureWindowsPath("/mnt/shared-data")),
+        ("//mnt/sibling/..", "/mnt/shared-data"),
+        ("/mnt/sibling/..", "//mnt/shared-data"),
+        ("//mnt/sibling/../shared-data", "/mnt/shared-data"),
+        ("/outside/../mnt/shared-data/project", "//mnt/shared-data"),
+    ],
+    ids=[
+        "target-inside-workspace",
+        "target-contains-workspace",
+        "normalized-root-contains-target",
+        "normalized-root-equals-target",
+        "target-contains-normalized-root",
+        "windows-path-target",
+        "double-slash-root",
+        "double-slash-target",
+        "double-slash-root-equals-target",
+        "double-slash-target-contains-root",
+    ],
+)
+async def test_docker_rejects_host_path_target_overlapping_workspace_before_image_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root: str,
+    target: str | PureWindowsPath,
+) -> None:
+    client = DockerSandboxClient(docker_client=cast(object, _FakeDockerClient()))
+    image_lookups = 0
+
+    def _image_exists(_image: str) -> bool:
+        nonlocal image_lookups
+        image_lookups += 1
+        return True
+
+    monkeypatch.setattr(client, "image_exists", _image_exists)
+
+    with pytest.raises(
+        ValueError,
+        match="host_path target must be outside the workspace root",
+    ):
+        await client.create(
+            options=DockerSandboxClientOptions(image=DEFAULT_PYTHON_SANDBOX_IMAGE),
+            manifest=Manifest(
+                root=root,
+                extra_path_grants=(
+                    SandboxPathGrant(
+                        path=cast(str, target),
+                        host_path=str(tmp_path),
+                    ),
+                ),
+            ),
+        )
+
+    assert image_lookups == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["create", "resume"])
+@pytest.mark.parametrize("host_grant", [False, True])
+async def test_docker_path_grant_validation_does_not_probe_host_workspace_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    host_grant: bool,
+) -> None:
+    client = DockerSandboxClient(docker_client=cast(object, _FakeDockerClient()))
+    manifest = Manifest(
+        root="//container-only/sibling/../workspace",
+        extra_path_grants=(
+            (SandboxPathGrant(path="/mnt/shared-data", host_path=str(tmp_path)),)
+            if host_grant
+            else ()
+        ),
+    )
+    state = DockerSandboxSessionState(
+        manifest=manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="container",
+    )
+
+    def unexpected_exists(path: Path) -> bool:
+        pytest.fail("Docker path comparison must not probe the host filesystem")
+
+    def provider_lookup(_container_id: str) -> None:
+        raise RuntimeError("provider reached")
+
+    async def provider_create(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("provider reached")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "exists", unexpected_exists)
+        patch.setattr(client, "get_container", provider_lookup)
+        patch.setattr(client, "_create_container", provider_create)
+        with pytest.raises(RuntimeError, match="provider reached"):
+            if operation == "create":
+                await client.create(
+                    manifest=manifest,
+                    options=DockerSandboxClientOptions(image=DEFAULT_PYTHON_SANDBOX_IMAGE),
+                )
+            else:
+                await client.resume(state)
 
 
 @pytest.mark.asyncio
@@ -2140,6 +2832,717 @@ async def test_docker_delete_removes_generated_docker_volumes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_docker_direct_persist_redacts_protected_mount_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = "direct-docker-persist-secret"
+    source_error = docker.errors.APIError(f"provider echoed {sentinel}")
+    source_args = source_error.args
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    container = _DeleteContainer()
+    docker_client = _DeleteDockerClient(container=container, volumes={})
+    session = DockerSandboxSession(
+        docker_client=cast(object, docker_client),
+        container=container,
+        state=DockerSandboxSessionState(
+            manifest=manifest,
+            snapshot=NoopSnapshot(id="snapshot"),
+            image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+            container_id="container",
+        ),
+    )
+
+    async def fail_stage_workspace_copy(**_kwargs: object) -> tuple[Path, Path]:
+        raise source_error
+
+    monkeypatch.setattr(session, "_stage_workspace_copy", fail_stage_workspace_copy)
+
+    with pytest.raises(
+        WorkspaceArchiveReadError, match="protected mount configuration"
+    ) as exc_info:
+        await session.persist_workspace()
+
+    assert exc_info.value.error_code is ErrorCode.WORKSPACE_ARCHIVE_READ_ERROR
+    assert exc_info.value.context == {}
+    assert sentinel not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert source_error.args == source_args
+    # The provider failure is a cause of the caught SDK error and remains untouched.
+    assert source_error.__traceback__ is not None
+
+
+@pytest.mark.asyncio
+async def test_docker_delete_redacts_first_failure_and_settles_all_volumes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    sentinel = "delete-boundary-secret"
+    source_error = RuntimeError(f"shutdown echoed {sentinel}")
+    source_args = source_error.args
+    secondary_error = RuntimeError("secondary container removal failed")
+    manifest = Manifest(
+        entries={
+            "left": S3Mount(
+                bucket="left-bucket",
+                access_key_id="access-key",
+                secret_access_key=sentinel,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            ),
+            "middle": S3Mount(
+                bucket="middle-bucket",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            ),
+            "right": S3Mount(
+                bucket="right-bucket",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            ),
+        }
+    )
+    volume_names = docker_sandbox._docker_volume_names_for_manifest(  # noqa: SLF001
+        manifest,
+        session_id=session_id,
+    )
+    first_volume = _FailingDeleteVolume(RuntimeError("secondary volume removal failed"))
+    second_volume = _DeleteVolume()
+    third_volume = _DeleteVolume()
+    container = _FailingDeleteContainer(secondary_error)
+    docker_client = _DeleteDockerClient(
+        container=container,
+        volumes=dict(
+            zip(
+                volume_names,
+                (first_volume, second_volume, third_volume),
+                strict=True,
+            )
+        ),
+    )
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+    inner = DockerSandboxSession(
+        docker_client=cast(object, docker_client),
+        container=container,
+        state=DockerSandboxSessionState(
+            manifest=manifest,
+            snapshot=NoopSnapshot(id="snapshot"),
+            image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+            container_id="container",
+            session_id=session_id,
+        ),
+    )
+    session = client._wrap_session(inner, instrumentation=client._instrumentation)
+
+    async def fail_shutdown() -> None:
+        raise source_error
+
+    monkeypatch.setattr(inner, "shutdown", fail_shutdown)
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+        await client.delete(session)
+
+    assert sentinel not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert source_error.args == source_args
+    assert source_error.__traceback__ is None
+    assert secondary_error.args == ("secondary container removal failed",)
+    assert container.remove_calls == [{}]
+    assert first_volume.remove_calls == 1
+    assert second_volume.remove_calls == 1
+    assert third_volume.remove_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "lookup_error",
+    [
+        docker.errors.NotFound("container not found"),
+        RuntimeError("container lookup failed"),
+    ],
+)
+async def test_docker_delete_runs_shutdown_and_volume_cleanup_after_lookup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    lookup_error: BaseException,
+) -> None:
+    session_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    volume_names = docker_sandbox._docker_volume_names_for_manifest(  # noqa: SLF001
+        manifest,
+        session_id=session_id,
+    )
+    volume = _DeleteVolume()
+    container = _DeleteContainer()
+    docker_client = _DeleteDockerClient(
+        container=container,
+        volumes={volume_names[0]: volume},
+    )
+    failing_containers = _FailingDeleteContainerCollection(lookup_error)
+    docker_client.containers = failing_containers  # type: ignore[assignment]
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+    inner = DockerSandboxSession(
+        docker_client=cast(object, docker_client),
+        container=container,
+        state=DockerSandboxSessionState(
+            manifest=manifest,
+            snapshot=NoopSnapshot(id="snapshot"),
+            image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+            container_id="container",
+            session_id=session_id,
+        ),
+    )
+    session = client._wrap_session(inner, instrumentation=client._instrumentation)
+    shutdown_calls = 0
+
+    async def record_shutdown() -> None:
+        nonlocal shutdown_calls
+        shutdown_calls += 1
+
+    monkeypatch.setattr(inner, "shutdown", record_shutdown)
+
+    if isinstance(lookup_error, docker.errors.NotFound):
+        assert await client.delete(session) is session
+    else:
+        with pytest.raises(RuntimeError, match="container lookup failed"):
+            await client.delete(session)
+
+    assert shutdown_calls == 1
+    assert failing_containers.get_calls == ["container"]
+    assert docker_client.volumes.get_calls == list(volume_names)
+    assert volume.remove_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_docker_create_cleans_generated_volumes_after_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key="secret-key",
+                mount_strategy=DockerVolumeMountStrategy(
+                    driver="rclone",
+                    driver_options={"s3-secret-access-key": "driver-secret"},
+                ),
+            )
+        }
+    )
+    expected_volume_name = "sandbox_12345678123456781234567812345678_ac6cdb3eb035_workspace_data"
+    container = _FailedStartContainer()
+    volume = _DeleteVolume()
+    docker_client = _DeleteDockerClient(
+        container=container,
+        volumes={expected_volume_name: volume},
+    )
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+
+    async def create_container(*args: object, **kwargs: object) -> _FailedStartContainer:
+        _ = (args, kwargs)
+        return container
+
+    monkeypatch.setattr(uuid, "uuid4", lambda: session_id)
+    monkeypatch.setattr(client, "_create_container", create_container)
+
+    with pytest.raises(RuntimeError, match="protected mount configuration"):
+        await client.create(
+            manifest=manifest,
+            options=DockerSandboxClientOptions(image=DEFAULT_PYTHON_SANDBOX_IMAGE),
+        )
+
+    assert container.remove_calls == [{"force": True}]
+    assert docker_client.volumes.get_calls == [expected_volume_name]
+    assert volume.remove_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_docker_create_cleans_generated_volumes_when_container_acquisition_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key="secret-key",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    expected_volume_name = "sandbox_12345678123456781234567812345678_ac6cdb3eb035_workspace_data"
+    volume = _DeleteVolume()
+    docker_client = _MissingDeleteDockerClient(volumes={expected_volume_name: volume})
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+
+    async def create_container(*args: object, **kwargs: object) -> object:
+        _ = (args, kwargs)
+        raise RuntimeError("container acquisition failed with secret-key")
+
+    monkeypatch.setattr(uuid, "uuid4", lambda: session_id)
+    monkeypatch.setattr(client, "_create_container", create_container)
+
+    with pytest.raises(RuntimeError, match="protected mount configuration"):
+        await client.create(
+            manifest=manifest,
+            options=DockerSandboxClientOptions(image=DEFAULT_PYTHON_SANDBOX_IMAGE),
+        )
+
+    assert docker_client.volumes.get_calls == [expected_volume_name]
+    assert volume.remove_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_docker_create_cleans_resources_after_post_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key="secret-key",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    expected_volume_name = "sandbox_12345678123456781234567812345678_ac6cdb3eb035_workspace_data"
+    container = _StartedContainer()
+    volume = _DeleteVolume()
+    docker_client = _DeleteDockerClient(
+        container=container,
+        volumes={expected_volume_name: volume},
+    )
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+
+    async def create_container(*args: object, **kwargs: object) -> _StartedContainer:
+        _ = (args, kwargs)
+        return container
+
+    def fail_snapshot_resolution(*args: object, **kwargs: object) -> object:
+        _ = (args, kwargs)
+        raise RuntimeError("snapshot resolution failed with secret-key")
+
+    monkeypatch.setattr(uuid, "uuid4", lambda: session_id)
+    monkeypatch.setattr(client, "_create_container", create_container)
+    monkeypatch.setattr(docker_sandbox, "resolve_snapshot", fail_snapshot_resolution)
+
+    with pytest.raises(RuntimeError, match="protected mount configuration"):
+        await client.create(
+            manifest=manifest,
+            options=DockerSandboxClientOptions(image=DEFAULT_PYTHON_SANDBOX_IMAGE),
+        )
+
+    assert container.start_calls == 1
+    assert container.remove_calls == [{"force": True}]
+    assert docker_client.volumes.get_calls == [expected_volume_name]
+    assert volume.remove_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_docker_resume_uses_fresh_volume_identity_and_cleans_partial_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    replacement_session_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key="secret-key",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    expected_volume_name = "sandbox_12345678123456781234567812345678_ac6cdb3eb035_workspace_data"
+    replacement_volume_name = "sandbox_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_ac6cdb3eb035_workspace_data"
+    stale_volume = _DeleteVolume()
+    partial_replacement_volume = _DeleteVolume()
+    docker_client = _MissingDeleteDockerClient(volumes={expected_volume_name: stale_volume})
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+    persisted_state = DockerSandboxSessionState(
+        session_id=session_id,
+        manifest=manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="missing-container",
+        workspace_root_ready=True,
+    )
+    payload = client.serialize_session_state(persisted_state)
+    payload["session_id"] = str(session_id)
+    state = cast(
+        DockerSandboxSessionState,
+        client.deserialize_session_state(payload).rebind_persisted_mount_authority(
+            manifest,
+            provider_backend_id="docker",
+        ),
+    )
+
+    async def create_container(
+        *args: object, session_id: uuid.UUID | None = None, **kwargs: object
+    ) -> object:
+        _ = (args, kwargs)
+        assert session_id == replacement_session_id
+        assert stale_volume.remove_calls == 0
+        docker_client.volumes.set(replacement_volume_name, partial_replacement_volume)
+        raise RuntimeError("replacement acquisition failed with secret-key")
+
+    monkeypatch.setattr(uuid, "uuid4", lambda: replacement_session_id)
+    monkeypatch.setattr(client, "_create_container", create_container)
+
+    with pytest.raises(RuntimeError, match="protected mount configuration"):
+        await client.resume(state)
+
+    assert state.container_id == ""
+    assert state.session_id == session_id
+    assert state.workspace_root_ready is False
+    assert docker_client.volumes.get_calls == [replacement_volume_name]
+    assert stale_volume.remove_calls == 0
+    assert partial_replacement_volume.remove_calls == 1
+    assert docker_client.volumes._volumes == {expected_volume_name: stale_volume}
+
+
+@pytest.mark.asyncio
+async def test_docker_resume_applies_current_authority_with_fresh_volume_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    replacement_session_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="current-access-key",
+                secret_access_key="current-secret-key",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    expected_volume_name = "sandbox_12345678123456781234567812345678_ac6cdb3eb035_workspace_data"
+    replacement_volume_name = "sandbox_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_ac6cdb3eb035_workspace_data"
+    stale_volume = _DeleteVolume()
+    docker_client = _MissingDeleteDockerClient(volumes={expected_volume_name: stale_volume})
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+    persisted_state = DockerSandboxSessionState(
+        session_id=session_id,
+        manifest=Manifest(
+            entries={
+                "data": S3Mount(
+                    bucket="bucket",
+                    access_key_id="previous-access-key",
+                    secret_access_key="previous-secret-key",
+                    mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+                )
+            }
+        ),
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="missing-container",
+    )
+    restored_state = client.deserialize_session_state(
+        client.serialize_session_state(persisted_state)
+    )
+    state = cast(
+        DockerSandboxSessionState,
+        restored_state.rebind_persisted_mount_authority(
+            manifest,
+            provider_backend_id="docker",
+        ),
+    )
+    replacement = _StartedContainer()
+    replacement_volume = _DeleteVolume()
+
+    async def create_container(
+        image: str,
+        *,
+        manifest: Manifest | None = None,
+        exposed_ports: tuple[int, ...] = (),
+        network_mode: str | None = None,
+        session_id: uuid.UUID | None = None,
+        labels: dict[str, str] | None = None,
+    ) -> _StartedContainer:
+        _ = (image, exposed_ports, labels)
+        assert network_mode is None
+        assert session_id == replacement_session_id
+        assert stale_volume.remove_calls == 0
+        assert manifest is state.manifest
+        assert manifest is not None
+        current_mount = manifest.entries["data"]
+        assert isinstance(current_mount, S3Mount)
+        assert current_mount.access_key_id == "current-access-key"
+        assert current_mount.secret_access_key == "current-secret-key"
+        docker_client.volumes.set(replacement_volume_name, replacement_volume)
+        return replacement
+
+    monkeypatch.setattr(uuid, "uuid4", lambda: replacement_session_id)
+    monkeypatch.setattr(client, "_create_container", create_container)
+
+    resumed = await client.resume(state)
+
+    assert isinstance(resumed._inner, DockerSandboxSession)
+    assert state.session_id == replacement_session_id
+    assert docker_client.volumes.get_calls == []
+    assert stale_volume.remove_calls == 0
+    assert docker_client.volumes._volumes == {
+        expected_volume_name: stale_volume,
+        replacement_volume_name: replacement_volume,
+    }
+
+
+@pytest.mark.asyncio
+async def test_docker_resume_does_not_remove_persisted_volume_selected_by_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    replacement_session_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key="secret-key",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    expected_volume_name = "sandbox_12345678123456781234567812345678_ac6cdb3eb035_workspace_data"
+    stale_volume = _FailingDeleteVolume(AssertionError("persisted volume must not be removed"))
+    docker_client = _MissingDeleteDockerClient(volumes={expected_volume_name: stale_volume})
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+    state = DockerSandboxSessionState(
+        session_id=session_id,
+        manifest=manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="missing-container",
+        workspace_root_ready=True,
+    )
+    replacement = _StartedContainer()
+
+    async def create_container(
+        *args: object, session_id: uuid.UUID | None = None, **kwargs: object
+    ) -> object:
+        _ = (args, kwargs)
+        assert session_id == replacement_session_id
+        return replacement
+
+    monkeypatch.setattr(uuid, "uuid4", lambda: replacement_session_id)
+    monkeypatch.setattr(client, "_create_container", create_container)
+
+    resumed = await client.resume(state)
+
+    assert isinstance(resumed._inner, DockerSandboxSession)
+    assert state.container_id == replacement.id
+    assert state.session_id == replacement_session_id
+    assert state.workspace_root_ready is False
+    assert docker_client.volumes.get_calls == []
+    assert stale_volume.remove_calls == 0
+    assert docker_client.volumes._volumes == {expected_volume_name: stale_volume}
+
+
+@pytest.mark.asyncio
+async def test_docker_resume_preserves_direct_credentialless_volume_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    expected_volume_name = "sandbox_12345678123456781234567812345678_ac6cdb3eb035_workspace_data"
+    existing_volume = _DeleteVolume()
+    docker_client = _MissingDeleteDockerClient(volumes={expected_volume_name: existing_volume})
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+    state = DockerSandboxSessionState(
+        session_id=session_id,
+        manifest=manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="missing-container",
+    )
+    replacement = _StartedContainer()
+
+    async def create_container(
+        *args: object, session_id: uuid.UUID | None = None, **kwargs: object
+    ) -> _StartedContainer:
+        _ = (args, kwargs)
+        assert session_id == state.session_id
+        return replacement
+
+    monkeypatch.setattr(client, "_create_container", create_container)
+
+    resumed = await client.resume(state)
+
+    assert isinstance(resumed._inner, DockerSandboxSession)
+    assert state.session_id == session_id
+    assert docker_client.volumes.get_calls == []
+    assert existing_volume.remove_calls == 0
+    assert docker_client.volumes._volumes == {expected_volume_name: existing_volume}
+
+
+@pytest.mark.asyncio
+async def test_docker_resume_cancellation_cleans_partial_volume_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    first_replacement_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    second_replacement_id = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key="secret-key",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    expected_volume_name = "sandbox_12345678123456781234567812345678_ac6cdb3eb035_workspace_data"
+    first_volume_name = "sandbox_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_ac6cdb3eb035_workspace_data"
+    second_volume_name = "sandbox_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb_ac6cdb3eb035_workspace_data"
+    stale_volume = _DeleteVolume()
+    partial_volume = _DeleteVolume()
+    docker_client = _MissingDeleteDockerClient(volumes={expected_volume_name: stale_volume})
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+    state = DockerSandboxSessionState(
+        session_id=session_id,
+        manifest=manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="missing-container",
+        workspace_root_ready=True,
+    )
+    replacement = _StartedContainer()
+    replacement_volume = _DeleteVolume()
+    create_attempts = 0
+
+    async def create_container(
+        *args: object, session_id: uuid.UUID | None = None, **kwargs: object
+    ) -> _StartedContainer:
+        nonlocal create_attempts
+        _ = (args, kwargs)
+        create_attempts += 1
+        if create_attempts == 1:
+            assert session_id == first_replacement_id
+            docker_client.volumes.set(first_volume_name, partial_volume)
+            raise asyncio.CancelledError()
+        assert session_id == second_replacement_id
+        assert partial_volume.remove_calls == 1
+        docker_client.volumes.set(second_volume_name, replacement_volume)
+        return replacement
+
+    replacement_ids = iter((first_replacement_id, second_replacement_id))
+    monkeypatch.setattr(uuid, "uuid4", lambda: next(replacement_ids))
+    monkeypatch.setattr(client, "_create_container", create_container)
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.resume(state)
+
+    assert state.container_id == "missing-container"
+    assert state.session_id == session_id
+    assert state.workspace_root_ready is True
+    assert stale_volume.remove_calls == 0
+    assert partial_volume.remove_calls == 1
+
+    resumed = await client.resume(state)
+
+    assert isinstance(resumed._inner, DockerSandboxSession)
+    assert state.container_id == replacement.id
+    assert state.session_id == second_replacement_id
+    assert state.workspace_root_ready is False
+    assert docker_client.volumes.get_calls == [first_volume_name]
+    assert partial_volume.remove_calls == 1
+    assert docker_client.volumes._volumes == {
+        expected_volume_name: stale_volume,
+        second_volume_name: replacement_volume,
+    }
+
+
+@pytest.mark.asyncio
+async def test_docker_resume_removes_replacement_volumes_when_wrapping_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    replacement_session_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key="secret-key",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    expected_volume_name = "sandbox_12345678123456781234567812345678_ac6cdb3eb035_workspace_data"
+    replacement_volume_name = "sandbox_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_ac6cdb3eb035_workspace_data"
+    replacement = _StartedContainer()
+    stale_volume = _DeleteVolume()
+    replacement_volume = _DeleteVolume()
+    docker_client = _MissingDeleteDockerClient(volumes={expected_volume_name: stale_volume})
+    client = DockerSandboxClient(docker_client=cast(object, docker_client))
+    state = DockerSandboxSessionState(
+        session_id=session_id,
+        manifest=manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="missing-container",
+        workspace_root_ready=True,
+    )
+
+    async def create_container(
+        *args: object, session_id: uuid.UUID | None = None, **kwargs: object
+    ) -> _StartedContainer:
+        _ = (args, kwargs)
+        assert session_id == replacement_session_id
+        assert stale_volume.remove_calls == 0
+        docker_client.volumes.set(replacement_volume_name, replacement_volume)
+        return replacement
+
+    def fail_wrap(*args: object, **kwargs: object) -> object:
+        _ = (args, kwargs)
+        raise RuntimeError("instrumentation binding failed with secret-key")
+
+    monkeypatch.setattr(uuid, "uuid4", lambda: replacement_session_id)
+    monkeypatch.setattr(client, "_create_container", create_container)
+    monkeypatch.setattr(client, "_wrap_session", fail_wrap)
+
+    with pytest.raises(RuntimeError, match="protected mount configuration"):
+        await client.resume(state)
+
+    assert state.container_id == "missing-container"
+    assert state.session_id == session_id
+    assert state.workspace_root_ready is True
+    assert replacement.remove_calls == [{"force": True}]
+    assert docker_client.volumes.get_calls == [replacement_volume_name]
+    assert stale_volume.remove_calls == 0
+    assert replacement_volume.remove_calls == 1
+    assert docker_client.volumes._volumes == {expected_volume_name: stale_volume}
+
+
+@pytest.mark.asyncio
 async def test_docker_clear_workspace_root_on_resume_preserves_nested_docker_volume_mounts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2395,12 +3798,18 @@ class _ResumeContainer:
         container_id: str = "container",
         workspace_exists: bool = False,
         published_ports: dict[str, list[dict[str, str]] | None] | None = None,
+        mounts: list[dict[str, object]] | None = None,
+        labels: dict[str, str] | None = None,
     ) -> None:
         self.status = status
         self.id = container_id
         self.exec_calls: list[dict[str, object]] = []
         self._workspace_exists = workspace_exists
-        self.attrs = {"NetworkSettings": {"Ports": published_ports or {}}}
+        self.attrs = {
+            "NetworkSettings": {"Ports": published_ports or {}},
+            "Mounts": mounts or [],
+            "Config": {"Labels": labels or {}},
+        }
 
     def reload(self) -> None:
         return
@@ -2814,25 +4223,23 @@ async def test_docker_resume_preserves_workspace_readiness_from_state() -> None:
     client = DockerSandboxClient(
         docker_client=_ResumeDockerClient(_ResumeContainer(status="running"))
     )
+    ready_state = DockerSandboxSessionState(
+        manifest=Manifest(root="/workspace"),
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="container",
+        workspace_root_ready=True,
+    )
+    not_ready_state = DockerSandboxSessionState(
+        manifest=Manifest(root="/workspace"),
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="container",
+        workspace_root_ready=False,
+    )
 
-    ready_session = await client.resume(
-        DockerSandboxSessionState(
-            manifest=Manifest(root="/workspace"),
-            snapshot=NoopSnapshot(id="snapshot"),
-            image=DEFAULT_PYTHON_SANDBOX_IMAGE,
-            container_id="container",
-            workspace_root_ready=True,
-        )
-    )
-    not_ready_session = await client.resume(
-        DockerSandboxSessionState(
-            manifest=Manifest(root="/workspace"),
-            snapshot=NoopSnapshot(id="snapshot"),
-            image=DEFAULT_PYTHON_SANDBOX_IMAGE,
-            container_id="container",
-            workspace_root_ready=False,
-        )
-    )
+    ready_session = await client.resume(ready_state)
+    not_ready_session = await client.resume(not_ready_state)
 
     assert isinstance(ready_session._inner, DockerSandboxSession)
     assert ready_session._inner._workspace_root_ready is True
@@ -2843,6 +4250,406 @@ async def test_docker_resume_preserves_workspace_readiness_from_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_docker_resume_reconnects_serialized_credentialless_external_mount() -> None:
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="example-bucket",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    client = DockerSandboxClient(
+        docker_client=_ResumeDockerClient(_ResumeContainer(status="running"))
+    )
+    state = DockerSandboxSessionState(
+        manifest=manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="container",
+    )
+
+    restored = cast(
+        DockerSandboxSessionState,
+        client.deserialize_session_state(client.serialize_session_state(state)),
+    )
+    resumed = await client.resume(restored)
+
+    assert isinstance(resumed._inner, DockerSandboxSession)
+    assert restored.mount_authority_redacted is False
+    assert restored.mount_authority_rebound is False
+    assert restored.session_id == state.session_id
+    assert restored.container_id == "container"
+
+
+@pytest.mark.asyncio
+async def test_docker_resume_does_not_reconnect_identity_from_tampered_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="example-bucket",
+                access_key_id="previous-access-key",
+                secret_access_key="previous-secret-key",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    client = DockerSandboxClient(docker_client=_PositionalOnlyMissingDockerClient())
+    state = DockerSandboxSessionState(
+        manifest=manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="surviving-container",
+    )
+    original_session_id = state.session_id
+    payload = client.serialize_session_state(state)
+    assert payload["container_id"] == ""
+    protected_session_id = uuid.UUID(str(payload["session_id"]))
+    assert protected_session_id != original_session_id
+    payload.pop(REDACTED_MOUNT_AUTHORITY_KEY, None)
+    payload_manifest = cast(dict[str, object], payload["manifest"])
+    cast(dict[str, object], payload_manifest["entries"]).pop("data")
+    restored = cast(DockerSandboxSessionState, client.deserialize_session_state(payload))
+    replacement = _StartedContainer()
+
+    async def create_container(*args: object, **kwargs: object) -> _StartedContainer:
+        _ = args
+        assert kwargs["session_id"] == protected_session_id
+        return replacement
+
+    monkeypatch.setattr(client, "_create_container", create_container)
+
+    resumed = await client.resume(restored)
+
+    assert restored.container_id == replacement.id
+    assert restored.session_id == protected_session_id
+    assert isinstance(resumed._inner, DockerSandboxSession)
+    assert resumed._inner._container is replacement  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_docker_resume_recreates_rebound_authority_for_existing_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    previous_manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="example-bucket",
+                access_key_id="previous-access-key",
+                secret_access_key="previous-secret-key",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    current_manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="example-bucket",
+                access_key_id="current-access-key",
+                secret_access_key="current-secret-key",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    client = DockerSandboxClient(
+        docker_client=_ResumeDockerClient(_ResumeContainer(status="running"))
+    )
+    persisted_state = DockerSandboxSessionState(
+        manifest=previous_manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="container",
+    )
+    restored_state = client.deserialize_session_state(
+        client.serialize_session_state(persisted_state)
+    )
+    rebound_state = cast(
+        DockerSandboxSessionState,
+        restored_state.rebind_persisted_mount_authority(
+            current_manifest,
+            provider_backend_id="docker",
+        ),
+    )
+    replacement_session_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    replacement = _StartedContainer()
+
+    async def create_container(*args: object, **kwargs: object) -> _StartedContainer:
+        _ = args
+        assert kwargs["session_id"] == replacement_session_id
+        manifest = kwargs["manifest"]
+        assert isinstance(manifest, Manifest)
+        mount = manifest.entries["data"]
+        assert isinstance(mount, S3Mount)
+        assert mount.access_key_id == "current-access-key"
+        assert mount.secret_access_key == "current-secret-key"
+        return replacement
+
+    monkeypatch.setattr(uuid, "uuid4", lambda: replacement_session_id)
+    monkeypatch.setattr(client, "_create_container", create_container)
+
+    resumed = await client.resume(rebound_state)
+
+    assert isinstance(resumed._inner, DockerSandboxSession)
+    assert rebound_state.mount_authority_rebound is True
+    assert rebound_state.session_id == replacement_session_id
+    assert rebound_state.container_id == replacement.id
+
+
+@pytest.mark.asyncio
+async def test_docker_resume_accepts_live_credentialless_external_mount() -> None:
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="example-bucket",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    client = DockerSandboxClient(
+        docker_client=_ResumeDockerClient(_ResumeContainer(status="running"))
+    )
+    state = DockerSandboxSessionState(
+        manifest=manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="container",
+    )
+
+    resumed = await client.resume(state)
+
+    assert isinstance(resumed._inner, DockerSandboxSession)
+    assert resumed._inner.state.manifest == manifest
+
+
+@pytest.mark.asyncio
+async def test_docker_resume_recreates_direct_state_with_configured_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="example-bucket",
+                access_key_id="current-access-key",
+                secret_access_key="current-secret-key",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+    client = DockerSandboxClient(
+        docker_client=_ResumeDockerClient(_ResumeContainer(status="running"))
+    )
+    state = DockerSandboxSessionState(
+        manifest=manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="existing-container",
+    )
+    replacement_session_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    replacement = _StartedContainer()
+
+    async def create_container(*args: object, **kwargs: object) -> _StartedContainer:
+        _ = args
+        assert kwargs["session_id"] == replacement_session_id
+        assert kwargs["manifest"] == manifest
+        return replacement
+
+    monkeypatch.setattr(uuid, "uuid4", lambda: replacement_session_id)
+    monkeypatch.setattr(client, "_create_container", create_container)
+
+    resumed = await client.resume(state)
+
+    assert isinstance(resumed._inner, DockerSandboxSession)
+    assert state.session_id == replacement_session_id
+    assert state.container_id == replacement.id
+    assert resumed._inner._workspace_state_preserved_on_start() is False  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_docker_resume_reconnects_serialized_credentialless_state() -> None:
+    container = _ResumeContainer(status="running", container_id="container")
+    client = DockerSandboxClient(docker_client=_ResumeDockerClient(container))
+    state = DockerSandboxSessionState(
+        manifest=Manifest(),
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="container",
+        workspace_root_ready=True,
+    )
+
+    restored = cast(
+        DockerSandboxSessionState,
+        client.deserialize_session_state(client.serialize_session_state(state)),
+    )
+    resumed = await client.resume(restored)
+
+    assert isinstance(resumed._inner, DockerSandboxSession)
+    assert resumed._inner._container is container  # noqa: SLF001
+    assert restored.container_id == "container"
+    assert restored.workspace_root_ready is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root", ["/mnt/sibling/..", "//mnt/sibling/.."])
+async def test_docker_resume_rejects_host_grant_inside_normalized_persisted_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root: str,
+) -> None:
+    client = DockerSandboxClient(docker_client=cast(object, _FakeDockerClient()))
+    trusted_manifest = Manifest(
+        extra_path_grants=(SandboxPathGrant(path="/mnt/shared-data", host_path=str(tmp_path)),),
+    )
+    state = DockerSandboxSessionState(
+        manifest=trusted_manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="container",
+        workspace_root_ready=True,
+    )
+    payload = client.serialize_session_state(state)
+    manifest_payload = payload["manifest"]
+    assert isinstance(manifest_payload, dict)
+    manifest_payload["root"] = root
+    restored = client.deserialize_session_state(payload).rebind_persisted_path_grants(
+        trusted_manifest
+    )
+    assert isinstance(restored, DockerSandboxSessionState)
+
+    def unexpected_lookup(_container_id: str) -> None:
+        pytest.fail("overlapping host grants must be rejected before Docker lookup")
+
+    async def unexpected_create(*args: object, **kwargs: object) -> None:
+        pytest.fail("overlapping host grants must be rejected before Docker creation")
+
+    monkeypatch.setattr(client, "get_container", unexpected_lookup)
+    monkeypatch.setattr(client, "_create_container", unexpected_create)
+
+    with pytest.raises(ValueError, match="host_path target must be outside the workspace root"):
+        await client.resume(restored)
+
+    assert restored.container_id == state.container_id
+    assert restored.session_id == state.session_id
+    assert restored.workspace_root_ready is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root", ["/workspace", "/mnt/sibling/../workspace"])
+async def test_docker_resume_requires_existing_host_mount_to_match_trusted_state(
+    tmp_path: Path,
+    root: str,
+) -> None:
+    host_path = tmp_path / "shared-data"
+    host_path.mkdir()
+    manifest = Manifest(
+        root=root,
+        extra_path_grants=(
+            SandboxPathGrant(
+                path="/mnt/shared-data",
+                host_path=str(host_path),
+                read_only=True,
+            ),
+        ),
+    )
+    matching_client = DockerSandboxClient(
+        docker_client=_ResumeDockerClient(
+            _ResumeContainer(
+                status="running",
+                mounts=[
+                    {
+                        "Type": "bind",
+                        "Source": str(host_path),
+                        "Destination": "/mnt/shared-data",
+                        "RW": False,
+                    }
+                ],
+            )
+        )
+    )
+    state = DockerSandboxSessionState(
+        manifest=manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="container",
+    )
+
+    await matching_client.resume(state)
+
+    mismatched_client = DockerSandboxClient(
+        docker_client=_ResumeDockerClient(_ResumeContainer(status="running"))
+    )
+    with pytest.raises(ValueError, match="does not match the current trusted manifest"):
+        await mismatched_client.resume(state)
+
+
+@pytest.mark.asyncio
+async def test_docker_resume_rejects_stale_bind_mount_for_path_only_grant(
+    tmp_path: Path,
+) -> None:
+    host_path = tmp_path / "shared-data"
+    host_path.mkdir()
+    client = DockerSandboxClient(
+        docker_client=_ResumeDockerClient(
+            _ResumeContainer(
+                status="running",
+                mounts=[
+                    {
+                        "Type": "bind",
+                        "Source": str(host_path),
+                        "Destination": "/mnt/shared-data",
+                        "RW": True,
+                    }
+                ],
+            )
+        )
+    )
+    state = DockerSandboxSessionState(
+        manifest=Manifest(
+            extra_path_grants=(SandboxPathGrant(path="/mnt/shared-data"),),
+        ),
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="container",
+    )
+
+    with pytest.raises(ValueError, match="not present in the current trusted manifest"):
+        await client.resume(state)
+
+
+@pytest.mark.asyncio
+async def test_docker_resume_rejects_bind_mount_when_persisted_grants_are_removed(
+    tmp_path: Path,
+) -> None:
+    host_path = tmp_path / "shared-data"
+    host_path.mkdir()
+    client = DockerSandboxClient(
+        docker_client=_ResumeDockerClient(
+            _ResumeContainer(
+                status="running",
+                mounts=[
+                    {
+                        "Type": "bind",
+                        "Source": str(host_path),
+                        "Destination": "/mnt/shared-data",
+                        "RW": True,
+                    }
+                ],
+            )
+        )
+    )
+    state = DockerSandboxSessionState(
+        manifest=Manifest(),
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id="container",
+    )
+
+    with pytest.raises(ValueError, match="not present in the current trusted manifest"):
+        await client.resume(state)
+
+
+@pytest.mark.asyncio
 async def test_docker_resume_resets_workspace_readiness_when_container_is_recreated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2850,17 +4657,20 @@ async def test_docker_resume_resets_workspace_readiness_when_container_is_recrea
         docker_client=cast(object, _ResumeDockerClient(docker.errors.NotFound("missing")))
     )
     replacement = _ResumeContainer(status="created", container_id="replacement")
-    create_calls: list[tuple[str, Manifest | None, tuple[int, ...]]] = []
+    create_calls: list[tuple[str, Manifest | None, tuple[int, ...], str | None]] = []
 
     async def _fake_create_container(
         image: str,
         *,
         manifest: Manifest | None = None,
         exposed_ports: tuple[int, ...] = (),
+        network_mode: str | None = None,
         session_id: uuid.UUID | None = None,
+        labels: dict[str, str] | None = None,
     ) -> object:
         _ = session_id
-        create_calls.append((image, manifest, exposed_ports))
+        _ = labels
+        create_calls.append((image, manifest, exposed_ports, network_mode))
         return replacement
 
     monkeypatch.setattr(client, "_create_container", _fake_create_container)
@@ -2882,26 +4692,110 @@ async def test_docker_resume_resets_workspace_readiness_when_container_is_recrea
     assert inner.state.workspace_root_ready is False
     assert inner._workspace_root_ready is False
     assert inner.should_provision_manifest_accounts_on_resume() is True
-    assert create_calls == [(DEFAULT_PYTHON_SANDBOX_IMAGE, inner.state.manifest, (8765,))]
+    assert create_calls == [(DEFAULT_PYTHON_SANDBOX_IMAGE, inner.state.manifest, (8765,), None)]
 
 
 @pytest.mark.asyncio
-async def test_docker_resume_recovers_workspace_workdir_when_root_already_exists(
+async def test_docker_resume_forwards_persisted_labels_when_recreating_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = DockerSandboxClient(
+        docker_client=cast(object, _ResumeDockerClient(docker.errors.NotFound("missing")))
+    )
+    replacement = _ResumeContainer(status="created", container_id="replacement")
+    labels = {"com.example.owner": "worker-123"}
+    forwarded_labels: list[dict[str, str] | None] = []
+
+    async def _fake_create_container(
+        image: str,
+        *,
+        manifest: Manifest | None = None,
+        exposed_ports: tuple[int, ...] = (),
+        network_mode: str | None = None,
+        session_id: uuid.UUID | None = None,
+        labels: dict[str, str] | None = None,
+    ) -> _ResumeContainer:
+        _ = (image, manifest, exposed_ports, network_mode, session_id)
+        forwarded_labels.append(labels)
+        return replacement
+
+    monkeypatch.setattr(client, "_create_container", _fake_create_container)
+
+    resumed = await client.resume(
+        DockerSandboxSessionState(
+            manifest=Manifest(root="/workspace"),
+            snapshot=NoopSnapshot(id="snapshot"),
+            image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+            container_id="missing",
+            labels=labels,
+        )
+    )
+
+    assert isinstance(resumed._inner, DockerSandboxSession)
+    assert forwarded_labels == [labels]
+
+
+@pytest.mark.asyncio
+async def test_docker_resume_reuses_container_with_matching_labels() -> None:
+    labels = {"com.example.owner": "worker-123"}
+    container = _ResumeContainer(
+        status="running",
+        labels={**labels, "com.example.extra": "preserved"},
+    )
+    client = DockerSandboxClient(docker_client=_ResumeDockerClient(container))
+    state = DockerSandboxSessionState(
+        manifest=Manifest(root="/workspace"),
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id=container.id,
+        labels=labels,
+    )
+
+    resumed = await client.resume(state)
+
+    assert isinstance(resumed._inner, DockerSandboxSession)
+    assert resumed._inner._container is container
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "actual_labels",
+    [{}, {"com.example.owner": "different"}],
+    ids=["missing", "mismatched"],
+)
+async def test_docker_resume_rejects_mismatched_existing_labels(
+    actual_labels: dict[str, str],
+) -> None:
+    expected_labels = {"com.example.owner": "worker-123"}
+    container = _ResumeContainer(status="running", labels=actual_labels)
+    client = DockerSandboxClient(docker_client=_ResumeDockerClient(container))
+    state = DockerSandboxSessionState(
+        manifest=Manifest(root="/workspace"),
+        snapshot=NoopSnapshot(id="snapshot"),
+        image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+        container_id=container.id,
+        labels=expected_labels,
+    )
+
+    with pytest.raises(ValueError, match="labels"):
+        await client.resume(state)
+
+
+@pytest.mark.asyncio
+async def test_docker_resume_recovers_workspace_workdir_for_direct_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     container = _ResumeContainer(status="running", workspace_exists=True)
     client = DockerSandboxClient(docker_client=_ResumeDockerClient(container))
 
-    payload = DockerSandboxSessionState(
+    state = DockerSandboxSessionState(
         manifest=Manifest(root="/workspace"),
         snapshot=NoopSnapshot(id="snapshot"),
         image=DEFAULT_PYTHON_SANDBOX_IMAGE,
         container_id="container",
-        workspace_root_ready=True,
-    ).model_dump(mode="json")
-    payload.pop("workspace_root_ready")
+    )
 
-    resumed = await client.resume(client.deserialize_session_state(payload))
+    resumed = await client.resume(state)
     assert isinstance(resumed._inner, DockerSandboxSession)
 
     loop = asyncio.get_running_loop()

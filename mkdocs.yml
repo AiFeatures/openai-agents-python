@@ -61,6 +61,14 @@ plugins:
                     - Concepts: sandbox/guide.md
                     - Sandbox clients: sandbox/clients.md
                     - Agent memory: sandbox/memory.md
+                - Realtime agents:
+                    - Quickstart: realtime/quickstart.md
+                    - Transport: realtime/transport.md
+                    - Guide: realtime/guide.md
+                - Voice agents:
+                    - Quickstart: voice/quickstart.md
+                    - Pipeline: voice/pipeline.md
+                    - Tracing: voice/tracing.md
                 - Models: models/index.md
                 - Tools: tools.md
                 - Guardrails: guardrails.md
@@ -79,17 +87,9 @@ plugins:
                 - Usage: usage.md
                 - Model context protocol (MCP): mcp.md
                 - Tracing: tracing.md
-                - Realtime agents:
-                    - Quickstart: realtime/quickstart.md
-                    - Transport: realtime/transport.md
-                    - Guide: realtime/guide.md
-                - Voice agents:
-                    - Quickstart: voice/quickstart.md
-                    - Pipeline: voice/pipeline.md
-                    - Tracing: voice/tracing.md
+                - Testing: testing.md
                 - Agent visualization: visualization.md
                 - REPL utility: repl.md
-                - Examples: examples.md
                 - Release process/changelog: release.md
 
             - API Reference:
@@ -99,6 +99,7 @@ plugins:
                     - Runner: ref/run.md
                     - Run config: ref/run_config.md
                     - Run state: ref/run_state.md
+                    - Testing: ref/testing.md
                     - Sandbox:
                         - Overview: ref/sandbox.md
                         - SandboxAgent: ref/sandbox/sandbox_agent.md
@@ -124,6 +125,7 @@ plugins:
                     - Memory: ref/memory.md
                     - REPL: ref/repl.md
                     - Tools: ref/tool.md
+                    - Decorators: ref/decorators.md
                     - Tool context: ref/tool_context.md
                     - Results: ref/result.md
                     - Streaming events: ref/stream_events.md
@@ -167,6 +169,7 @@ plugins:
                     - Events: ref/realtime/events.md
                     - Configuration: ref/realtime/config.md
                     - Model: ref/realtime/model.md
+                    - Testing: ref/realtime/testing.md
                 - Voice:
                     - Pipeline: ref/voice/pipeline.md
                     - Workflow: ref/voice/workflow.md
@@ -180,6 +183,7 @@ plugins:
                     - OpenAI voice model provider: ref/voice/models/openai_provider.md
                     - OpenAI STT: ref/voice/models/openai_stt.md
                     - OpenAI TTS: ref/voice/models/openai_tts.md
+                    - Testing: ref/voice/testing.md
                 - Extensions:
                     - Handoff filters: ref/extensions/handoff_filters.md
                     - Handoff prompt: ref/extensions/handoff_prompt.md
@@ -210,6 +214,13 @@ plugins:
                     - 概念: sandbox/guide.md
                     - Sandbox クライアント: sandbox/clients.md
                     - エージェントメモリ: sandbox/memory.md
+                - リアルタイムエージェント:
+                    - realtime/quickstart.md
+                    - realtime/guide.md
+                - 音声エージェント:
+                    - voice/quickstart.md
+                    - voice/pipeline.md
+                    - voice/tracing.md
                 - モデル: models/index.md
                 - tools.md
                 - guardrails.md
@@ -228,16 +239,9 @@ plugins:
                 - usage.md
                 - mcp.md
                 - tracing.md
-                - リアルタイムエージェント:
-                    - realtime/quickstart.md
-                    - realtime/guide.md
-                - 音声エージェント:
-                    - voice/quickstart.md
-                    - voice/pipeline.md
-                    - voice/tracing.md
+                - テスト: testing.md
                 - visualization.md
                 - repl.md
-                - コード例: examples.md
                 - release.md
         - locale: ko
           name: 한국어
@@ -253,6 +257,13 @@ plugins:
                     - 개념: sandbox/guide.md
                     - 샌드박스 클라이언트: sandbox/clients.md
                     - 에이전트 메모리: sandbox/memory.md
+                - 실시간 에이전트:
+                    - realtime/quickstart.md
+                    - realtime/guide.md
+                - 음성 에이전트:
+                    - voice/quickstart.md
+                    - voice/pipeline.md
+                    - voice/tracing.md
                 - 모델: models/index.md
                 - tools.md
                 - guardrails.md
@@ -271,16 +282,9 @@ plugins:
                 - usage.md
                 - mcp.md
                 - tracing.md
-                - 실시간 에이전트:
-                    - realtime/quickstart.md
-                    - realtime/guide.md
-                - 음성 에이전트:
-                    - voice/quickstart.md
-                    - voice/pipeline.md
-                    - voice/tracing.md
+                - 테스트: testing.md
                 - visualization.md
                 - repl.md
-                - 코드 예제: examples.md
                 - release.md
         - locale: zh
           name: 简体中文
@@ -296,6 +300,13 @@ plugins:
                     - 概念: sandbox/guide.md
                     - 沙箱客户端: sandbox/clients.md
                     - 智能体记忆: sandbox/memory.md
+                - 实时智能体:
+                    - realtime/quickstart.md
+                    - realtime/guide.md
+                - 语音智能体:
+                    - voice/quickstart.md
+                    - voice/pipeline.md
+                    - voice/tracing.md
                 - 模型: models/index.md
                 - tools.md
                 - guardrails.md
@@ -314,16 +325,9 @@ plugins:
                 - usage.md
                 - mcp.md
                 - tracing.md
-                - 实时智能体:
-                    - realtime/quickstart.md
-                    - realtime/guide.md
-                - 语音智能体:
-                    - voice/quickstart.md
-                    - voice/pipeline.md
-                    - voice/tracing.md
+                - 测试: testing.md
                 - visualization.md
                 - repl.md
-                - 示例: examples.md
                 - release.md
 extra:
   # Remove material generation message in footer

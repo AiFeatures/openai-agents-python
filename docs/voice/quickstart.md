@@ -8,6 +8,12 @@ Make sure you've followed the base [quickstart instructions](../quickstart.md) f
 pip install 'openai-agents[voice]'
 ```
 
+The demo code below also uses [`sounddevice`](https://pypi.org/project/sounddevice/) for microphone and speaker I/O, which is not part of the `voice` extra:
+
+```bash
+pip install sounddevice
+```
+
 ## Concepts
 
 The main concept to know about is a [`VoicePipeline`][agents.voice.pipeline.VoicePipeline], which is a 3 step process:
@@ -44,20 +50,17 @@ graph LR
 
 ## Agents
 
-First, let's set up some Agents. This should feel familiar to you if you've built any agents with this SDK. We'll have a couple of Agents, a handoff, and a tool.
+First, let's set up some Agents. This should feel familiar to you if you've built any agents with this SDK. We'll have two Agents, a configured handoff, and a tool.
 
 ```python
 import random
 
-from agents import (
-    Agent,
-    function_tool,
-)
+from agents import Agent
+from agents.decorators import tool
 from agents.extensions.handoff_prompt import prompt_with_handoff_instructions
 
 
-
-@function_tool
+@tool
 def get_weather(city: str) -> str:
     """Get the weather for a given city."""
     print(f"[debug] get_weather called with city: {city}")
@@ -91,6 +94,7 @@ We'll set up a simple voice pipeline, using [`SingleAgentVoiceWorkflow`][agents.
 
 ```python
 from agents.voice import SingleAgentVoiceWorkflow, VoicePipeline
+
 pipeline = VoicePipeline(workflow=SingleAgentVoiceWorkflow(agent))
 ```
 
@@ -116,7 +120,6 @@ player.start()
 async for event in result.stream():
     if event.type == "voice_stream_event_audio":
         player.write(event.data)
-
 ```
 
 ## Put it all together
@@ -128,10 +131,8 @@ import random
 import numpy as np
 import sounddevice as sd
 
-from agents import (
-    Agent,
-    function_tool,
-)
+from agents import Agent
+from agents.decorators import tool
 from agents.voice import (
     AudioInput,
     SingleAgentVoiceWorkflow,
@@ -140,7 +141,7 @@ from agents.voice import (
 from agents.extensions.handoff_prompt import prompt_with_handoff_instructions
 
 
-@function_tool
+@tool
 def get_weather(city: str) -> str:
     """Get the weather for a given city."""
     print(f"[debug] get_weather called with city: {city}")
@@ -189,4 +190,4 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-If you run this example, the agent will speak to you! Check out the example in [examples/voice/static](https://github.com/openai/openai-agents-python/tree/main/examples/voice/static) to see a demo where you can speak to the agent yourself.
+If you run this example, the agent will produce spoken audio for you to hear! Check out the example in [examples/voice/static](https://github.com/openai/openai-agents-python/tree/main/examples/voice/static) to see a demo where you can speak to the agent yourself.

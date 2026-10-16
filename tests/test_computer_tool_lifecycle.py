@@ -26,7 +26,7 @@ from agents import (
 )
 from agents.computer import Button, Computer, Environment
 from agents.models.openai_responses import Converter
-from tests.fake_model import FakeModel
+from agents.testing import ScriptedModel
 
 
 class FakeComputer(Computer):
@@ -158,7 +158,7 @@ async def test_runner_disposes_computer_after_run() -> None:
     dispose = AsyncMock()
 
     tool = ComputerTool(computer=ComputerProvider[FakeComputer](create=create, dispose=dispose))
-    model = FakeModel(initial_output=[_make_message("done")])
+    model = ScriptedModel(steps=[[_make_message("done")]])
     agent = Agent(name="ComputerAgent", model=model, tools=[tool])
 
     result = await Runner.run(agent, "hello")
@@ -167,7 +167,7 @@ async def test_runner_disposes_computer_after_run() -> None:
     create.assert_awaited_once()
     dispose.assert_awaited_once()
     dispose.assert_awaited_with(run_context=result.context_wrapper, computer=created)
-    resolved_tool = cast(ComputerTool[Any], model.last_turn_args["tools"][0])
+    resolved_tool = cast(ComputerTool[Any], model.calls[-1].tools[0])
     assert resolved_tool is not tool
     assert resolved_tool.computer is created
 
@@ -194,27 +194,29 @@ async def test_runner_preserves_concrete_computer_tool_identity_for_hooks() -> N
             self.ended.append(tool)
 
     tool = ComputerTool(computer=FakeComputer("concrete"))
-    model = FakeModel(
-        initial_output=[
-            ResponseComputerToolCall(
-                id="computer-call",
-                type="computer_call",
-                action=ActionScreenshot(type="screenshot"),
-                call_id="computer-call",
-                pending_safety_checks=[],
-                status="completed",
-            )
+    model = ScriptedModel(
+        steps=[
+            [
+                ResponseComputerToolCall(
+                    id="computer-call",
+                    type="computer_call",
+                    action=ActionScreenshot(type="screenshot"),
+                    call_id="computer-call",
+                    pending_safety_checks=[],
+                    status="completed",
+                )
+            ]
         ]
     )
-    model.set_next_output([_make_message("done")])
+    model.enqueue([_make_message("done")])
     agent = Agent(name="ComputerAgent", model=model, tools=[tool])
     hooks = IdentityHooks()
 
     result = await Runner.run(agent, "hello", hooks=hooks)
 
     assert result.final_output == "done"
-    assert model.first_turn_args is not None
-    assert model.first_turn_args["tools"][0] is tool
+    assert bool(model.calls)
+    assert model.calls[0].tools[0] is tool
     assert hooks.started == [tool]
     assert hooks.ended == [tool]
 
@@ -239,10 +241,10 @@ async def test_concurrent_runs_keep_computer_provider_instances_isolated() -> No
     release_model = [asyncio.Event(), asyncio.Event()]
     serialized_widths: list[int] = []
 
-    class GatedSerializationModel(FakeModel):
+    class GatedSerializationModel(ScriptedModel):
         def __init__(self) -> None:
-            super().__init__(initial_output=[_make_message("done")])
-            self.set_next_output([_make_message("done")])
+            super().__init__(steps=[[_make_message("done")]])
+            self.enqueue([_make_message("done")])
             self.call_count = 0
 
         async def get_response(
@@ -331,7 +333,7 @@ async def test_streamed_run_disposes_computer_after_completion() -> None:
     dispose = AsyncMock()
 
     tool = ComputerTool(computer=ComputerProvider[FakeComputer](create=create, dispose=dispose))
-    model = FakeModel(initial_output=[_make_message("done")])
+    model = ScriptedModel(steps=[[_make_message("done")]])
     agent = Agent(name="ComputerAgent", model=model, tools=[tool])
 
     streamed_result = Runner.run_streamed(agent, "hello")
@@ -342,6 +344,56 @@ async def test_streamed_run_disposes_computer_after_completion() -> None:
     create.assert_awaited_once()
     dispose.assert_awaited_once()
     dispose.assert_awaited_with(run_context=streamed_result.context_wrapper, computer=created)
-    resolved_tool = cast(ComputerTool[Any], model.last_turn_args["tools"][0])
+    resolved_tool = cast(ComputerTool[Any], model.calls[-1].tools[0])
     assert resolved_tool is not tool
     assert resolved_tool.computer is created
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("fail_prompt", [False, True])
+async def test_start_hook_replaces_computer_before_initialization(
+    streamed: bool, fail_prompt: bool
+) -> None:
+    old_create = AsyncMock(return_value=FakeComputer("old"))
+    old_dispose = AsyncMock()
+    new_create = AsyncMock(return_value=FakeComputer("new"))
+    new_dispose = AsyncMock()
+    old_tool = ComputerTool(computer=ComputerProvider(create=old_create, dispose=old_dispose))
+    new_tool = ComputerTool(computer=ComputerProvider(create=new_create, dispose=new_dispose))
+
+    class ReplaceComputerHooks(RunHooks):
+        async def on_agent_start(self, context, agent) -> None:
+            await asyncio.sleep(0)
+            agent.tools = [new_tool]
+
+    async def instructions(context, agent) -> str:
+        if fail_prompt:
+            raise RuntimeError("prompt failed")
+        return "Use the computer."
+
+    model = ScriptedModel(steps=[[_make_message("done")]])
+    agent = Agent(name="computer", model=model, tools=[old_tool], instructions=instructions)
+
+    async def run() -> None:
+        if streamed:
+            result = Runner.run_streamed(agent, "go", hooks=ReplaceComputerHooks())
+            async for _ in result.stream_events():
+                pass
+        else:
+            result = await Runner.run(agent, "go", hooks=ReplaceComputerHooks())
+        assert result.final_output == "done"
+
+    if fail_prompt:
+        with pytest.raises(RuntimeError, match="prompt failed"):
+            await run()
+        assert model.calls == ()
+    else:
+        await run()
+        assert len(model.calls[0].tools) == 1
+        assert isinstance(model.calls[0].tools[0], ComputerTool)
+        assert model.calls[0].tools[0].computer is new_create.return_value
+    old_create.assert_not_awaited()
+    old_dispose.assert_not_awaited()
+    new_create.assert_awaited_once()
+    new_dispose.assert_awaited_once()
