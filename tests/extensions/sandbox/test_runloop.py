@@ -21,13 +21,22 @@ from agents.run_state import RunState
 from agents.sandbox import Manifest, SandboxPathGrant
 from agents.sandbox.capabilities import Shell
 from agents.sandbox.capabilities.tools.shell_tool import ExecCommandArgs, ExecCommandTool
-from agents.sandbox.entries import File, InContainerMountStrategy, Mount, MountpointMountPattern
+from agents.sandbox.entries import (
+    File,
+    InContainerMountStrategy,
+    Mount,
+    MountpointMountPattern,
+    RcloneMountPattern,
+    S3Mount,
+)
 from agents.sandbox.entries.mounts.base import InContainerMountAdapter
+from agents.sandbox.errors import MountConfigError
 from agents.sandbox.manifest import Environment
 from agents.sandbox.materialization import MaterializedFile
 from agents.sandbox.session.base_sandbox_session import BaseSandboxSession
 from agents.sandbox.session.dependencies import Dependencies
 from agents.sandbox.session.sandbox_client import BaseSandboxClientOptions
+from agents.sandbox.session.sandbox_session_state import SandboxSessionState
 from agents.sandbox.snapshot import NoopSnapshot, SnapshotBase
 from agents.sandbox.types import ExposedPortEndpoint
 from tests.utils.factories import make_run_state
@@ -1269,9 +1278,28 @@ def _load_runloop_module(monkeypatch: pytest.MonkeyPatch) -> Any:
         "runloop_api_client.types.shared.launch_parameters",
         fake_launch_parameters_module,
     )
-    sys.modules.pop("agents.extensions.sandbox.runloop.sandbox", None)
-    sys.modules.pop("agents.extensions.sandbox.runloop", None)
-    return importlib.import_module("agents.extensions.sandbox.runloop.sandbox")
+    # Re-importing an adapter also replaces its registered model classes.
+    # Record undo before clearing these entries for fresh class registration;
+    # unrelated registrations must survive teardown.
+    monkeypatch.setitem(
+        SandboxSessionState._subclass_registry,
+        "runloop",
+        SandboxSessionState._subclass_registry.get("runloop", SandboxSessionState),
+    )
+    del SandboxSessionState._subclass_registry["runloop"]
+    module_names = (
+        "agents.extensions.sandbox.runloop.sandbox",
+        "agents.extensions.sandbox.runloop",
+    )
+    for name in module_names:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    module: Any = importlib.import_module("agents.extensions.sandbox.runloop.sandbox")
+    # Track the fresh imports too, so teardown removes them before restoring
+    # any original modules alongside the real provider SDK.
+    for name in module_names:
+        monkeypatch.setitem(sys.modules, name, sys.modules.pop(name))
+    return module
 
 
 def _build_tar_bytes(files: dict[str, bytes]) -> bytes:
@@ -1293,6 +1321,18 @@ def test_runloop_package_re_exports_backend_symbols(monkeypatch: pytest.MonkeyPa
     assert package_module.RunloopLaunchParameters is runloop_module.RunloopLaunchParameters
     assert package_module.RunloopAfterIdle is runloop_module.RunloopAfterIdle
     assert package_module.RunloopUserParameters is runloop_module.RunloopUserParameters
+
+
+@pytest.fixture(autouse=True)
+def _trust_recording_mounts_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agents.sandbox import _mount_security
+
+    original = _mount_security._mount_class_is_trusted
+    monkeypatch.setattr(
+        _mount_security,
+        "_mount_class_is_trusted",
+        lambda mount: isinstance(mount, _RecordingMount) or original(mount),
+    )
 
 
 class _RecordingMount(Mount):
@@ -1854,6 +1894,90 @@ class TestRunloopSandbox:
         assert session.state.secret_refs == {"API_KEY": "API_KEY"}
 
     @pytest.mark.asyncio
+    async def test_create_references_existing_managed_secrets_without_uploading_values(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runloop_module = _load_runloop_module(monkeypatch)
+
+        async with runloop_module.RunloopSandboxClient() as client:
+            session = await client.create(
+                options=runloop_module.RunloopSandboxClientOptions(
+                    managed_secrets={
+                        "SHARED_TOKEN": runloop_module.RunloopExistingSecret(),
+                        "API_KEY": runloop_module.RunloopExistingSecret(),
+                    },
+                )
+            )
+            sdk = _FakeAsyncRunloopSDK.created_instances[-1]
+
+        assert sdk.secret.create_calls == []
+        assert sdk.secret.update_calls == []
+        create_params = sdk.devbox.create_calls[0]
+        assert create_params["secrets"] == {
+            "API_KEY": "API_KEY",
+            "SHARED_TOKEN": "SHARED_TOKEN",
+        }
+        assert session.state.secret_refs == {
+            "API_KEY": "API_KEY",
+            "SHARED_TOKEN": "SHARED_TOKEN",
+        }
+
+    @pytest.mark.asyncio
+    async def test_create_mixes_existing_and_uploaded_managed_secrets(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runloop_module = _load_runloop_module(monkeypatch)
+
+        async with runloop_module.RunloopSandboxClient() as client:
+            session = await client.create(
+                options=runloop_module.RunloopSandboxClientOptions(
+                    managed_secrets={
+                        "API_KEY": "super-secret",
+                        "SHARED_TOKEN": runloop_module.RunloopExistingSecret(),
+                    },
+                )
+            )
+            sdk = _FakeAsyncRunloopSDK.created_instances[-1]
+
+        assert sdk.secret.create_calls == [("API_KEY", "super-secret", {"timeout": 30.0})]
+        assert sdk.secret.update_calls == []
+        assert "SHARED_TOKEN" not in sdk.secret.secrets
+        create_params = sdk.devbox.create_calls[0]
+        assert create_params["secrets"] == {
+            "API_KEY": "API_KEY",
+            "SHARED_TOKEN": "SHARED_TOKEN",
+        }
+        assert session.state.secret_refs == {
+            "API_KEY": "API_KEY",
+            "SHARED_TOKEN": "SHARED_TOKEN",
+        }
+        assert "super-secret" not in json.dumps(session.state.model_dump(mode="json"))
+
+    def test_runloop_client_options_round_trip_existing_managed_secrets(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runloop_module = _load_runloop_module(monkeypatch)
+
+        options = runloop_module.RunloopSandboxClientOptions(
+            managed_secrets={
+                "API_KEY": "super-secret",
+                "SHARED_TOKEN": runloop_module.RunloopExistingSecret(),
+            },
+        )
+
+        restored = runloop_module.RunloopSandboxClientOptions.model_validate(
+            json.loads(json.dumps(options.model_dump(mode="json")))
+        )
+
+        assert restored.managed_secrets == {
+            "API_KEY": "super-secret",
+            "SHARED_TOKEN": runloop_module.RunloopExistingSecret(),
+        }
+
+    @pytest.mark.asyncio
     async def test_resume_and_snapshot_restore_reuse_runloop_native_options(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -2049,7 +2173,10 @@ class TestRunloopSandbox:
             session = await client.create(
                 options=runloop_module.RunloopSandboxClientOptions(pause_on_exit=True),
             )
-            state = session.state
+            state = cast(
+                Any,
+                client.deserialize_session_state(client.serialize_session_state(session.state)),
+            )
             sdk = _FakeAsyncRunloopSDK.created_instances[-1]
             sdk.devbox.create_calls.clear()
             sdk.devbox.devboxes[state.devbox_id].status = "suspended"
@@ -2059,6 +2186,41 @@ class TestRunloopSandbox:
         assert sdk.devbox.from_id_calls == [state.devbox_id]
         assert sdk.devbox.create_calls == []
         assert resumed._inner._skip_start is True  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_skip_start_rejects_unsafe_mount_before_provider_work(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sentinel = "runloop-start-secret"
+        runloop_module = _load_runloop_module(monkeypatch)
+
+        async with runloop_module.RunloopSandboxClient() as client:
+            session = await client.create(options=runloop_module.RunloopSandboxClientOptions())
+            sdk = _FakeAsyncRunloopSDK.created_instances[-1]
+            devbox = sdk.devbox.devboxes[session.state.devbox_id]
+            session.state.manifest = Manifest(
+                entries={
+                    "data": S3Mount(
+                        bucket="bucket",
+                        access_key_id="access-key",
+                        secret_access_key=sentinel,
+                        mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
+                    )
+                }
+            )
+            session._inner._skip_start = True  # noqa: SLF001
+            exec_calls_before = len(devbox.exec_calls)
+            resume_calls_before = devbox.resume_calls
+            snapshot_calls_before = len(devbox.snapshot_calls)
+
+            with pytest.raises(MountConfigError) as exc:
+                await session.start()
+
+        assert len(devbox.exec_calls) == exec_calls_before
+        assert devbox.resume_calls == resume_calls_before
+        assert len(devbox.snapshot_calls) == snapshot_calls_before
+        assert sentinel not in str(exc.value)
 
     @pytest.mark.asyncio
     async def test_resume_reconnects_running_devbox_without_pause(

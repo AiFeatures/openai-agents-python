@@ -18,6 +18,7 @@ from pydantic import Field, PrivateAttr
 from agents.sandbox import Manifest
 from agents.sandbox.config import DEFAULT_PYTHON_SANDBOX_IMAGE
 from agents.sandbox.entries import (
+    Dir,
     File,
     GCSMount,
     InContainerMountStrategy,
@@ -26,11 +27,12 @@ from agents.sandbox.entries import (
     R2Mount,
     S3Mount,
 )
-from agents.sandbox.entries.mounts.base import InContainerMountAdapter
+from agents.sandbox.entries.mounts.base import InContainerMountAdapter, MountStrategyBase
 from agents.sandbox.errors import (
     InvalidManifestPathError,
     MountConfigError,
     WorkspaceArchiveReadError,
+    WorkspaceArchiveWriteError,
     WorkspaceReadNotFoundError,
 )
 from agents.sandbox.files import EntryKind
@@ -41,6 +43,7 @@ from agents.sandbox.session.runtime_helpers import (
     RESOLVE_WORKSPACE_PATH_HELPER,
     WORKSPACE_FINGERPRINT_HELPER,
 )
+from agents.sandbox.session.sandbox_session_state import SandboxSessionState
 from agents.sandbox.snapshot import LocalSnapshot
 from agents.sandbox.types import ExecResult
 
@@ -60,6 +63,28 @@ def _set_aio_attr(obj: object, name: str, fn: Callable[..., object]) -> None:
     setattr(obj, name, _with_aio(fn))
 
 
+@pytest.fixture(autouse=True)
+def _trust_recording_mounts_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agents.sandbox import _mount_security
+
+    original = _mount_security._mount_class_is_trusted
+    monkeypatch.setattr(
+        _mount_security,
+        "_mount_class_is_trusted",
+        lambda mount: isinstance(mount, _RecordingMount) or original(mount),
+    )
+
+
+class _AsyncGate:
+    def __init__(self, started: asyncio.Event, release: asyncio.Event) -> None:
+        self.started = started
+        self.release = release
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _AsyncGate:
+        _ = memo
+        return self
+
+
 class _RecordingMount(Mount):
     type: str = "modal_recording_mount"
     mount_strategy: InContainerMountStrategy = Field(
@@ -67,6 +92,10 @@ class _RecordingMount(Mount):
     )
     _events: list[tuple[str, str]] = PrivateAttr(default_factory=list)
     _teardown_error: str | None = PrivateAttr(default=None)
+    _teardown_gate: _AsyncGate | None = PrivateAttr(default=None)
+    _restore_error: str | None = PrivateAttr(default=None)
+    _restore_cancelled: bool = PrivateAttr(default=False)
+    _restore_gate: _AsyncGate | None = PrivateAttr(default=None)
 
     def bind_events(self, events: list[tuple[str, str]]) -> _RecordingMount:
         self._events = events
@@ -74,6 +103,38 @@ class _RecordingMount(Mount):
 
     def bind_teardown_error(self, message: str) -> _RecordingMount:
         self._teardown_error = message
+        return self
+
+    def bind_restore_error(self, message: str) -> _RecordingMount:
+        self._restore_error = message
+        return self
+
+    def bind_restore_cancellation(
+        self,
+        started: asyncio.Event,
+        release: asyncio.Event,
+    ) -> _RecordingMount:
+        self._restore_gate = _AsyncGate(started, release)
+        self._restore_cancelled = True
+        return self
+
+    def bind_teardown_gate(
+        self,
+        started: asyncio.Event,
+        release: asyncio.Event,
+    ) -> _RecordingMount:
+        self._teardown_gate = _AsyncGate(started, release)
+        return self
+
+    def bind_restore_gate(
+        self,
+        started: asyncio.Event,
+        release: asyncio.Event,
+        *,
+        error: str | None = None,
+    ) -> _RecordingMount:
+        self._restore_gate = _AsyncGate(started, release)
+        self._restore_error = error
         return self
 
     def supported_in_container_patterns(
@@ -127,6 +188,9 @@ class _RecordingMount(Mount):
                 if mount._teardown_error is not None:
                     raise RuntimeError(mount._teardown_error)
                 mount._events.append(("unmount", path.as_posix()))
+                if mount._teardown_gate is not None:
+                    mount._teardown_gate.started.set()
+                    await mount._teardown_gate.release.wait()
 
             async def restore_after_snapshot(
                 self,
@@ -136,8 +200,23 @@ class _RecordingMount(Mount):
             ) -> None:
                 _ = (strategy, session)
                 mount._events.append(("mount", path.as_posix()))
+                if mount._restore_gate is not None:
+                    mount._restore_gate.started.set()
+                    await mount._restore_gate.release.wait()
+                if mount._restore_cancelled:
+                    raise asyncio.CancelledError()
+                if mount._restore_error is not None:
+                    raise RuntimeError(mount._restore_error)
 
         return _Adapter(self)
+
+
+def _unfinished_mount_transition_tasks() -> list[asyncio.Task[object]]:
+    return [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name() == "agents.mount_transition" and not task.done()
+    ]
 
 
 def _load_modal_module(
@@ -366,11 +445,34 @@ def _load_modal_module(
     monkeypatch.setitem(sys.modules, "modal.exception", fake_modal_exception)
     monkeypatch.setitem(sys.modules, "modal.config", fake_modal_config)
     monkeypatch.setitem(sys.modules, "modal.container_process", fake_container_process)
-    sys.modules.pop("agents.extensions.sandbox.modal.sandbox", None)
-    sys.modules.pop("agents.extensions.sandbox.modal.mounts", None)
-    sys.modules.pop("agents.extensions.sandbox.modal", None)
+    # Re-importing an adapter also replaces its registered model classes.
+    # Record undo before clearing these entries for fresh class registration;
+    # unrelated registrations must survive teardown.
+    monkeypatch.setitem(
+        SandboxSessionState._subclass_registry,
+        "modal",
+        SandboxSessionState._subclass_registry.get("modal", SandboxSessionState),
+    )
+    del SandboxSessionState._subclass_registry["modal"]
+    monkeypatch.setitem(
+        MountStrategyBase._subclass_registry,
+        "modal_cloud_bucket",
+        MountStrategyBase._subclass_registry.get("modal_cloud_bucket", MountStrategyBase),
+    )
+    del MountStrategyBase._subclass_registry["modal_cloud_bucket"]
+    module_names = (
+        "agents.extensions.sandbox.modal.sandbox",
+        "agents.extensions.sandbox.modal.mounts",
+        "agents.extensions.sandbox.modal",
+    )
+    for name in module_names:
+        monkeypatch.delitem(sys.modules, name, raising=False)
 
     module: Any = importlib.import_module("agents.extensions.sandbox.modal.sandbox")
+    # Track the fresh imports too, so teardown removes them before restoring
+    # any original modules alongside the real provider SDK.
+    for name in module_names:
+        monkeypatch.setitem(sys.modules, name, sys.modules.pop(name))
     return module, create_calls, registry_tags
 
 
@@ -422,6 +524,38 @@ async def test_modal_sandbox_create_passes_idle_timeout(
     assert create_calls
     assert create_calls[0]["idle_timeout"] == 60
     assert session.state.idle_timeout == 60
+
+
+@pytest.mark.parametrize(
+    ("cpu", "memory"),
+    [
+        (1.0, 2048),
+        ((1.0, 4.0), (2048, 8192)),
+    ],
+    ids=["requests", "requests-and-limits"],
+)
+@pytest.mark.asyncio
+async def test_modal_sandbox_create_passes_resources(
+    monkeypatch: pytest.MonkeyPatch,
+    cpu: float | tuple[float, float],
+    memory: int | tuple[int, int],
+) -> None:
+    modal_module, create_calls, _registry_tags = _load_modal_module(monkeypatch)
+
+    client = modal_module.ModalSandboxClient()
+    session = await client.create(
+        options=modal_module.ModalSandboxClientOptions(
+            app_name="sandbox-tests",
+            cpu=cpu,
+            memory=memory,
+        ),
+    )
+
+    assert create_calls
+    assert create_calls[0]["cpu"] == cpu
+    assert create_calls[0]["memory"] == memory
+    assert session.state.cpu == cpu
+    assert session.state.memory == memory
 
 
 @pytest.mark.asyncio
@@ -544,6 +678,69 @@ def test_modal_deserialize_session_state_defaults_missing_idle_timeout(
     )
 
     assert restored.idle_timeout is None
+
+
+def test_modal_deserialize_session_state_defaults_missing_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(root="/workspace"),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        cpu=(1.0, 4.0),
+        memory=(2048, 8192),
+    )
+    payload = state.model_dump(mode="json")
+    payload.pop("cpu")
+    payload.pop("memory")
+
+    restored = modal_module.ModalSandboxClient().deserialize_session_state(
+        cast(dict[str, object], payload)
+    )
+
+    assert restored.cpu is None
+    assert restored.memory is None
+
+
+@pytest.mark.asyncio
+async def test_modal_deserialize_discards_surviving_resource_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    client = modal_module.ModalSandboxClient()
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(
+            root="/workspace",
+            entries={
+                "remote": S3Mount(
+                    bucket="bucket",
+                    mount_strategy=modal_module.ModalCloudBucketMountStrategy(
+                        secret_name="protected-secret"
+                    ),
+                )
+            },
+        ),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        sandbox_id="sb-survivor",
+        workspace_root_ready=True,
+    )
+    payload = client.serialize_session_state(state)
+    cast(dict[str, object], payload["manifest"])["entries"] = {}
+    payload.pop("__openai_agents_redacted_mount_authority", None)
+
+    restored = client.deserialize_session_state(payload)
+    assert restored.sandbox_id is None
+    assert restored.workspace_root_ready is False
+    session = await client.resume(restored)
+
+    assert restored.sandbox_id == session.state.sandbox_id
+    assert restored.sandbox_id != "sb-survivor"
+    assert restored.workspace_root_ready is False
+    assert sys.modules["modal"].Sandbox.from_id_calls == []
+    assert len(create_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -1122,20 +1319,137 @@ async def test_modal_resume_eagerly_reconnects_sandbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     modal_module, create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    client = modal_module.ModalSandboxClient()
 
     state = modal_module.ModalSandboxSessionState(
-        manifest=Manifest(root="/workspace"),
+        manifest=Manifest(
+            root="/workspace",
+            entries={
+                "remote": S3Mount(
+                    bucket="bucket",
+                    mount_strategy=modal_module.ModalCloudBucketMountStrategy(),
+                )
+            },
+        ),
         snapshot=modal_module.resolve_snapshot(None, "snapshot"),
         app_name="sandbox-tests",
         sandbox_id="sb-existing",
     )
+    state = client.deserialize_session_state(client.serialize_session_state(state))
 
-    client = modal_module.ModalSandboxClient()
     session = await client.resume(state)
 
     assert session._inner._sandbox is not None  # noqa: SLF001
     assert create_calls == []
     assert sys.modules["modal"].Sandbox.from_id_calls == ["sb-existing"]
+
+
+@pytest.mark.asyncio
+async def test_modal_resume_reconnects_deserialized_credentialless_external_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    trusted_manifest = Manifest(
+        root="/workspace",
+        entries={
+            "remote": S3Mount(
+                bucket="bucket",
+                mount_strategy=modal_module.ModalCloudBucketMountStrategy(),
+            )
+        },
+    )
+    state = modal_module.ModalSandboxSessionState(
+        manifest=trusted_manifest,
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        sandbox_id="sb-existing",
+    )
+    client = modal_module.ModalSandboxClient()
+    restored = client.deserialize_session_state(client.serialize_session_state(state))
+    session = await client.resume(restored)
+
+    assert session._inner._sandbox is not None  # noqa: SLF001
+    assert restored.mount_authority_rebound is False
+    assert create_calls == []
+    assert sys.modules["modal"].Sandbox.from_id_calls == ["sb-existing"]
+
+
+@pytest.mark.asyncio
+async def test_modal_resume_reconnects_generically_parsed_credentialless_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    trusted_manifest = Manifest(
+        root="/workspace",
+        entries={
+            "remote": S3Mount(
+                bucket="bucket",
+                mount_strategy=modal_module.ModalCloudBucketMountStrategy(),
+            )
+        },
+    )
+    state = modal_module.ModalSandboxSessionState(
+        manifest=trusted_manifest,
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        sandbox_id="sb-existing",
+    )
+    client = modal_module.ModalSandboxClient()
+    restored = SandboxSessionState.parse(client.serialize_session_state(state))
+    assert isinstance(restored, modal_module.ModalSandboxSessionState)
+    session = await client.resume(restored)
+
+    assert session._inner._sandbox is not None  # noqa: SLF001
+    assert restored.mount_authority_rebound is False
+    assert create_calls == []
+    assert sys.modules["modal"].Sandbox.from_id_calls == ["sb-existing"]
+
+
+@pytest.mark.asyncio
+async def test_modal_resume_creates_fresh_sandbox_for_rebound_mount_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    trusted_manifest = Manifest(
+        root="/workspace",
+        entries={
+            "remote": S3Mount(
+                bucket="bucket",
+                mount_strategy=modal_module.ModalCloudBucketMountStrategy(
+                    secret_name="current-secret"
+                ),
+            )
+        },
+    )
+    state = modal_module.ModalSandboxSessionState(
+        manifest=trusted_manifest,
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        sandbox_id="sb-existing",
+    )
+    client = modal_module.ModalSandboxClient()
+    serialized = client.serialize_session_state(state)
+    assert "current-secret" not in repr(serialized)
+    restored = client.deserialize_session_state(serialized)
+    assert restored.mount_authority_redacted is True
+    rebound = restored.rebind_persisted_mount_authority(
+        trusted_manifest,
+        provider_backend_id="modal",
+    )
+    assert rebound.mount_authority_redacted is False
+
+    original_session_id = rebound.session_id
+    session = await client.resume(rebound)
+
+    assert session._inner._sandbox is not None  # noqa: SLF001
+    assert rebound.session_id != original_session_id
+    assert rebound.sandbox_id == "sb-123"
+    assert len(create_calls) == 1
+    assert sys.modules["modal"].Sandbox.from_id_calls == []
+    volumes = cast(dict[str, object], create_calls[0]["volumes"])
+    assert volumes.keys() == {"/workspace/remote"}
+    mount = cast(Any, volumes["/workspace/remote"])
+    assert mount.secret.name == "current-secret"
 
 
 @pytest.mark.asyncio
@@ -2263,6 +2577,13 @@ async def test_modal_snapshot_directory_teardown_failure_restores_partial_cleanu
         object_id = "sb-123"
         snapshot_directory: Any
 
+        def __init__(self) -> None:
+            self.terminate_calls = 0
+            self.terminate = _with_aio(self._terminate)
+
+        def _terminate(self) -> None:
+            self.terminate_calls += 1
+
     sandbox = _FakeSnapshotSandbox()
     state = modal_module.ModalSandboxSessionState(
         manifest=Manifest(
@@ -2323,6 +2644,9 @@ async def test_modal_snapshot_directory_teardown_failure_restores_partial_cleanu
     assert commands[2][0:2] == ["sh", "-lc"]
     assert "modal-snapshot-directory-ephemeral.tar" in commands[2][2]
     assert "tar xf" in commands[2][2]
+    assert sandbox.terminate_calls == 1
+    assert session._sandbox is None  # noqa: SLF001
+    assert session.state.sandbox_id is None
 
 
 @pytest.mark.asyncio
@@ -2999,6 +3323,193 @@ async def test_modal_hydrate_tar_chunks_large_payload_before_draining(
     assert sandbox.processes[0].stdin.drain_calls >= 2
 
 
+def _hydration_tar_bytes(*members: tarfile.TarInfo) -> io.BytesIO:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for member in members:
+            if member.isreg():
+                tar.addfile(member, io.BytesIO(b"x" * member.size))
+            else:
+                tar.addfile(member)
+    buf.seek(0)
+    return buf
+
+
+def _hydration_member(name: str, kind: str = "file", linkname: str = "") -> tarfile.TarInfo:
+    member = tarfile.TarInfo(name)
+    if kind == "file":
+        member.size = 1
+    elif kind == "dir":
+        member.type = tarfile.DIRTYPE
+    elif kind == "symlink":
+        member.type = tarfile.SYMTYPE
+        member.linkname = linkname
+    elif kind == "hardlink":
+        member.type = tarfile.LNKTYPE
+        member.linkname = linkname
+    elif kind == "fifo":
+        member.type = tarfile.FIFOTYPE
+    elif kind == "chardev":
+        member.type = tarfile.CHRTYPE
+    else:  # pragma: no cover - guards against a typo in a parametrize entry
+        raise AssertionError(f"unknown kind: {kind}")
+    return member
+
+
+class _RecordingHydrationSandbox:
+    """A sandbox that records what it was asked to run, so a test can assert *nothing* ran."""
+
+    object_id = "sb-123"
+
+    def __init__(self) -> None:
+        self.commands: list[tuple[object, ...]] = []
+        self.payloads: list[bytes] = []
+        self.exec = _with_aio(self._exec)
+
+    def _exec(self, *command: object, **kwargs: object) -> object:
+        _ = kwargs
+        self.commands.append(command)
+        sandbox = self
+
+        class _Stdin:
+            def write(self, data: bytes | bytearray | memoryview) -> None:
+                sandbox.payloads.append(bytes(data))
+
+            def write_eof(self) -> None:
+                return None
+
+            def drain(self) -> None:
+                return None
+
+        stdin = _Stdin()
+        _set_aio_attr(stdin, "drain", stdin.drain)
+        return types.SimpleNamespace(
+            stdin=stdin,
+            stderr=types.SimpleNamespace(read=_with_aio(lambda: b"")),
+            wait=_with_aio(lambda: 0),
+        )
+
+
+def _hydration_session(
+    modal_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox: _RecordingHydrationSandbox,
+) -> Any:
+    # An ephemeral *directory*, so `ephemeral_persistence_paths()` yields the prefix
+    # `logs`; an ephemeral file would yield only its own exact path.
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(
+            root="/workspace",
+            entries={
+                "main.py": File(content=b"print('hi')\n"),
+                "logs": Dir(ephemeral=True),
+            },
+        ),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        sandbox_id=sandbox.object_id,
+    )
+    session = modal_module.ModalSandboxSession.from_state(state, sandbox=sandbox)
+
+    async def _fake_call_modal(
+        fn: Callable[..., object],
+        *args: object,
+        call_timeout: float | None = None,
+        **kwargs: object,
+    ) -> object:
+        _ = call_timeout
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(session, "_call_modal", _fake_call_modal)
+    return session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("member", "reason"),
+    [
+        # A member claiming a path the manifest owns as ephemeral.
+        (
+            _hydration_member("logs/events.jsonl"),
+            "archive member overlaps protected path: logs",
+        ),
+        # Member types and links under the ephemeral prefix. Under `skip_rel_paths`
+        # these were never validated and `tar xf` created them anyway.
+        (_hydration_member("logs/pipe", "fifo"), "unsupported member type"),
+        (_hydration_member("logs/dev", "chardev"), "unsupported member type"),
+        (
+            _hydration_member("logs/escape", "symlink", "/etc/passwd"),
+            "archive member overlaps protected path: logs",
+        ),
+        (
+            _hydration_member("logs/link", "hardlink", "/etc/passwd"),
+            "hardlink member not allowed",
+        ),
+        # A traversal member normalizing under the protected prefix.
+        (
+            _hydration_member("logs/../../etc/passwd"),
+            "parent traversal",
+        ),
+    ],
+)
+async def test_modal_hydrate_tar_rejects_protected_members_before_extracting(
+    monkeypatch: pytest.MonkeyPatch, member: tarfile.TarInfo, reason: str
+) -> None:
+    """Hydration must reject before `tar xf`, because it extracts the bytes it validated.
+
+    `_hydrate_workspace_via_tar` validates the buffer it then pipes to `tar xf -`, so
+    there is no point after validation at which a member can be dropped. Hence
+    `reject_rel_paths` rather than `skip_rel_paths`: skipping suppresses member-type
+    and link validation while still handing those members to tar. The assertion that
+    no command ran is what distinguishes rejecting before extraction from failing
+    after it.
+    """
+
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    sandbox = _RecordingHydrationSandbox()
+    session = _hydration_session(modal_module, monkeypatch, sandbox)
+
+    payload = _hydration_tar_bytes(_hydration_member("main.py"), member)
+
+    with pytest.raises(WorkspaceArchiveWriteError) as excinfo:
+        await session.hydrate_workspace(payload)
+
+    assert excinfo.value.context["reason"] == reason
+    assert sandbox.commands == []
+    assert sandbox.payloads == []
+
+
+@pytest.mark.asyncio
+async def test_modal_hydrate_tar_accepts_an_archive_without_protected_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control: rejecting the ephemeral paths must not reject valid snapshots.
+
+    A snapshot from `persist_workspace` excludes the ephemeral paths, and symlinks
+    staying inside the archive are still accepted so virtualenvs remain restorable.
+    """
+
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    sandbox = _RecordingHydrationSandbox()
+    session = _hydration_session(modal_module, monkeypatch, sandbox)
+
+    payload = _hydration_tar_bytes(
+        _hydration_member(".", "dir"),
+        _hydration_member("./main.py"),
+        _hydration_member("./.venv", "dir"),
+        _hydration_member("./.venv/lib64", "symlink", "lib"),
+    )
+    raw = payload.getvalue()
+
+    await session.hydrate_workspace(payload)
+
+    assert sandbox.commands == [
+        ("mkdir", "-p", "--", "/workspace"),
+        ("tar", "xf", "-", "-C", "/workspace"),
+    ]
+    assert b"".join(sandbox.payloads) == raw
+
+
 @pytest.mark.asyncio
 async def test_modal_snapshot_filesystem_restore_preserves_exposed_ports(
     monkeypatch: pytest.MonkeyPatch,
@@ -3012,6 +3523,8 @@ async def test_modal_snapshot_filesystem_restore_preserves_exposed_ports(
         workspace_persistence="snapshot_filesystem",
         exposed_ports=(8765,),
         idle_timeout=60,
+        cpu=(1.0, 4.0),
+        memory=(2048, 8192),
     )
     session = modal_module.ModalSandboxSession.from_state(state)
     call_names: list[str] = []
@@ -3038,6 +3551,8 @@ async def test_modal_snapshot_filesystem_restore_preserves_exposed_ports(
     assert create_calls
     assert create_calls[0]["encrypted_ports"] == (8765,)
     assert create_calls[0]["idle_timeout"] == 60
+    assert create_calls[0]["cpu"] == (1.0, 4.0)
+    assert create_calls[0]["memory"] == (2048, 8192)
     assert sys.modules["modal"].Image.from_id_calls == ["snap-123"]
     assert call_names == []
     assert call_timeouts == []
@@ -3137,6 +3652,540 @@ async def test_modal_snapshot_directory_persist_only_detaches_durable_workspace_
     assert session._sandbox is not None  # noqa: SLF001
     assert archive.read() == modal_module._encode_snapshot_directory_ref(snapshot_id="im-123")
     assert events == [("unmount", "/workspace/actual"), ("mount", "/workspace/actual")]
+
+
+@pytest.mark.asyncio
+async def test_modal_snapshot_directory_persist_settles_cancelled_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    events: list[tuple[str, str]] = []
+    teardown_started = asyncio.Event()
+    teardown_release = asyncio.Event()
+    mount = (
+        _RecordingMount(mount_path=Path("actual"), ephemeral=False)
+        .bind_events(events)
+        .bind_teardown_gate(teardown_started, teardown_release)
+    )
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(root="/workspace", entries={"remote": mount}),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        workspace_persistence="snapshot_directory",
+    )
+    session = modal_module.ModalSandboxSession.from_state(state)
+
+    persist_task = asyncio.create_task(session.persist_workspace())
+    try:
+        await asyncio.wait_for(teardown_started.wait(), timeout=1)
+        persist_task.cancel()
+        await asyncio.sleep(0)
+    finally:
+        teardown_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await persist_task
+
+    assert events == [("unmount", "/workspace/actual"), ("mount", "/workspace/actual")]
+    assert session._sandbox is not None  # noqa: SLF001
+    assert session.state.sandbox_id == "sb-123"
+    assert session._sandbox.terminate_calls == 0  # noqa: SLF001
+    assert _unfinished_mount_transition_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_modal_snapshot_directory_persist_settles_cancelled_remount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    events: list[tuple[str, str]] = []
+    restore_started = asyncio.Event()
+    restore_release = asyncio.Event()
+    mount = (
+        _RecordingMount(mount_path=Path("actual"), ephemeral=False)
+        .bind_events(events)
+        .bind_restore_gate(restore_started, restore_release)
+    )
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(root="/workspace", entries={"remote": mount}),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        workspace_persistence="snapshot_directory",
+    )
+    session = modal_module.ModalSandboxSession.from_state(state)
+
+    persist_task = asyncio.create_task(session.persist_workspace())
+    try:
+        await asyncio.wait_for(restore_started.wait(), timeout=1)
+        persist_task.cancel()
+        await asyncio.sleep(0)
+    finally:
+        restore_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await persist_task
+
+    assert events == [("unmount", "/workspace/actual"), ("mount", "/workspace/actual")]
+    assert session._sandbox is not None  # noqa: SLF001
+    assert session.state.sandbox_id == "sb-123"
+    assert session._sandbox.terminate_calls == 0  # noqa: SLF001
+    assert _unfinished_mount_transition_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_modal_snapshot_directory_persist_terminates_cancelled_failed_remount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    events: list[tuple[str, str]] = []
+    restore_started = asyncio.Event()
+    restore_release = asyncio.Event()
+    first = _RecordingMount(mount_path=Path("first"), ephemeral=False).bind_events(events)
+    second = (
+        _RecordingMount(mount_path=Path("second"), ephemeral=False)
+        .bind_events(events)
+        .bind_restore_gate(restore_started, restore_release, error="remount failed")
+    )
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(
+            root="/workspace",
+            entries={"first": first, "second": second},
+        ),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        workspace_persistence="snapshot_directory",
+    )
+    session = modal_module.ModalSandboxSession.from_state(state)
+
+    persist_task = asyncio.create_task(session.persist_workspace())
+    try:
+        await asyncio.wait_for(restore_started.wait(), timeout=1)
+        assert session._sandbox is not None  # noqa: SLF001
+        sandbox = session._sandbox  # noqa: SLF001
+        persist_task.cancel()
+        await asyncio.sleep(0)
+    finally:
+        restore_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await persist_task
+
+    assert events == [
+        ("unmount", "/workspace/first"),
+        ("unmount", "/workspace/second"),
+        ("mount", "/workspace/second"),
+        ("mount", "/workspace/first"),
+    ]
+    assert sandbox.terminate_calls == 1
+    assert session._sandbox is None  # noqa: SLF001
+    assert session.state.sandbox_id is None
+    assert session._running is False  # noqa: SLF001
+    assert _unfinished_mount_transition_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_modal_snapshot_directory_persist_distinguishes_simultaneous_cancellations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    events: list[tuple[str, str]] = []
+    restore_started = asyncio.Event()
+    restore_release = asyncio.Event()
+    mount = (
+        _RecordingMount(mount_path=Path("actual"), ephemeral=False)
+        .bind_events(events)
+        .bind_restore_cancellation(restore_started, restore_release)
+    )
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(root="/workspace", entries={"remote": mount}),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        workspace_persistence="snapshot_directory",
+    )
+    session = modal_module.ModalSandboxSession.from_state(state)
+
+    persist_task = asyncio.create_task(session.persist_workspace())
+    await asyncio.wait_for(restore_started.wait(), timeout=1)
+    assert session._sandbox is not None  # noqa: SLF001
+    sandbox = session._sandbox  # noqa: SLF001
+    restore_release.set()
+    persist_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await persist_task
+
+    assert events == [("unmount", "/workspace/actual"), ("mount", "/workspace/actual")]
+    assert sandbox.terminate_calls == 1
+    assert session._sandbox is None  # noqa: SLF001
+    assert session.state.sandbox_id is None
+    assert session._running is False  # noqa: SLF001
+    assert _unfinished_mount_transition_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_modal_snapshot_directory_failed_remount_does_not_create_replacement_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    events: list[tuple[str, str]] = []
+    mount = (
+        _RecordingMount(mount_path=Path("actual"), ephemeral=False)
+        .bind_events(events)
+        .bind_restore_error("remount failed")
+    )
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(
+            root="/workspace",
+            entries={
+                "tmp.txt": File(content=b"skip", ephemeral=True),
+                "remote": mount,
+            },
+        ),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        workspace_persistence="snapshot_directory",
+    )
+    session = modal_module.ModalSandboxSession.from_state(state)
+    await session._ensure_sandbox()  # noqa: SLF001
+    assert session._sandbox is not None  # noqa: SLF001
+    sandbox = session._sandbox  # noqa: SLF001
+
+    with pytest.raises(WorkspaceArchiveReadError) as exc_info:
+        await session.persist_workspace()
+
+    assert isinstance(exc_info.value.cause, RuntimeError)
+    assert str(exc_info.value.cause) == "remount failed"
+    assert events == [("unmount", "/workspace/actual"), ("mount", "/workspace/actual")]
+    assert len(create_calls) == 1
+    assert sandbox.terminate_calls == 1
+    assert session._sandbox is None  # noqa: SLF001
+    assert session.state.sandbox_id is None
+    assert session._running is False  # noqa: SLF001
+    assert _unfinished_mount_transition_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_modal_snapshot_directory_persist_propagates_cancelled_terminal_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    mount = _RecordingMount(
+        mount_path=Path("actual"),
+        ephemeral=False,
+    ).bind_teardown_error("unmount failed")
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(root="/workspace", entries={"remote": mount}),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        workspace_persistence="snapshot_directory",
+    )
+    session = modal_module.ModalSandboxSession.from_state(state)
+    await session._ensure_sandbox()  # noqa: SLF001
+    assert session._sandbox is not None  # noqa: SLF001
+    sandbox = session._sandbox  # noqa: SLF001
+    termination_started = asyncio.Event()
+    termination_release = asyncio.Event()
+
+    async def _terminate(**kwargs: object) -> None:
+        sandbox.terminate_calls += 1
+        sandbox.terminate_kwargs.append(kwargs)
+        termination_started.set()
+        await termination_release.wait()
+
+    sandbox.terminate.aio = _terminate
+    persist_task = asyncio.create_task(session.persist_workspace())
+    try:
+        await asyncio.wait_for(termination_started.wait(), timeout=1)
+        persist_task.cancel()
+        await asyncio.sleep(0)
+    finally:
+        termination_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await persist_task
+
+    assert sandbox.terminate_calls == 1
+    assert session._sandbox is None  # noqa: SLF001
+    assert session.state.sandbox_id is None
+    assert session._running is False  # noqa: SLF001
+    assert _unfinished_mount_transition_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_modal_snapshot_directory_hydrate_settles_cancelled_image_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    events: list[tuple[str, str]] = []
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(
+            root="/workspace",
+            entries={
+                "remote": _RecordingMount(mount_path=Path("actual"), ephemeral=False).bind_events(
+                    events
+                )
+            },
+        ),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        workspace_persistence="snapshot_directory",
+    )
+    session = modal_module.ModalSandboxSession.from_state(state)
+    await session._ensure_sandbox()  # noqa: SLF001
+    assert session._sandbox is not None  # noqa: SLF001
+    sandbox = session._sandbox  # noqa: SLF001
+    mount_started = asyncio.Event()
+    mount_release = asyncio.Event()
+
+    async def _mount_image(path: str, image: object) -> None:
+        sandbox.mount_image_calls.append((path, getattr(image, "object_id", None)))
+        mount_started.set()
+        await mount_release.wait()
+
+    sandbox.mount_image.aio = _mount_image
+    hydrate_task = asyncio.create_task(
+        session.hydrate_workspace(
+            io.BytesIO(modal_module._encode_snapshot_directory_ref(snapshot_id="snap-dir-123"))
+        )
+    )
+    try:
+        await asyncio.wait_for(mount_started.wait(), timeout=1)
+        hydrate_task.cancel()
+        await asyncio.sleep(0)
+    finally:
+        mount_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await hydrate_task
+
+    assert sandbox.mount_image_calls == [("/workspace", "snap-dir-123")]
+    assert events == [("mount", "/workspace/actual")]
+    assert session._sandbox is sandbox  # noqa: SLF001
+    assert session.state.sandbox_id == "sb-123"
+    assert sandbox.terminate_calls == 0
+    assert _unfinished_mount_transition_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_modal_snapshot_directory_hydrate_terminates_cancelled_failed_image_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(root="/workspace"),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        workspace_persistence="snapshot_directory",
+    )
+    session = modal_module.ModalSandboxSession.from_state(state)
+    await session._ensure_sandbox()  # noqa: SLF001
+    assert session._sandbox is not None  # noqa: SLF001
+    sandbox = session._sandbox  # noqa: SLF001
+    mount_started = asyncio.Event()
+    mount_release = asyncio.Event()
+
+    async def _mount_image(path: str, image: object) -> None:
+        sandbox.mount_image_calls.append((path, getattr(image, "object_id", None)))
+        mount_started.set()
+        await mount_release.wait()
+        raise RuntimeError("mount image failed")
+
+    sandbox.mount_image.aio = _mount_image
+    hydrate_task = asyncio.create_task(
+        session.hydrate_workspace(
+            io.BytesIO(modal_module._encode_snapshot_directory_ref(snapshot_id="snap-dir-123"))
+        )
+    )
+    try:
+        await asyncio.wait_for(mount_started.wait(), timeout=1)
+        hydrate_task.cancel()
+        await asyncio.sleep(0)
+    finally:
+        mount_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await hydrate_task
+
+    assert sandbox.mount_image_calls == [("/workspace", "snap-dir-123")]
+    assert sandbox.terminate_calls == 1
+    assert session._sandbox is None  # noqa: SLF001
+    assert session.state.sandbox_id is None
+    assert _unfinished_mount_transition_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_modal_snapshot_directory_hydrate_maps_inner_image_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(root="/workspace"),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        workspace_persistence="snapshot_directory",
+    )
+    session = modal_module.ModalSandboxSession.from_state(state)
+    await session._ensure_sandbox()  # noqa: SLF001
+    assert session._sandbox is not None  # noqa: SLF001
+    sandbox = session._sandbox  # noqa: SLF001
+
+    async def _mount_image(_path: str, _image: object) -> None:
+        raise asyncio.CancelledError()
+
+    sandbox.mount_image.aio = _mount_image
+
+    with pytest.raises(WorkspaceArchiveWriteError) as exc_info:
+        await session.hydrate_workspace(
+            io.BytesIO(modal_module._encode_snapshot_directory_ref(snapshot_id="snap-dir-123"))
+        )
+
+    assert isinstance(exc_info.value.cause, WorkspaceArchiveWriteError)
+    assert exc_info.value.cause.context["reason"] == "mount_image_cancelled"
+    assert sandbox.terminate_calls == 1
+    assert session._sandbox is None  # noqa: SLF001
+    assert session.state.sandbox_id is None
+    assert session._running is False  # noqa: SLF001
+    assert _unfinished_mount_transition_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_modal_snapshot_directory_hydrate_distinguishes_simultaneous_cancellations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(root="/workspace"),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        workspace_persistence="snapshot_directory",
+    )
+    session = modal_module.ModalSandboxSession.from_state(state)
+    await session._ensure_sandbox()  # noqa: SLF001
+    assert session._sandbox is not None  # noqa: SLF001
+    sandbox = session._sandbox  # noqa: SLF001
+    mount_started = asyncio.Event()
+    mount_release = asyncio.Event()
+
+    async def _mount_image(_path: str, _image: object) -> None:
+        mount_started.set()
+        await mount_release.wait()
+        raise asyncio.CancelledError()
+
+    sandbox.mount_image.aio = _mount_image
+    hydrate_task = asyncio.create_task(
+        session.hydrate_workspace(
+            io.BytesIO(modal_module._encode_snapshot_directory_ref(snapshot_id="snap-dir-123"))
+        )
+    )
+    await asyncio.wait_for(mount_started.wait(), timeout=1)
+    mount_release.set()
+    hydrate_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await hydrate_task
+
+    assert sandbox.terminate_calls == 1
+    assert session._sandbox is None  # noqa: SLF001
+    assert session.state.sandbox_id is None
+    assert session._running is False  # noqa: SLF001
+    assert _unfinished_mount_transition_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_modal_snapshot_directory_hydrate_propagates_cancelled_terminal_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(root="/workspace"),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        workspace_persistence="snapshot_directory",
+    )
+    session = modal_module.ModalSandboxSession.from_state(state)
+    await session._ensure_sandbox()  # noqa: SLF001
+    assert session._sandbox is not None  # noqa: SLF001
+    sandbox = session._sandbox  # noqa: SLF001
+    termination_started = asyncio.Event()
+    termination_release = asyncio.Event()
+
+    async def _mount_image(_path: str, _image: object) -> None:
+        raise RuntimeError("mount image failed")
+
+    async def _terminate(**kwargs: object) -> None:
+        sandbox.terminate_calls += 1
+        sandbox.terminate_kwargs.append(kwargs)
+        termination_started.set()
+        await termination_release.wait()
+
+    sandbox.mount_image.aio = _mount_image
+    sandbox.terminate.aio = _terminate
+    hydrate_task = asyncio.create_task(
+        session.hydrate_workspace(
+            io.BytesIO(modal_module._encode_snapshot_directory_ref(snapshot_id="snap-dir-123"))
+        )
+    )
+    try:
+        await asyncio.wait_for(termination_started.wait(), timeout=1)
+        hydrate_task.cancel()
+        await asyncio.sleep(0)
+    finally:
+        termination_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await hydrate_task
+
+    assert sandbox.terminate_calls == 1
+    assert session._sandbox is None  # noqa: SLF001
+    assert session.state.sandbox_id is None
+    assert session._running is False  # noqa: SLF001
+    assert _unfinished_mount_transition_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_modal_snapshot_directory_hydrate_terminates_cancelled_failed_remount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    events: list[tuple[str, str]] = []
+    restore_started = asyncio.Event()
+    restore_release = asyncio.Event()
+    mount = (
+        _RecordingMount(mount_path=Path("actual"), ephemeral=False)
+        .bind_events(events)
+        .bind_restore_gate(restore_started, restore_release, error="remount failed")
+    )
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(root="/workspace", entries={"remote": mount}),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        workspace_persistence="snapshot_directory",
+    )
+    session = modal_module.ModalSandboxSession.from_state(state)
+
+    hydrate_task = asyncio.create_task(
+        session.hydrate_workspace(
+            io.BytesIO(modal_module._encode_snapshot_directory_ref(snapshot_id="snap-dir-123"))
+        )
+    )
+    try:
+        await asyncio.wait_for(restore_started.wait(), timeout=1)
+        assert session._sandbox is not None  # noqa: SLF001
+        sandbox = session._sandbox  # noqa: SLF001
+        hydrate_task.cancel()
+        await asyncio.sleep(0)
+    finally:
+        restore_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await hydrate_task
+
+    assert sandbox.mount_image_calls == [("/workspace", "snap-dir-123")]
+    assert events == [("mount", "/workspace/actual")]
+    assert sandbox.terminate_calls == 1
+    assert session._sandbox is None  # noqa: SLF001
+    assert session.state.sandbox_id is None
+    assert _unfinished_mount_transition_tasks() == []
 
 
 @pytest.mark.asyncio
@@ -3475,6 +4524,328 @@ async def test_modal_pty_start_drains_all_buffered_output_after_exit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fallback_read", [False, True])
+async def test_modal_pty_keeps_session_live_until_delayed_exit_tail_reaches_eof(
+    monkeypatch: pytest.MonkeyPatch,
+    fallback_read: bool,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    release_tail = asyncio.Event()
+
+    class _DelayedStream:
+        def __init__(self, *, tail: bytes | None) -> None:
+            self._tail = tail
+            self._returned_tail = False
+
+        def __aiter__(self) -> _DelayedStream:
+            return self
+
+        async def __anext__(self) -> bytes:
+            if self._tail is not None and not self._returned_tail:
+                await release_tail.wait()
+                self._returned_tail = True
+                return self._tail
+            raise StopAsyncIteration
+
+    if fallback_read:
+
+        async def read_aio(stream: _DelayedStream, _size: int) -> bytes:
+            try:
+                return await stream.__anext__()
+            except StopAsyncIteration:
+                return b""
+
+        def install_read(stream: _DelayedStream) -> None:
+            stream.read = _with_aio(lambda _size: b"")
+            stream.read.aio = lambda size: read_aio(stream, size)
+
+        monkeypatch.delattr(_DelayedStream, "__aiter__")
+    else:
+
+        def install_read(stream: _DelayedStream) -> None:
+            pass
+
+    class _FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = _DelayedStream(tail=b"tail")
+            self.stderr = _DelayedStream(tail=None)
+            install_read(self.stdout)
+            install_read(self.stderr)
+            self.poll = _with_aio(lambda: 0)
+            self.terminate = _with_aio(lambda: None)
+
+    class _FakeSandbox:
+        object_id = "sb-delayed-tail"
+
+        def __init__(self) -> None:
+            self.process = _FakeProcess()
+            self.exec = _with_aio(self._exec)
+
+        def _exec(self, *command: object, **kwargs: object) -> object:
+            _ = (command, kwargs)
+            return self.process
+
+    sandbox = _FakeSandbox()
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(root="/workspace"),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        sandbox_id=sandbox.object_id,
+    )
+    session = modal_module.ModalSandboxSession.from_state(state, sandbox=sandbox)
+
+    started = await session.pty_exec_start("python3", shell=False, tty=True, yield_time_s=0.01)
+
+    assert started.process_id is not None
+    assert started.exit_code is None
+    assert started.output == b""
+
+    release_tail.set()
+    finished = await session.pty_write_stdin(
+        session_id=started.process_id,
+        chars="",
+        yield_time_s=0.01,
+    )
+
+    assert finished.process_id is None
+    assert finished.exit_code == 0
+    assert finished.output == b"tail"
+
+
+@pytest.mark.asyncio
+async def test_modal_pty_closes_failed_stream_after_known_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+
+    class _FailedStream:
+        def __aiter__(self) -> _FailedStream:
+            return self
+
+        async def __anext__(self) -> bytes:
+            raise RuntimeError("stream failed")
+
+    class _EmptyStream:
+        def __aiter__(self) -> _EmptyStream:
+            return self
+
+        async def __anext__(self) -> bytes:
+            raise StopAsyncIteration
+
+    class _FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = _FailedStream()
+            self.stderr = _EmptyStream()
+            self.poll = _with_aio(lambda: 0)
+            self.terminate = _with_aio(lambda: None)
+
+    class _FakeSandbox:
+        object_id = "sb-failed-stream"
+
+        def __init__(self) -> None:
+            self.process = _FakeProcess()
+            self.exec = _with_aio(self._exec)
+
+        def _exec(self, *command: object, **kwargs: object) -> object:
+            _ = (command, kwargs)
+            return self.process
+
+    sandbox = _FakeSandbox()
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(root="/workspace"),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        sandbox_id=sandbox.object_id,
+    )
+    session = modal_module.ModalSandboxSession.from_state(state, sandbox=sandbox)
+
+    finished = await session.pty_exec_start("python3", shell=False, tty=True, yield_time_s=0.01)
+
+    assert finished.process_id is None
+    assert finished.exit_code == 0
+    assert finished.output == b""
+
+
+@pytest.mark.asyncio
+async def test_modal_pty_does_not_poll_status_after_yield_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    pending = asyncio.Event()
+    poll_calls = 0
+
+    class _PendingStream:
+        def __aiter__(self) -> _PendingStream:
+            return self
+
+        async def __anext__(self) -> bytes:
+            await pending.wait()
+            raise StopAsyncIteration
+
+    class _FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = _PendingStream()
+            self.stderr = _PendingStream()
+            self.terminate = _with_aio(lambda: None)
+
+            def poll() -> None:
+                return None
+
+            async def poll_aio() -> None:
+                nonlocal poll_calls
+                poll_calls += 1
+                await asyncio.sleep(0.2)
+
+            poll.aio = poll_aio  # type: ignore[attr-defined]
+            self.poll = poll
+
+    class _FakeSandbox:
+        object_id = "sb-slow-poll"
+
+        def __init__(self) -> None:
+            self.process = _FakeProcess()
+            self.exec = _with_aio(self._exec)
+
+        def _exec(self, *command: object, **kwargs: object) -> object:
+            _ = (command, kwargs)
+            return self.process
+
+    sandbox = _FakeSandbox()
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(root="/workspace"),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        sandbox_id=sandbox.object_id,
+    )
+    session = modal_module.ModalSandboxSession.from_state(state, sandbox=sandbox)
+
+    started = await session.pty_exec_start("python3", shell=False, tty=True, yield_time_s=0.25)
+
+    assert started.process_id is not None
+    assert started.exit_code is None
+    assert poll_calls == 1
+
+    await session.pty_terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_modal_pty_skips_status_when_fallback_reads_cross_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    poll_calls = 0
+
+    class _SlowReadStream:
+        def __init__(self) -> None:
+            def read(_size: int) -> bytes:
+                return b""
+
+            async def read_aio(_size: int) -> bytes:
+                await asyncio.sleep(0.2)
+                return b""
+
+            read.aio = read_aio  # type: ignore[attr-defined]
+            self.read = read
+
+    class _FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = _SlowReadStream()
+            self.stderr = _SlowReadStream()
+            self.terminate = _with_aio(lambda: None)
+
+            def poll() -> None:
+                return None
+
+            async def poll_aio() -> None:
+                nonlocal poll_calls
+                poll_calls += 1
+                await asyncio.sleep(0.2)
+
+            poll.aio = poll_aio  # type: ignore[attr-defined]
+            self.poll = poll
+
+    class _FakeSandbox:
+        object_id = "sb-slow-read"
+
+        def __init__(self) -> None:
+            self.process = _FakeProcess()
+            self.exec = _with_aio(self._exec)
+
+        def _exec(self, *command: object, **kwargs: object) -> object:
+            _ = (command, kwargs)
+            return self.process
+
+    sandbox = _FakeSandbox()
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(root="/workspace"),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        sandbox_id=sandbox.object_id,
+    )
+    session = modal_module.ModalSandboxSession.from_state(state, sandbox=sandbox)
+
+    started = await session.pty_exec_start("python3", shell=False, tty=True, yield_time_s=0.25)
+
+    assert started.process_id is not None
+    assert started.exit_code is None
+    assert poll_calls == 0
+
+    await session.pty_terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_modal_pty_keeps_pre_exit_empty_fallback_read_live_for_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+
+    class _FallbackStream:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self._chunks = chunks
+            self.read = _with_aio(self._read)
+
+        def _read(self, _size: int) -> bytes:
+            return self._chunks.pop(0) if self._chunks else b""
+
+    class _FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = _FallbackStream([b"", b"tail", b""])
+            self.stderr = _FallbackStream([b"", b"", b""])
+            self._poll_results: list[int | None] = [None, 0]
+            self.poll = _with_aio(self._poll)
+            self.terminate = _with_aio(lambda: None)
+
+        def _poll(self) -> int | None:
+            return self._poll_results.pop(0) if self._poll_results else 0
+
+    class _FakeSandbox:
+        object_id = "sb-fallback-tail"
+
+        def __init__(self) -> None:
+            self.process = _FakeProcess()
+            self.exec = _with_aio(self._exec)
+
+        def _exec(self, *command: object, **kwargs: object) -> object:
+            _ = (command, kwargs)
+            return self.process
+
+    sandbox = _FakeSandbox()
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(root="/workspace"),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        sandbox_id=sandbox.object_id,
+    )
+    session = modal_module.ModalSandboxSession.from_state(state, sandbox=sandbox)
+
+    finished = await session.pty_exec_start("python3", shell=False, tty=True, yield_time_s=0.25)
+
+    assert finished.process_id is None
+    assert finished.exit_code == 0
+    assert finished.output == b"tail"
+
+
+@pytest.mark.asyncio
 async def test_modal_pty_start_wraps_startup_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3710,3 +5081,161 @@ async def test_modal_pty_start_cleans_up_unregistered_process_on_cancellation(
 
     assert sandbox.process.terminate_calls == 1
     assert session._pty_processes == {}  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_modal_direct_persist_redacts_protected_mount_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modal_module, _create_calls, _registry_tags = _load_modal_module(monkeypatch)
+    sentinel = "direct-modal-persist-secret"
+    source_error = RuntimeError(f"provider echoed {sentinel}")
+    source_args = cast(Any, BaseException.args).__get__(source_error, type(source_error))
+    state = modal_module.ModalSandboxSessionState(
+        manifest=Manifest(
+            root="/workspace",
+            entries={
+                "remote": S3Mount(
+                    bucket="bucket",
+                    mount_strategy=modal_module.ModalCloudBucketMountStrategy(secret_name=sentinel),
+                )
+            },
+        ),
+        snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+        app_name="sandbox-tests",
+        sandbox_id="sb-direct-persist",
+    )
+    session = modal_module.ModalSandboxSession.from_state(state)
+
+    async def fail_persist() -> io.IOBase:
+        raise source_error
+
+    monkeypatch.setattr(session, "_persist_workspace_via_tar", fail_persist)
+
+    with pytest.raises(RuntimeError, match="protected mount configuration") as exc_info:
+        await session.persist_workspace()
+
+    assert sentinel not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert source_error.args == source_args
+    assert source_error.__traceback__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_during_exit_drain", [False, True])
+async def test_modal_pty_cancellation_preserves_consumed_utf8(
+    monkeypatch: pytest.MonkeyPatch, cancel_during_exit_drain: bool
+) -> None:
+    modal_module, _, _ = _load_modal_module(monkeypatch)
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+
+    class Stream:
+        def __init__(self, chunks: list[bytes], *, block: bool) -> None:
+            self.chunks = chunks
+
+            async def read_aio(_size: int) -> bytes:
+                if self.chunks:
+                    return self.chunks.pop(0)
+                if block:
+                    blocked.set()
+                    await release.wait()
+                return b""
+
+            self.read = _with_aio(lambda _size: b"")
+            self.read.aio = read_aio
+
+    # Provider doubles control cancellation after consumption, before the next read.
+    stdout = Stream(
+        [b"", b"\xa9"] if cancel_during_exit_drain else [b"\xa9"], block=cancel_during_exit_drain
+    )
+    stderr = Stream([b""] if cancel_during_exit_drain else [], block=not cancel_during_exit_drain)
+    process = types.SimpleNamespace(
+        stdout=stdout,
+        stderr=stderr,
+        poll=_with_aio(lambda: 0 if cancel_during_exit_drain else None),
+        terminate=_with_aio(lambda: None),
+    )
+    session = modal_module.ModalSandboxSession.from_state(
+        modal_module.ModalSandboxSessionState(
+            manifest=Manifest(root="/workspace"),
+            snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+            app_name="sandbox-tests",
+            sandbox_id="sb-cancel-output",
+        ),
+        sandbox=types.SimpleNamespace(object_id="sb-cancel-output"),
+    )
+    entry = modal_module._ModalPtyProcessEntry(process=process, tty=False)
+    entry.output_chunks.append(b"\xc3")
+    session._pty_processes[1] = entry
+    session._reserved_pty_process_ids.add(1)
+    task = asyncio.create_task(session.pty_write_stdin(session_id=1, chars="", yield_time_s=1))
+    try:
+        await asyncio.wait_for(blocked.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert b"".join(entry.output_chunks) == "é".encode()
+        assert session._pty_processes[1] is entry
+        release.set()
+        process.poll = _with_aio(lambda: 0)
+        update = await session.pty_write_stdin(session_id=1, chars="", yield_time_s=0)
+        assert update.output == "é".encode()
+        assert update.process_id is None
+        assert not entry.output_chunks
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await session.pty_terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_modal_pty_bounds_each_fallback_read_by_remaining_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agents.sandbox.session import pty_output
+
+    modal_module, _, _ = _load_modal_module(monkeypatch)
+    now = 0.0
+    timeouts: list[float] = []
+    clock = types.SimpleNamespace(monotonic=lambda: now)
+    monkeypatch.setattr(modal_module, "time", clock)
+    monkeypatch.setattr(pty_output, "time", clock)
+    process = types.SimpleNamespace(
+        stdout=types.SimpleNamespace(read=lambda _size: b""),
+        stderr=types.SimpleNamespace(read=lambda _size: b""),
+        poll=lambda: pytest.fail("Status must not be polled after the deadline"),
+    )
+    session = modal_module.ModalSandboxSession.from_state(
+        modal_module.ModalSandboxSessionState(
+            manifest=Manifest(root="/workspace"),
+            snapshot=modal_module.resolve_snapshot(None, "snapshot"),
+            app_name="sandbox-tests",
+            sandbox_id="sb-deadline",
+        ),
+        sandbox=types.SimpleNamespace(object_id="sb-deadline"),
+    )
+
+    async def timed_out_read(
+        fn: object, *args: object, call_timeout: float, **kwargs: object
+    ) -> None:
+        nonlocal now
+        assert fn in (process.stdout.read, process.stderr.read)
+        timeouts.append(call_timeout)
+        now += call_timeout
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(session, "_call_modal", timed_out_read)
+    entry = modal_module._ModalPtyProcessEntry(process=process, tty=False)
+    # This boundary owns the deadline; empty stdin polls publicly clamp to five seconds.
+    output, _, closed = await session._collect_pty_output(
+        entry=entry,
+        yield_time_ms=250,
+        max_output_tokens=None,
+    )
+    assert timeouts == pytest.approx([0.2, 0.05])
+    assert now == pytest.approx(0.25)
+    assert output == b""
+    assert closed is False

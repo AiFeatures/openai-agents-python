@@ -28,9 +28,10 @@ from agents.run_internal.run_loop import get_new_response, run_single_turn_strea
 from agents.run_internal.run_steps import NextStepInterruption
 from agents.run_internal.tool_use_tracker import AgentToolUseTracker
 from agents.stream_events import RunItemStreamEvent
+from agents.testing import ScriptedModel
 from agents.usage import Usage
+from tests.model_test_helpers import get_exact_output_stream_step
 
-from .fake_model import FakeModel
 from .test_responses import get_text_message
 
 
@@ -148,6 +149,7 @@ def test_hydrate_from_state_preserves_unsent_outputs_from_interrupted_turn() -> 
     ]
     interrupted_state = SimpleNamespace(
         _current_step=NextStepInterruption(interruptions=[]),
+        _model_responses=[model_response],
         _last_processed_response=SimpleNamespace(
             handoffs=[],
             functions=[
@@ -208,6 +210,101 @@ def test_hydrate_from_state_preserves_unsent_outputs_from_interrupted_turn() -> 
         for item in prepared
         if isinstance(item, dict) and item.get("type") == "function_call_output"
     ] == ["call_DIAG", "call_CLEANUP1", "call_CLEANUP2"]
+
+
+def test_hydrate_from_state_preserves_unsent_output_without_a_pending_tool_run() -> None:
+    """An interrupted turn's local output is unsent even with no pending tool run to enumerate.
+
+    A call to a tool that does not exist is answered locally and leaves no pending tool run in
+    the resumed `ProcessedResponse`, so the latest model response is what identifies its output
+    as still unsent.
+    """
+    agent = Agent(name="test")
+    approval_call = ResponseFunctionToolCall(
+        id="fc_101",
+        type="function_call",
+        call_id="call_APPROVAL",
+        name="run_cleanup",
+        arguments='{"target": "temp_files"}',
+        status="completed",
+    )
+    missing_tool_call = ResponseFunctionToolCall(
+        id="fc_102",
+        type="function_call",
+        call_id="call_MISSING",
+        name="not_a_registered_tool",
+        arguments="{}",
+        status="completed",
+    )
+    model_response = ModelResponse(
+        output=[approval_call, missing_tool_call],
+        usage=Usage(),
+        response_id="resp_101",
+    )
+    missing_tool_output = ToolCallOutputItem(
+        agent=agent,
+        raw_item={
+            "type": "function_call_output",
+            "call_id": "call_MISSING",
+            "output": "Tool not_a_registered_tool not found.",
+        },
+        output="Tool not_a_registered_tool not found.",
+    )
+    generated_items: list[RunItem] = [
+        ToolCallItem(agent=agent, raw_item=approval_call),
+        ToolCallItem(agent=agent, raw_item=missing_tool_call),
+        ToolApprovalItem(agent=agent, raw_item=approval_call, tool_name="run_cleanup"),
+        missing_tool_output,
+    ]
+    interrupted_state = SimpleNamespace(
+        _current_step=NextStepInterruption(interruptions=[]),
+        _model_responses=[model_response],
+        _last_processed_response=SimpleNamespace(
+            handoffs=[],
+            functions=[SimpleNamespace(tool_call=approval_call)],
+            computer_actions=[],
+            custom_tool_calls=[],
+            local_shell_calls=[],
+            shell_calls=[],
+            apply_patch_calls=[],
+        ),
+    )
+
+    tracker = OpenAIServerConversationTracker(previous_response_id="resp_101")
+    tracker.hydrate_from_state(
+        original_input="Clean up and call the missing tool.",
+        generated_items=generated_items,
+        model_responses=[model_response],
+        unsent_tool_call_ids=get_unsent_tool_call_ids_for_interrupted_state(
+            cast(Any, interrupted_state)
+        ),
+    )
+
+    assert "call_MISSING" not in tracker.server_tool_call_ids
+
+    prepared = tracker.prepare_input(
+        "Clean up and call the missing tool.",
+        [
+            ToolCallItem(agent=agent, raw_item=approval_call),
+            ToolCallItem(agent=agent, raw_item=missing_tool_call),
+            missing_tool_output,
+            ToolCallOutputItem(
+                agent=agent,
+                raw_item={
+                    "type": "function_call_output",
+                    "call_id": "call_APPROVAL",
+                    "output": "Cleanup finished.",
+                },
+                output="Cleanup finished.",
+            ),
+        ],
+    )
+
+    assert [
+        item.get("call_id")
+        for item in prepared
+        if isinstance(item, dict) and item.get("type") == "function_call_output"
+    ] == ["call_MISSING", "call_APPROVAL"]
 
 
 def test_hydrate_from_state_does_not_track_string_initial_input_by_object_identity() -> None:
@@ -815,8 +912,8 @@ def test_prepare_input_does_not_resend_reasoning_item_after_marking_omitted_id_a
 
 @pytest.mark.asyncio
 async def test_get_new_response_marks_filtered_input_as_sent() -> None:
-    model = FakeModel()
-    model.set_next_output([get_text_message("ok")])
+    model = ScriptedModel()
+    model.enqueue([get_text_message("ok")])
     agent = Agent(name="test", model=model)
     tracker = OpenAIServerConversationTracker(conversation_id="conv4", previous_response_id=None)
     context_wrapper: RunContextWrapper[dict[str, Any]] = RunContextWrapper(context={})
@@ -848,15 +945,15 @@ async def test_get_new_response_marks_filtered_input_as_sent() -> None:
         None,
     )
 
-    assert model.last_turn_args["input"] == [item_1]
+    assert model.calls[-1].input == [item_1]
     assert any(item is item_1 for item in tracker.sent_items)
     assert all(item is not item_2 for item in tracker.sent_items)
 
 
 @pytest.mark.asyncio
 async def test_run_single_turn_streamed_marks_filtered_input_as_sent() -> None:
-    model = FakeModel()
-    model.set_next_output([get_text_message("ok")])
+    model = ScriptedModel()
+    model.enqueue([get_text_message("ok")])
     agent = Agent(name="test", model=model)
     tracker = OpenAIServerConversationTracker(conversation_id="conv6", previous_response_id=None)
     context_wrapper: RunContextWrapper[dict[str, Any]] = RunContextWrapper(context={})
@@ -899,17 +996,16 @@ async def test_run_single_turn_streamed_marks_filtered_input_as_sent() -> None:
         run_config,
         should_run_agent_start_hooks=False,
         tool_use_tracker=tool_use_tracker,
-        all_tools=[],
         server_conversation_tracker=tracker,
     )
 
-    assert model.last_turn_args["input"] == [item_1]
+    assert model.calls[-1].input == [item_1]
     assert tracker.remaining_initial_input == [item_2]
 
 
 @pytest.mark.asyncio
 async def test_run_single_turn_streamed_seeds_hosted_mcp_metadata_from_pre_step_items() -> None:
-    model = FakeModel()
+    model = ScriptedModel()
     mcp_call = McpCall(
         id="mcp_call_1",
         arguments="{}",
@@ -918,8 +1014,7 @@ async def test_run_single_turn_streamed_seeds_hosted_mcp_metadata_from_pre_step_
         type="mcp_call",
         status="completed",
     )
-    model.set_next_output([mcp_call])
-    agent = Agent(name="test", model=model)
+    model.enqueue(get_exact_output_stream_step([mcp_call]))
     hosted_tool = HostedMCPTool(
         tool_config=cast(
             Any,
@@ -930,6 +1025,7 @@ async def test_run_single_turn_streamed_seeds_hosted_mcp_metadata_from_pre_step_
             },
         )
     )
+    agent = Agent(name="test", model=model, tools=[hosted_tool])
     context_wrapper: RunContextWrapper[dict[str, Any]] = RunContextWrapper(context={})
     tool_use_tracker = AgentToolUseTracker()
 
@@ -974,10 +1070,9 @@ async def test_run_single_turn_streamed_seeds_hosted_mcp_metadata_from_pre_step_
         run_config,
         should_run_agent_start_hooks=False,
         tool_use_tracker=tool_use_tracker,
-        all_tools=[hosted_tool],
     )
 
-    assert model.last_turn_args["input"] == [item_1]
+    assert model.calls[-1].input == [item_1]
 
     tool_call_events: list[ToolCallItem] = []
     while not streamed_result._event_queue.empty():

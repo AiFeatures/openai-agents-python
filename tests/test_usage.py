@@ -1,19 +1,26 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
-from openai.types.completion_usage import CompletionTokensDetails, PromptTokensDetails
+from openai.types.completion_usage import (
+    CompletionTokensDetails,
+    CompletionUsage,
+    PromptTokensDetails,
+)
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 
 from agents import Agent, Runner
 from agents.run_internal.agent_runner_helpers import snapshot_usage, usage_delta
+from agents.testing import ScriptedModel
 from agents.usage import (
     RequestUsage,
     Usage,
+    _raw_usage_snapshot,
     deserialize_usage,
     model_usage_to_span_usage,
     serialize_usage,
 )
-from tests.fake_model import FakeModel
 from tests.test_responses import get_text_message
 
 
@@ -22,6 +29,45 @@ def test_usage_defaults_cache_write_tokens_to_zero() -> None:
 
     assert usage.input_tokens_details.cached_tokens == 0
     assert getattr(usage.input_tokens_details, "cache_write_tokens", None) == 0
+
+
+def test_raw_usage_snapshot_preserves_presence_and_is_detached() -> None:
+    raw_usage: dict[str, Any] = {
+        "input_tokens": 3,
+        "input_tokens_details": {"cached_tokens": 0},
+        "provider_metric": None,
+    }
+
+    snapshot = _raw_usage_snapshot(raw_usage)
+    raw_usage["input_tokens_details"]["cached_tokens"] = 9
+
+    assert snapshot == {
+        "input_tokens": 3,
+        "input_tokens_details": {"cached_tokens": 0},
+        "provider_metric": None,
+    }
+
+
+def test_raw_usage_snapshot_does_not_add_unset_pydantic_fields() -> None:
+    usage = CompletionUsage.model_validate(
+        {
+            "completion_tokens": 2,
+            "prompt_tokens": 3,
+            "total_tokens": 5,
+            "prompt_tokens_details": {},
+        }
+    )
+
+    assert _raw_usage_snapshot(usage) == {
+        "completion_tokens": 2,
+        "prompt_tokens": 3,
+        "total_tokens": 5,
+        "prompt_tokens_details": {},
+    }
+
+
+def test_raw_usage_snapshot_rejects_non_json_values() -> None:
+    assert _raw_usage_snapshot({"provider_metric": object()}) is None
 
 
 @pytest.mark.asyncio
@@ -44,8 +90,8 @@ async def test_runner_run_carries_request_usage_entries() -> None:
             )
         ],
     )
-    model = FakeModel(initial_output=[get_text_message("done")])
-    model.set_hardcoded_usage(usage)
+    model = ScriptedModel(steps=[[get_text_message("done")]])
+    model.set_default_usage(usage)
     agent = Agent(name="usage-agent", model=model)
 
     result = await Runner.run(agent, input="hi")
@@ -318,6 +364,58 @@ def test_usage_add_preserves_existing_entries_when_top_level_also_set():
     entry = u1.request_usage_entries[0]
     assert entry.input_tokens_details.cached_tokens == 10
     assert entry.output_tokens_details.reasoning_tokens == 5
+
+
+def test_usage_add_detaches_pre_existing_request_usage_entries():
+    source_entry = RequestUsage(
+        input_tokens=100,
+        output_tokens=50,
+        total_tokens=150,
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 0, "cached_tokens": 10}
+        ),
+        output_tokens_details=OutputTokensDetails(reasoning_tokens=5),
+    )
+    source = Usage(
+        requests=1,
+        input_tokens=100,
+        output_tokens=50,
+        total_tokens=150,
+        request_usage_entries=[source_entry],
+    )
+    aggregate = Usage()
+
+    aggregate.add(source)
+    source_entry.input_tokens = 999
+    source_entry.input_tokens_details.cached_tokens = 99
+    source_entry.output_tokens_details.reasoning_tokens = 99
+
+    aggregate_entry = aggregate.request_usage_entries[0]
+    assert aggregate_entry.input_tokens == 100
+    assert aggregate_entry.input_tokens_details.cached_tokens == 10
+    assert aggregate_entry.output_tokens_details.reasoning_tokens == 5
+
+
+def test_usage_add_detaches_synthesized_request_usage_details():
+    source = Usage(
+        requests=1,
+        input_tokens=100,
+        output_tokens=50,
+        total_tokens=150,
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cache_write_tokens": 0, "cached_tokens": 10}
+        ),
+        output_tokens_details=OutputTokensDetails(reasoning_tokens=5),
+    )
+    aggregate = Usage()
+
+    aggregate.add(source)
+    source.input_tokens_details.cached_tokens = 99
+    source.output_tokens_details.reasoning_tokens = 99
+
+    aggregate_entry = aggregate.request_usage_entries[0]
+    assert aggregate_entry.input_tokens_details.cached_tokens == 10
+    assert aggregate_entry.output_tokens_details.reasoning_tokens == 5
 
 
 def test_usage_request_usage_entries_default_empty():

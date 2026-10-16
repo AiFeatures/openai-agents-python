@@ -25,11 +25,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, cast
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 from pydantic import BaseModel, Field
 
 from ....logger import log_tool_action_debug, log_tool_action_warning
+from ....sandbox._mount_security import redact_mount_error_data
 from ....sandbox.entries import Mount
 from ....sandbox.errors import (
     ExecTimeoutError,
@@ -43,6 +44,7 @@ from ....sandbox.errors import (
 from ....sandbox.manifest import Manifest
 from ....sandbox.session import SandboxSession, SandboxSessionState
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
+from ....sandbox.session.bounded_read import collect_bounded
 from ....sandbox.session.dependencies import Dependencies
 from ....sandbox.session.manager import Instrumentation
 from ....sandbox.session.pty_output import collect_pty_output
@@ -50,6 +52,7 @@ from ....sandbox.session.pty_types import (
     PTY_PROCESSES_MAX,
     PTY_PROCESSES_WARNING,
     PtyExecUpdate,
+    _settle_pty_cleanup,
     allocate_pty_process_id,
     clamp_pty_yield_time_ms,
     process_id_to_prune_from_meta,
@@ -433,7 +436,9 @@ class BlaxelSandboxSession(BaseSandboxSession):
 
     # -- lifecycle -----------------------------------------------------------
 
+    @redact_mount_error_data
     async def start(self) -> None:
+        await self._validate_manifest_application()
         # When resuming a paused sandbox, _skip_start is set by the client to
         # avoid reapplying the full manifest over files that may have changed
         # while the sandbox was paused.
@@ -501,6 +506,25 @@ class BlaxelSandboxSession(BaseSandboxSession):
                 context={"reason": "mkdir_failed"},
                 cause=e,
             ) from e
+
+    async def _read_bounded(self, path: Path, *, max_bytes: int) -> bytes:
+        workspace_path = await self._validate_path_access(path)
+        filesystem = self._sandbox.fs
+        client = filesystem.get_client()
+        path_arg = filesystem.format_path(sandbox_path_str(workspace_path))
+        async with client.stream(
+            "GET",
+            f"{filesystem.url}/filesystem/{path_arg}",
+            headers={"Accept": "application/octet-stream"},
+        ) as response:
+            if response.status_code == 404:
+                raise WorkspaceReadNotFoundError(path=path)
+            if response.status_code != 200:
+                raise WorkspaceArchiveReadError(
+                    path=path,
+                    retryable=True if response.status_code in TRANSIENT_HTTP_STATUS_CODES else None,
+                )
+            return await collect_bounded(response.aiter_bytes(chunk_size=65536), max_bytes)
 
     async def read(self, path: Path | str, *, user: str | User | None = None) -> io.IOBase:
         error_path = posix_path_as_path(coerce_posix_path(path))
@@ -836,11 +860,18 @@ class BlaxelSandboxSession(BaseSandboxSession):
                 registered = True
         except asyncio.TimeoutError as e:
             if not registered:
-                await self._terminate_pty_entry(entry)
+                await _settle_pty_cleanup(self._terminate_pty_entry(entry))
             raise ExecTimeoutError(command=command, timeout_s=exec_timeout, cause=e) from e
+        except asyncio.CancelledError as cancellation:
+            if not registered:
+                await _settle_pty_cleanup(
+                    self._terminate_pty_entry(entry),
+                    initial_cancellation=cancellation,
+                )
+            raise
         except Exception as e:
             if not registered:
-                await self._terminate_pty_entry(entry)
+                await _settle_pty_cleanup(self._terminate_pty_entry(entry))
             raise _blaxel_exec_transport_error(command=command, cause=e) from e
 
         if pruned is not None:
@@ -853,7 +884,7 @@ class BlaxelSandboxSession(BaseSandboxSession):
             )
 
         yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
+        output, original_token_count, output_closed = await self._collect_pty_output(
             entry=entry,
             yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
             max_output_tokens=max_output_tokens,
@@ -863,6 +894,7 @@ class BlaxelSandboxSession(BaseSandboxSession):
             entry=entry,
             output=output,
             original_token_count=original_token_count,
+            output_closed=output_closed,
         )
 
     async def pty_write_stdin(
@@ -887,7 +919,7 @@ class BlaxelSandboxSession(BaseSandboxSession):
             await asyncio.sleep(0.1)
 
         yield_time_ms = 250 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
+        output, original_token_count, output_closed = await self._collect_pty_output(
             entry=entry,
             yield_time_ms=resolve_pty_write_yield_time_ms(
                 yield_time_ms=yield_time_ms, input_empty=chars == ""
@@ -900,6 +932,7 @@ class BlaxelSandboxSession(BaseSandboxSession):
             entry=entry,
             output=output,
             original_token_count=original_token_count,
+            output_closed=output_closed,
         )
 
     async def pty_terminate_all(self) -> None:
@@ -961,7 +994,7 @@ class BlaxelSandboxSession(BaseSandboxSession):
         entry: _BlaxelPtySessionEntry,
         yield_time_ms: int,
         max_output_tokens: int | None,
-    ) -> tuple[bytes, int | None]:
+    ) -> tuple[bytes, int | None, bool]:
         return await collect_pty_output(
             output_chunks=entry.output_chunks,
             output_lock=entry.output_lock,
@@ -978,11 +1011,12 @@ class BlaxelSandboxSession(BaseSandboxSession):
         entry: _BlaxelPtySessionEntry,
         output: bytes,
         original_token_count: int | None,
+        output_closed: bool,
     ) -> PtyExecUpdate:
-        exit_code = entry.exit_code if entry.done else None
+        exit_code = entry.exit_code if output_closed else None
         live_process_id: int | None = process_id
 
-        if entry.done:
+        if output_closed:
             async with self._pty_lock:
                 removed = self._pty_sessions.pop(process_id, None)
                 self._reserved_pty_process_ids.discard(process_id)
@@ -1052,10 +1086,13 @@ class BlaxelSandboxClient(BaseSandboxClient["BlaxelSandboxClientOptions"]):
     ) -> None:
         # Validate that the Blaxel SDK is importable.
         _import_blaxel_sdk()
-        self._instrumentation = instrumentation or Instrumentation()
+        self._instrumentation = (
+            instrumentation if instrumentation is not None else Instrumentation()
+        )
         self._dependencies = dependencies
         self._token = token or os.environ.get("BL_API_KEY")
 
+    @redact_mount_error_data
     async def create(
         self,
         *,
@@ -1065,6 +1102,7 @@ class BlaxelSandboxClient(BaseSandboxClient["BlaxelSandboxClientOptions"]):
     ) -> SandboxSession:
         if manifest is None:
             manifest = Manifest(root=DEFAULT_BLAXEL_WORKSPACE_ROOT)
+        self._validate_manifest_for_create(manifest)
 
         timeouts_in = options.timeouts
         if isinstance(timeouts_in, BlaxelTimeouts):
@@ -1132,6 +1170,7 @@ class BlaxelSandboxClient(BaseSandboxClient["BlaxelSandboxClientOptions"]):
             log_tool_action_warning(logger, "Shutdown failed during delete (non-fatal)", e)
         return session
 
+    @redact_mount_error_data
     async def resume(
         self,
         state: SandboxSessionState,
@@ -1145,7 +1184,7 @@ class BlaxelSandboxClient(BaseSandboxClient["BlaxelSandboxClientOptions"]):
         """
         if not isinstance(state, BlaxelSandboxSessionState):
             raise TypeError("BlaxelSandboxClient.resume expects a BlaxelSandboxSessionState")
-
+        state.assert_path_grants_rebound()
         SandboxInstance = _import_blaxel_sdk()
         blaxel_sandbox = None
         reconnected = False
@@ -1179,7 +1218,7 @@ class BlaxelSandboxClient(BaseSandboxClient["BlaxelSandboxClientOptions"]):
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
     def deserialize_session_state(self, payload: dict[str, object]) -> SandboxSessionState:
-        return BlaxelSandboxSessionState.model_validate(payload)
+        return self._deserialize_session_state_payload(payload, BlaxelSandboxSessionState)
 
 
 # ---------------------------------------------------------------------------
@@ -1279,15 +1318,32 @@ def _build_ws_url(
 ) -> str:
     """Build the WebSocket URL for a Blaxel terminal session."""
     base = sandbox_url.rstrip("/")
-    ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
-    return (
-        f"{ws_base}/terminal/ws"
-        f"?token={token}"
-        f"&cols={cols}"
-        f"&rows={rows}"
-        f"&sessionId={session_id}"
-        f"&workingDir={cwd}"
+    # Rewrite only the scheme. `replace` would also rewrite an occurrence inside the path,
+    # such as a proxied URL.
+    if base.startswith("https://"):
+        ws_base = f"wss://{base.removeprefix('https://')}"
+    elif base.startswith("http://"):
+        ws_base = f"ws://{base.removeprefix('http://')}"
+    else:
+        ws_base = base
+    # Percent-encode the values. The workspace path and session id are caller-controlled and
+    # may contain characters that are structural in a query string, so interpolating them
+    # raw lets a path such as `/w/a&rows=1` add or override parameters, and lets a `#`
+    # silently truncate the rest into a fragment. A `+` in a token would also decode back as
+    # a space.
+    # `/` stays literal because it is legal in a query value and keeps paths readable.
+    query = urlencode(
+        {
+            "token": token,
+            "cols": cols,
+            "rows": rows,
+            "sessionId": session_id,
+            "workingDir": cwd,
+        },
+        quote_via=quote,
+        safe="/",
     )
+    return f"{ws_base}/terminal/ws?{query}"
 
 
 __all__ = [

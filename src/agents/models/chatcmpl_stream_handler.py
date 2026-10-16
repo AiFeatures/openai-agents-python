@@ -48,12 +48,19 @@ from openai.types.responses.response_reasoning_text_done_event import (
 )
 from openai.types.responses.response_usage import OutputTokensDetails
 
-from ..exceptions import ModelBehaviorError, UserError
+from ..exceptions import AgentsException, ModelBehaviorError, UserError
 from ..items import TResponseStreamEvent
 from ..logger import logger
-from ..usage import _cache_write_tokens, _make_input_tokens_details
+from ..usage import (
+    _attach_raw_usage_snapshot,
+    _cache_write_tokens,
+    _extract_raw_usage_snapshot,
+    _make_input_tokens_details,
+    _mark_request_completed_without_usage,
+)
 from .chatcmpl_helpers import ChatCmplHelpers
 from .fake_id import FAKE_RESPONSES_ID
+from .reasoning_content_replay import _CHAT_COMPLETIONS_REASONING_FIELD_KEY
 
 
 # Define a Part class for internal use
@@ -75,12 +82,67 @@ class StreamingState:
     # Fields for real-time function call streaming
     function_call_streaming: dict[int, bool] = field(default_factory=dict)
     ignored_tool_call_indexes: set[int] = field(default_factory=set)
-    # Store accumulated thinking text and signature for Anthropic compatibility
-    thinking_text: str = ""
-    thinking_signature: str | None = None
+    # Store the ordered Anthropic thinking block sequence for replay. Text and signatures
+    # cannot be flattened into scalars: each block carries its own signature, and a
+    # redacted_thinking block carries neither text nor signature.
+    thinking_blocks: list[dict[str, Any]] = field(default_factory=list)
     # Store provider data for all output items
     provider_data: dict[str, Any] = field(default_factory=dict)
     has_warned_unsupported_choice: bool = False
+
+    def accumulate_thinking_block(self, block: dict[str, Any]) -> bool:
+        """Fold one streamed thinking delta into the ordered block sequence.
+
+        Anthropic streams a thinking block as a run of `thinking_delta` chunks terminated by a
+        single `signature_delta`, so a signature both belongs to the block being accumulated and
+        marks its end. A `redacted_thinking` block arrives whole and is kept verbatim.
+        """
+        block_type = block.get("type", "thinking")
+        if block_type == "redacted_thinking":
+            self.thinking_blocks.append(dict(block))
+            return True
+
+        if block_type != "thinking":
+            return False
+
+        for field_name in ("thinking", "signature"):
+            if field_name not in block:
+                continue
+            field_value = block[field_name]
+            if not isinstance(field_value, str):
+                raise ModelBehaviorError(
+                    f"Expected streamed thinking block field '{field_name}' to be a string, "
+                    f"got {type(field_value).__name__}."
+                )
+
+        thinking_text = block.get("thinking") or ""
+        signature = block.get("signature") or ""
+        metadata = {
+            key: value
+            for key, value in block.items()
+            if key not in {"type", "thinking", "signature"}
+        }
+        if not thinking_text and not signature and not metadata:
+            return False
+
+        current = self._open_thinking_block()
+        current.update(metadata)
+        if thinking_text:
+            current["thinking"] = f"{current.get('thinking', '')}{thinking_text}"
+        if signature:
+            # A signature closes the block, so later text starts a new one.
+            current["signature"] = signature
+        return True
+
+    def _open_thinking_block(self) -> dict[str, Any]:
+        """Return the thinking block still accepting deltas, creating one when needed."""
+        if self.thinking_blocks:
+            last_block = self.thinking_blocks[-1]
+            if last_block.get("type") == "thinking" and "signature" not in last_block:
+                return last_block
+        new_block: dict[str, Any] = {"type": "thinking", "thinking": ""}
+        self.thinking_blocks.append(new_block)
+        return new_block
 
 
 @dataclass
@@ -235,6 +297,12 @@ class ChatCmplStreamHandler:
         if hasattr(delta, "thinking_blocks") and delta.thinking_blocks:
             return True
 
+        if getattr(delta, "annotations", None):
+            return True
+
+        if getattr(delta, "audio", None):
+            return True
+
         return False
 
     @staticmethod
@@ -315,7 +383,8 @@ class ChatCmplStreamHandler:
         choice = Choice(
             index=0,
             delta=ChoiceDelta(tool_calls=tool_call_deltas),
-            finish_reason="tool_calls",
+            # Assembling buffered deltas does not prove the provider finished the choice.
+            finish_reason=None,
         )
         return template_chunk.model_copy(update={"choices": [choice], "usage": None})
 
@@ -377,11 +446,8 @@ class ChatCmplStreamHandler:
 
                 if has_passthrough_output:
                     passthrough_choices.append(choice)
-                elif choice.finish_reason == "content_filter":
-                    # A content-filtered choice ends the stream with an empty delta, so it
-                    # would otherwise be dropped here and the handler would never see the
-                    # finish_reason it needs to synthesize the refusal. Forward a
-                    # delta-stripped copy so buffering semantics are unchanged.
+                elif choice.finish_reason is not None:
+                    # Preserve real terminal evidence even when all output was buffered.
                     passthrough_choices.append(choice.model_copy(update={"delta": ChoiceDelta()}))
 
             if passthrough_choices or chunk.usage is not None:
@@ -460,6 +526,49 @@ class ChatCmplStreamHandler:
         )
         state.active_reasoning_summary_index = None
 
+    @staticmethod
+    def _finalize_thinking_blocks(state: StreamingState) -> None:
+        if not state.thinking_blocks or not state.reasoning_content_index_and_output:
+            return
+
+        reasoning_item = state.reasoning_content_index_and_output[1]
+        provider_data = getattr(reasoning_item, "provider_data", None)
+        reasoning_provider_data = provider_data.copy() if isinstance(provider_data, dict) else {}
+        reasoning_provider_data["thinking_blocks"] = [
+            dict(block) for block in state.thinking_blocks
+        ]
+        reasoning_item.provider_data = reasoning_provider_data  # type: ignore[attr-defined]
+
+        # Retain the released normalized representation for callers and legacy replay.
+        thinking_text = ""
+        last_signature: str | None = None
+        for block in state.thinking_blocks:
+            if block.get("type") != "thinking":
+                continue
+            thinking_text += block.get("thinking") or ""
+            if signature := block.get("signature"):
+                last_signature = signature
+        if thinking_text:
+            if not reasoning_item.content:
+                reasoning_item.content = []
+            reasoning_item.content.append(Content(text=thinking_text, type="reasoning_text"))
+        if last_signature:
+            reasoning_item.encrypted_content = last_signature
+
+    @staticmethod
+    def _discard_plaintext_reasoning_replay_marker(
+        reasoning_item: ResponseReasoningItem,
+    ) -> None:
+        provider_data = getattr(reasoning_item, "provider_data", None)
+        if not isinstance(provider_data, dict):
+            return
+        if provider_data.get(_CHAT_COMPLETIONS_REASONING_FIELD_KEY) != "reasoning":
+            return
+
+        reasoning_provider_data = provider_data.copy()
+        del reasoning_provider_data[_CHAT_COMPLETIONS_REASONING_FIELD_KEY]
+        reasoning_item.provider_data = reasoning_provider_data  # type: ignore[attr-defined]
+
     @classmethod
     def _finish_reasoning_item(
         cls,
@@ -497,6 +606,9 @@ class ChatCmplStreamHandler:
         stream: AsyncStream[ChatCompletionChunk],
         model: str | None = None,
         strict_feature_validation: bool = False,
+        preserve_raw_usage: bool = False,
+        raise_on_length_truncation: bool = False,
+        require_finish_reason: bool = False,
     ) -> AsyncIterator[TResponseStreamEvent]:
         """
         Handle a streaming chat completion response and yield response events.
@@ -506,8 +618,18 @@ class ChatCmplStreamHandler:
             stream: The async stream of chat completion chunks from the model
             model: The source model that is generating this stream. Used to handle
                 provider-specific stream processing.
+            preserve_raw_usage: Whether to retain the last provider usage payload before
+                converting it to the Responses usage shape.
+            raise_on_length_truncation: Whether to raise ModelBehaviorError when the
+                stream terminates with finish_reason == "length" and no visible output.
+                This is an internal option enabled only by OpenAIChatCompletionsModel:
+                the shared handler also serves LiteLLM and AnyLLM, whose streaming
+                behavior must remain unchanged.
+            require_finish_reason: Whether choice zero must have a provider finish reason
+                before completion. Enabled for the official OpenAI endpoint only.
         """
         usage: CompletionUsage | None = None
+        raw_usage: dict[str, Any] | None = None
         state = StreamingState()
         output_layout = _StreamOutputLayout()
         sequence_number = SequenceNumber()
@@ -515,7 +637,12 @@ class ChatCmplStreamHandler:
         # safety block only through finish_reason == "content_filter" with an
         # empty delta and no refusal field. Track it so we can synthesize an
         # explicit refusal after the stream if nothing else was emitted.
+        # A completion truncated before any visible token (finish_reason ==
+        # "length") has the same shape; track it too so we can surface a model
+        # behavior error instead of collapsing into an empty turn.
         saw_content_filter = False
+        saw_length = False
+        saw_finish_reason = False
         async for chunk in stream:
             if not state.started:
                 state.started = True
@@ -529,6 +656,8 @@ class ChatCmplStreamHandler:
             # Only update when chunk has usage data (not always in the last chunk)
             if hasattr(chunk, "usage") and chunk.usage is not None:
                 usage = chunk.usage
+                if preserve_raw_usage:
+                    raw_usage = _extract_raw_usage_snapshot(chunk, fallback=chunk.usage)
 
             if not chunk.choices:
                 continue
@@ -556,8 +685,12 @@ class ChatCmplStreamHandler:
             if choice is None:
                 continue
 
+            if choice.finish_reason is not None:
+                saw_finish_reason = True
             if choice.finish_reason == "content_filter":
                 saw_content_filter = True
+            elif choice.finish_reason == "length":
+                saw_length = True
 
             if not choice.delta:
                 continue
@@ -574,22 +707,41 @@ class ChatCmplStreamHandler:
             delta = choice.delta
             choice_logprobs = choice.logprobs
 
+            if getattr(delta, "audio", None):
+                # The sync converter rejects audio output; a silent empty stream would
+                # diverge from that released behavior.
+                raise AgentsException("Audio is not currently supported")
+
             # Handle thinking blocks from Anthropic (for preserving signatures)
+            has_thinking_block = False
             if hasattr(delta, "thinking_blocks") and delta.thinking_blocks:
                 for block in delta.thinking_blocks:
                     if isinstance(block, dict):
-                        # Accumulate thinking text
-                        thinking_text = block.get("thinking", "")
-                        if thinking_text:
-                            state.thinking_text += thinking_text
-                        # Store signature if present
-                        signature = block.get("signature")
-                        if signature:
-                            state.thinking_signature = signature
+                        has_thinking_block |= state.accumulate_thinking_block(block)
+
+                if has_thinking_block and not state.reasoning_content_index_and_output:
+                    reasoning_item = ResponseReasoningItem(
+                        id=FAKE_RESPONSES_ID,
+                        summary=[],
+                        type="reasoning",
+                    )
+                    if state.provider_data:
+                        reasoning_item.provider_data = state.provider_data.copy()  # type: ignore[attr-defined]
+                    state.reasoning_content_index_and_output = (0, reasoning_item)
+                    yield ResponseOutputItemAddedEvent(
+                        item=reasoning_item,
+                        output_index=0,
+                        type="response.output_item.added",
+                        sequence_number=sequence_number.get_and_increment(),
+                    )
+                if has_thinking_block and state.reasoning_content_index_and_output:
+                    cls._discard_plaintext_reasoning_replay_marker(
+                        state.reasoning_content_index_and_output[1]
+                    )
 
             # Handle reasoning content for reasoning summaries
-            if hasattr(delta, "reasoning_content"):
-                reasoning_content = delta.reasoning_content
+            reasoning_content = getattr(delta, "reasoning_content", None)
+            if reasoning_content is not None:
                 if reasoning_content and not state.reasoning_content_index_and_output:
                     reasoning_item = ResponseReasoningItem(
                         id=FAKE_RESPONSES_ID,
@@ -608,6 +760,7 @@ class ChatCmplStreamHandler:
 
                 if reasoning_content and state.reasoning_content_index_and_output:
                     reasoning_item = state.reasoning_content_index_and_output[1]
+                    cls._discard_plaintext_reasoning_replay_marker(reasoning_item)
                     if state.active_reasoning_summary_index is None:
                         summary_index = len(reasoning_item.summary)
                         reasoning_item.summary.append(Summary(text="", type="summary_text"))
@@ -641,6 +794,8 @@ class ChatCmplStreamHandler:
             # Handle reasoning content from 3rd party platforms
             if hasattr(delta, "reasoning"):
                 reasoning_text = delta.reasoning
+                if not isinstance(reasoning_text, str):
+                    reasoning_text = ""
                 if reasoning_text and not state.reasoning_content_index_and_output:
                     reasoning_item = ResponseReasoningItem(
                         id=FAKE_RESPONSES_ID,
@@ -648,8 +803,9 @@ class ChatCmplStreamHandler:
                         content=[Content(text="", type="reasoning_text")],
                         type="reasoning",
                     )
-                    if state.provider_data:
-                        reasoning_item.provider_data = state.provider_data.copy()  # type: ignore[attr-defined]
+                    reasoning_provider_data = state.provider_data.copy()
+                    reasoning_provider_data[_CHAT_COMPLETIONS_REASONING_FIELD_KEY] = "reasoning"
+                    reasoning_item.provider_data = reasoning_provider_data  # type: ignore[attr-defined]
                     state.reasoning_content_index_and_output = (0, reasoning_item)
                     yield ResponseOutputItemAddedEvent(
                         item=reasoning_item,
@@ -705,8 +861,6 @@ class ChatCmplStreamHandler:
                 # text part has already opened keep their existing behavior.
                 if not state.text_content_index_and_output:
                     content_index = 0
-                    if state.reasoning_content_index_and_output:
-                        content_index += 1
                     if state.refusal_content_index_and_output:
                         content_index += 1
 
@@ -719,23 +873,28 @@ class ChatCmplStreamHandler:
                             logprobs=[],
                         ),
                     )
-                    # Start a new assistant message stream
-                    assistant_item = ResponseOutputMessage(
-                        id=FAKE_RESPONSES_ID,
-                        content=[],
-                        role="assistant",
-                        type="message",
-                        status="in_progress",
-                    )
-                    if state.provider_data:
-                        assistant_item.provider_data = state.provider_data.copy()  # type: ignore[attr-defined]
-                    # Notify consumers of the start of a new output message + first content part
-                    yield ResponseOutputItemAddedEvent(
-                        item=assistant_item,
-                        output_index=output_layout.assistant_message_output_index(state),
-                        type="response.output_item.added",
-                        sequence_number=sequence_number.get_and_increment(),
-                    )
+                    # A refusal part already opened this assistant message, so only the new
+                    # content part is announced here. Re-announcing the message would emit a
+                    # second response.output_item.added for an item that is already open and
+                    # is closed by a single response.output_item.done.
+                    if content_index == 0:
+                        # Start a new assistant message stream
+                        assistant_item = ResponseOutputMessage(
+                            id=FAKE_RESPONSES_ID,
+                            content=[],
+                            role="assistant",
+                            type="message",
+                            status="in_progress",
+                        )
+                        if state.provider_data:
+                            assistant_item.provider_data = state.provider_data.copy()  # type: ignore[attr-defined]
+                        # Notify consumers of the start of a new output message
+                        yield ResponseOutputItemAddedEvent(
+                            item=assistant_item,
+                            output_index=output_layout.assistant_message_output_index(state),
+                            type="response.output_item.added",
+                            sequence_number=sequence_number.get_and_increment(),
+                        )
                     yield ResponseContentPartAddedEvent(
                         content_index=state.text_content_index_and_output[0],
                         item_id=FAKE_RESPONSES_ID,
@@ -751,12 +910,12 @@ class ChatCmplStreamHandler:
                     )
                 delta_logprobs = (
                     ChatCmplHelpers.convert_logprobs_for_text_delta(
-                        choice_logprobs.content if choice_logprobs else None
+                        choice_logprobs.content if choice_logprobs is not None else None
                     )
                     or []
                 )
                 output_logprobs = ChatCmplHelpers.convert_logprobs_for_output_text(
-                    choice_logprobs.content if choice_logprobs else None
+                    choice_logprobs.content if choice_logprobs is not None else None
                 )
                 # Emit the delta for this segment of content
                 yield ResponseTextDeltaEvent(
@@ -779,13 +938,18 @@ class ChatCmplStreamHandler:
                         # every content delta, which would be O(n^2) over a long stream.
                         existing_logprobs.extend(output_logprobs)
 
+            # Handle url citations. These can arrive on the delta carrying the cited text
+            # or on a later one, so this sits outside the content branch above.
+            if state.text_content_index_and_output:
+                state.text_content_index_and_output[1].annotations.extend(
+                    ChatCmplHelpers.convert_url_citations(getattr(delta, "annotations", None))
+                )
+
             # Handle refusals (model declines to answer)
             # This is always set by the OpenAI API, but not by others e.g. LiteLLM
             if hasattr(delta, "refusal") and delta.refusal:
                 if not state.refusal_content_index_and_output:
                     refusal_index = 0
-                    if state.reasoning_content_index_and_output:
-                        refusal_index += 1
                     if state.text_content_index_and_output:
                         refusal_index += 1
 
@@ -793,23 +957,28 @@ class ChatCmplStreamHandler:
                         refusal_index,
                         ResponseOutputRefusal(refusal="", type="refusal"),
                     )
-                    # Start a new assistant message if one doesn't exist yet (in-progress)
-                    assistant_item = ResponseOutputMessage(
-                        id=FAKE_RESPONSES_ID,
-                        content=[],
-                        role="assistant",
-                        type="message",
-                        status="in_progress",
-                    )
-                    if state.provider_data:
-                        assistant_item.provider_data = state.provider_data.copy()  # type: ignore[attr-defined]
-                    # Notify downstream that assistant message + first content part are starting
-                    yield ResponseOutputItemAddedEvent(
-                        item=assistant_item,
-                        output_index=output_layout.assistant_message_output_index(state),
-                        type="response.output_item.added",
-                        sequence_number=sequence_number.get_and_increment(),
-                    )
+                    # A text part already opened this assistant message, so only the new
+                    # content part is announced here. Re-announcing the message would emit a
+                    # second response.output_item.added for an item that is already open and
+                    # is closed by a single response.output_item.done.
+                    if refusal_index == 0:
+                        # Start a new assistant message if one doesn't exist yet (in-progress)
+                        assistant_item = ResponseOutputMessage(
+                            id=FAKE_RESPONSES_ID,
+                            content=[],
+                            role="assistant",
+                            type="message",
+                            status="in_progress",
+                        )
+                        if state.provider_data:
+                            assistant_item.provider_data = state.provider_data.copy()  # type: ignore[attr-defined]
+                        # Notify downstream that the assistant message is starting
+                        yield ResponseOutputItemAddedEvent(
+                            item=assistant_item,
+                            output_index=output_layout.assistant_message_output_index(state),
+                            type="response.output_item.added",
+                            sequence_number=sequence_number.get_and_increment(),
+                        )
                     yield ResponseContentPartAddedEvent(
                         content_index=state.refusal_content_index_and_output[0],
                         item_id=FAKE_RESPONSES_ID,
@@ -1021,6 +1190,46 @@ class ChatCmplStreamHandler:
                 sequence_number=sequence_number.get_and_increment(),
             )
 
+        if require_finish_reason and not saw_finish_reason:
+            if usage is not None:
+                response.usage = cls._build_response_usage(usage)
+            else:
+                _mark_request_completed_without_usage(response)
+            if preserve_raw_usage and raw_usage is not None:
+                _attach_raw_usage_snapshot(response, raw_usage)
+            raise ModelBehaviorError(
+                "Chat Completions stream ended before receiving a finish_reason for choice 0."
+            )
+
+        # A completion truncated before any visible token (finish_reason ==
+        # "length") is a token- or reasoning-budget exhaustion, not a policy
+        # refusal. Surface it as a model behavior error rather than manufacturing
+        # a refusal that would route through model_refusal handlers. This is an
+        # internal behavior enabled only by OpenAIChatCompletionsModel: the
+        # shared handler also serves LiteLLM and AnyLLM, whose streaming behavior
+        # must remain unchanged.
+        if (
+            saw_length
+            and raise_on_length_truncation
+            and state.text_content_index_and_output is None
+            and state.refusal_content_index_and_output is None
+            and not state.function_calls
+        ):
+            # Preserve the request and any reported token usage on the response
+            # so the caller can attach it to the generation span before the
+            # error propagates.
+            if usage is not None:
+                response.usage = cls._build_response_usage(usage)
+            else:
+                _mark_request_completed_without_usage(response)
+            if preserve_raw_usage and raw_usage is not None:
+                _attach_raw_usage_snapshot(response, raw_usage)
+            raise ModelBehaviorError(
+                "Chat Completions stream terminated with finish_reason='length' "
+                "but produced no assistant text, tool call, or refusal."
+            )
+
+        cls._finalize_thinking_blocks(state)
         for event in cls._finish_reasoning_item(state, sequence_number):
             yield event
 
@@ -1099,17 +1308,6 @@ class ChatCmplStreamHandler:
         # include Reasoning item if it exists
         if state.reasoning_content_index_and_output:
             reasoning_item = state.reasoning_content_index_and_output[1]
-            # Store thinking text in content and signature in encrypted_content
-            if state.thinking_text:
-                # Add thinking text as a Content object
-                if not reasoning_item.content:
-                    reasoning_item.content = []
-                reasoning_item.content.append(
-                    Content(text=state.thinking_text, type="reasoning_text")
-                )
-            # Store signature in encrypted_content
-            if state.thinking_signature:
-                reasoning_item.encrypted_content = state.thinking_signature
             outputs.append(reasoning_item)
 
         outputs.extend(output_layout.function_calls_before_message(state))
@@ -1125,10 +1323,17 @@ class ChatCmplStreamHandler:
             )
             if state.provider_data:
                 assistant_msg.provider_data = state.provider_data.copy()  # type: ignore[attr-defined]
+            # Assemble the parts in the order of the content indexes already announced by
+            # the content_part events. A refusal that opened before any text holds index 0
+            # and the text holds index 1, so appending text first would contradict the
+            # indexes consumers already received.
+            content_parts: list[tuple[int, ResponseOutputText | ResponseOutputRefusal]] = []
             if state.text_content_index_and_output:
-                assistant_msg.content.append(state.text_content_index_and_output[1])
+                content_parts.append(state.text_content_index_and_output)
             if state.refusal_content_index_and_output:
-                assistant_msg.content.append(state.refusal_content_index_and_output[1])
+                content_parts.append(state.refusal_content_index_and_output)
+            content_parts.sort(key=lambda entry: entry[0])
+            assistant_msg.content.extend(part for _, part in content_parts)
             outputs.append(assistant_msg)
 
             # send a ResponseOutputItemDone for the assistant message
@@ -1144,30 +1349,40 @@ class ChatCmplStreamHandler:
         final_response = response.model_copy()
         final_response.output = outputs
 
-        final_response.usage = (
-            ResponseUsage(
-                input_tokens=usage.prompt_tokens or 0,
-                output_tokens=usage.completion_tokens or 0,
-                total_tokens=usage.total_tokens or 0,
-                output_tokens_details=OutputTokensDetails(
-                    reasoning_tokens=usage.completion_tokens_details.reasoning_tokens
-                    if usage.completion_tokens_details
-                    and usage.completion_tokens_details.reasoning_tokens
-                    else 0
-                ),
-                input_tokens_details=_make_input_tokens_details(
-                    cached_tokens=usage.prompt_tokens_details.cached_tokens
-                    if usage.prompt_tokens_details and usage.prompt_tokens_details.cached_tokens
-                    else 0,
-                    cache_write_tokens=_cache_write_tokens(usage.prompt_tokens_details),
-                ),
-            )
-            if usage
-            else None
-        )
+        final_response.usage = cls._build_response_usage(usage)
+        if preserve_raw_usage:
+            _attach_raw_usage_snapshot(final_response, raw_usage)
+        if usage is None:
+            # The stream reached a terminal response, so a request was made even though the
+            # provider reported no usage. Record that without inventing a usage payload, so
+            # the raw usage snapshot stays absent and tokens are not reported as real zeros.
+            _mark_request_completed_without_usage(final_response)
 
         yield ResponseCompletedEvent(
             response=final_response,
             type="response.completed",
             sequence_number=sequence_number.get_and_increment(),
+        )
+
+    @staticmethod
+    def _build_response_usage(usage: CompletionUsage | None) -> ResponseUsage | None:
+        """Convert the streamed provider usage into a Responses usage payload."""
+        if usage is None:
+            return None
+        return ResponseUsage(
+            input_tokens=usage.prompt_tokens or 0,
+            output_tokens=usage.completion_tokens or 0,
+            total_tokens=usage.total_tokens or 0,
+            output_tokens_details=OutputTokensDetails(
+                reasoning_tokens=usage.completion_tokens_details.reasoning_tokens
+                if usage.completion_tokens_details
+                and usage.completion_tokens_details.reasoning_tokens
+                else 0
+            ),
+            input_tokens_details=_make_input_tokens_details(
+                cached_tokens=usage.prompt_tokens_details.cached_tokens
+                if usage.prompt_tokens_details and usage.prompt_tokens_details.cached_tokens
+                else 0,
+                cache_write_tokens=_cache_write_tokens(usage.prompt_tokens_details),
+            ),
         )

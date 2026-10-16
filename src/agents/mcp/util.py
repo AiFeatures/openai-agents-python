@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import functools
 import hashlib
@@ -11,20 +12,14 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol, Union
 
-import httpx
 from typing_extensions import NotRequired, TypedDict
 
 from .. import _debug
 from .._mcp_tool_metadata import resolve_mcp_tool_description_for_model, resolve_mcp_tool_title
-from ..exceptions import AgentsException, ModelBehaviorError, UserError
-
-try:
-    from mcp.shared.exceptions import McpError as _McpError
-except ImportError:  # pragma: no cover – mcp is optional on Python < 3.10
-    _McpError = None  # type: ignore[assignment, misc]
+from ..exceptions import AgentsException, MCPToolCancellationError, ModelBehaviorError, UserError
 from ..logger import log_tool_action_error, logger
 from ..run_context import RunContextWrapper
-from ..strict_schema import ensure_strict_json_schema
+from ..strict_schema import _copy_json_schema, ensure_strict_json_schema
 from ..tool import (
     FunctionTool,
     Tool,
@@ -41,6 +36,14 @@ from ..tool_context import ToolContext
 from ..tracing import FunctionSpanData, get_current_span, mcp_tools_span
 from ..util._custom_data import maybe_extract_custom_data
 from ..util._types import MaybeAwaitable
+from ._compat import (
+    MCPError,
+    image_mime_type,
+    mcp_error_message,
+    result_is_error,
+    result_structured_content,
+    tool_input_schema,
+)
 from ._logging import get_mcp_server_log_message, get_mcp_server_log_name
 
 if TYPE_CHECKING:
@@ -72,18 +75,19 @@ class _PrefixedToolNameCandidate:
 
 
 class HttpClientFactory(Protocol):
-    """Protocol for HTTP client factory functions.
+    """Protocol for MCP HTTP client factory functions.
 
-    This interface matches the MCP SDK's McpHttpClientFactory but is defined locally
-    to avoid accessing internal MCP SDK modules.
+    The factory must use the HTTP stack required by the installed MCP SDK: ``httpx``
+    for MCP v1 or ``httpx2`` for MCP v2. This protocol avoids importing either SDK's
+    private factory type.
     """
 
     def __call__(
         self,
         headers: dict[str, str] | None = None,
-        timeout: httpx.Timeout | None = None,
-        auth: httpx.Auth | None = None,
-    ) -> httpx.AsyncClient: ...
+        timeout: Any = None,
+        auth: Any = None,
+    ) -> Any: ...
 
 
 @dataclass
@@ -296,33 +300,35 @@ class MCPUtil:
                     agent,
                     failure_error_function=failure_error_function,
                     tool_name_overrides=tool_name_overrides,
+                    server_index=server_index,
                 )
                 server_tool_names = {tool.name for tool in function_tools}
                 duplicate_tool_names = sorted(server_tool_names & tool_names)
                 if duplicate_tool_names:
                     raise UserError(
                         "Duplicate tool names found across MCP servers: "
-                        f"{', '.join(duplicate_tool_names)}"
+                        f"{', '.join(repr(name) for name in duplicate_tool_names)}"
                     )
                 tool_names.update(server_tool_names)
                 tools.extend(function_tools)
 
             return tools
 
-        for server in servers:
+        for server_index, server in enumerate(servers):
             server_tools = await cls.get_function_tools(
                 server,
                 convert_schemas_to_strict,
                 run_context,
                 agent,
                 failure_error_function=failure_error_function,
+                server_index=server_index,
             )
             server_tool_names = {tool.name for tool in server_tools}
             duplicate_tool_names = sorted(server_tool_names & tool_names)
             if duplicate_tool_names:
                 raise UserError(
                     "Duplicate tool names found across MCP servers: "
-                    f"{', '.join(duplicate_tool_names)}. "
+                    f"{', '.join(repr(name) for name in duplicate_tool_names)}. "
                     "Pass `include_server_in_tool_names=True` to "
                     "`MCPUtil.get_all_function_tools()` or set "
                     "`mcp_config={'include_server_in_tool_names': True}` on the "
@@ -341,7 +347,7 @@ class MCPUtil:
         run_context: RunContextWrapper[Any],
         agent: AgentBase,
     ) -> list[MCPTool]:
-        with mcp_tools_span(server=server.name) as span:
+        with mcp_tools_span(server=get_mcp_server_log_name(server.name)) as span:
             tools = await server.list_tools(run_context, agent)
             span.span_data.result = [tool.name for tool in tools]
             return tools
@@ -355,8 +361,9 @@ class MCPUtil:
         agent: AgentBase,
         failure_error_function: ToolErrorFunction | None = default_tool_error_function,
         tool_name_overrides: list[str] | None = None,
+        server_index: int = 0,
     ) -> list[Tool]:
-        return [
+        function_tools = [
             cls.to_function_tool(
                 tool,
                 server,
@@ -369,6 +376,11 @@ class MCPUtil:
             )
             for index, tool in enumerate(tools)
         ]
+        for function_tool in function_tools:
+            assert function_tool._mcp_tool_binding is not None
+            server_name, raw_tool_name, _ = function_tool._mcp_tool_binding
+            function_tool._mcp_tool_binding = (server_name, raw_tool_name, server_index)
+        return list(function_tools)
 
     @classmethod
     async def get_function_tools(
@@ -407,6 +419,7 @@ class MCPUtil:
             agent,
             failure_error_function=failure_error_function,
             tool_name_overrides=tool_name_overrides,
+            server_index=server_index,
         )
 
     @staticmethod
@@ -450,7 +463,7 @@ class MCPUtil:
         not depend on object identity or cross any serialization boundary.
         """
         base_names = [
-            cls._build_prefixed_tool_base_name(server.name, tool.name)
+            cls._build_prefixed_tool_base_name(get_mcp_server_log_name(server.name), tool.name)
             for _, server, tools in server_tool_batches
             for tool in tools
         ]
@@ -458,9 +471,10 @@ class MCPUtil:
 
         candidates: list[_PrefixedToolNameCandidate] = []
         for server_index, server, tools in server_tool_batches:
+            server_name = get_mcp_server_log_name(server.name)
             for tool_index, tool in enumerate(tools):
-                base_name = cls._build_prefixed_tool_base_name(server.name, tool.name)
-                seed = f"{server.name}\0{tool.name}"
+                base_name = cls._build_prefixed_tool_base_name(server_name, tool.name)
+                seed = f"{server_name}\0{tool.name}"
                 force_hash = base_name_counts[base_name] > 1 or base_name in reserved_names
                 initial_name = cls._shorten_tool_name(base_name, seed, force_hash=force_hash)
                 candidates.append(
@@ -530,7 +544,8 @@ class MCPUtil:
         effective_failure_error_function = server._get_failure_error_function(
             failure_error_function
         )
-        schema, is_strict = copy.deepcopy(tool.inputSchema), False
+        schema, is_strict = _copy_json_schema(tool_input_schema(tool)), False
+        input_schema_is_empty = schema == {}
 
         # MCP spec doesn't require the inputSchema to have `properties`, but OpenAI spec does.
         if "properties" not in schema:
@@ -543,7 +558,10 @@ class MCPUtil:
             # non-strict. Convert a separate copy so the non-strict fallback keeps
             # the original schema intact.
             try:
-                schema = ensure_strict_json_schema(copy.deepcopy(schema))
+                schema = ensure_strict_json_schema(
+                    _copy_json_schema(schema),
+                    _reject_open_objects=not input_schema_is_empty,
+                )
                 is_strict = True
             except Exception as e:
                 if _debug.DONT_LOG_TOOL_DATA:
@@ -566,13 +584,25 @@ class MCPUtil:
             ),
             failure_error_function=effective_failure_error_function,
             strict_json_schema=is_strict,
+            tool_input_guardrails=(
+                list(server.tool_input_guardrails)
+                if server.tool_input_guardrails is not None
+                else None
+            ),
+            tool_output_guardrails=(
+                list(server.tool_output_guardrails)
+                if server.tool_output_guardrails is not None
+                else None
+            ),
             needs_approval=needs_approval,
             mcp_title=resolve_mcp_tool_title(tool),
             tool_origin=ToolOrigin(
                 type=ToolOriginType.MCP,
-                mcp_server_name=server.name,
+                mcp_server_name=get_mcp_server_log_name(server.name),
             ),
         )
+        function_tool._mcp_annotations = copy.deepcopy(tool.annotations)
+        function_tool._mcp_tool_binding = (get_mcp_server_log_name(server.name), tool.name, None)
         return function_tool
 
     @staticmethod
@@ -618,8 +648,8 @@ class MCPUtil:
             tool_display_name=tool_display_name,
             arguments=MappingProxyType(copy.deepcopy(arguments)),
             result_meta=cls._copy_mapping_proxy(getattr(result, "meta", None)),
-            structured_content=cls._copy_mapping_proxy(getattr(result, "structuredContent", None)),
-            is_error=getattr(result, "isError", None),
+            structured_content=cls._copy_mapping_proxy(result_structured_content(result)),
+            is_error=result_is_error(result),
             tool_output=copy.deepcopy(tool_output),
         )
         return await maybe_extract_custom_data(extractor, extractor_context)
@@ -694,15 +724,35 @@ class MCPUtil:
         try:
             resolved_meta = await cls._resolve_meta(server, context, tool.name, json_data)
             merged_meta = cls._merge_mcp_meta(resolved_meta, meta)
-            if merged_meta is None:
-                result = await server.call_tool(tool.name, json_data)
-            else:
-                result = await server.call_tool(tool.name, json_data, meta=merged_meta)
-        except UserError:
-            # Re-raise UserError as-is (it already has a good message)
+            call_task = asyncio.create_task(
+                server.call_tool(tool.name, json_data)
+                if merged_meta is None
+                else server.call_tool(tool.name, json_data, meta=merged_meta)
+            )
+            try:
+                done, _ = await asyncio.wait({call_task}, return_when=asyncio.FIRST_COMPLETED)
+                finished_task = done.pop()
+                if finished_task.cancelled():
+                    raise MCPToolCancellationError(
+                        f"Failed to call tool '{tool.name}' on MCP server "
+                        f"'{get_mcp_server_log_name(server.name)}': "
+                        "tool execution was cancelled."
+                    )
+                result = finished_task.result()
+            except asyncio.CancelledError:
+                if not call_task.done():
+                    call_task.cancel()
+                try:
+                    await call_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                raise
+        except (UserError, MCPToolCancellationError):
+            # Re-raise handled tool-call errors as-is; the FunctionTool failure pipeline
+            # will format them into model-visible tool errors when appropriate.
             raise
         except Exception as e:
-            if _McpError is not None and isinstance(e, _McpError):
+            if isinstance(e, MCPError):
                 # An MCP-level error (e.g. upstream HTTP 4xx/5xx, tool not found, etc.)
                 # is not a programming error – re-raise so the FunctionTool failure
                 # pipeline (failure_error_function) can handle it.  The default handler
@@ -712,7 +762,7 @@ class MCPUtil:
                     logger.warning("MCP tool returned an error.")
                 else:
                     server_log_name = get_mcp_server_log_name(server.name)
-                    error_text = e.error.message if hasattr(e, "error") and e.error else str(e)
+                    error_text = mcp_error_message(e)
                     logger.warning(
                         "MCP tool %s on server '%s' returned an error: %s",
                         tool_name_for_display,
@@ -728,7 +778,8 @@ class MCPUtil:
                 )
             log_tool_action_error(logger, log_message, e)
             raise AgentsException(
-                f"Error invoking MCP tool {tool_name_for_display} on server '{server.name}': {e}"
+                f"Error invoking MCP tool {tool_name_for_display} on server "
+                f"'{get_mcp_server_log_name(server.name)}': {e}"
             ) from e
 
         if _debug.DONT_LOG_TOOL_DATA:
@@ -736,10 +787,15 @@ class MCPUtil:
         else:
             logger.debug("MCP tool %s returned %s", tool_name_for_display, result)
 
-        # If structured content is requested and available, use it exclusively
+        # If structured content is requested and available, use it exclusively. Results the
+        # server flagged as errors keep their content instead, because that is where the
+        # actionable failure text lives. MCP permits `structuredContent` alongside
+        # `isError`, so this is an error-content precedence policy in this SDK rather than
+        # the structured payload being invalid for a failed call.
         tool_output: ToolOutput
-        if server.use_structured_content and result.structuredContent:
-            tool_output = json.dumps(result.structuredContent)
+        structured_content = result_structured_content(result)
+        if server.use_structured_content and structured_content and not result_is_error(result):
+            tool_output = json.dumps(structured_content)
         else:
             tool_output_list: list[ToolOutputItem] = []
             for item in result.content:
@@ -748,13 +804,16 @@ class MCPUtil:
                 elif item.type == "image":
                     tool_output_list.append(
                         ToolOutputImageDict(
-                            type="image", image_url=f"data:{item.mimeType};base64,{item.data}"
+                            type="image",
+                            image_url=f"data:{image_mime_type(item)};base64,{item.data}",
                         )
                     )
                 else:
-                    # Fall back to regular text content
+                    # Fall back to text content holding the block serialized as JSON.
+                    # ``str()`` on the dump would produce a Python repr (single quotes,
+                    # ``None``/``True``), which the model cannot parse back as JSON.
                     tool_output_list.append(
-                        ToolOutputTextDict(type="text", text=str(item.model_dump(mode="json")))
+                        ToolOutputTextDict(type="text", text=item.model_dump_json())
                     )
             if len(tool_output_list) == 1:
                 tool_output = tool_output_list[0]
@@ -774,14 +833,14 @@ class MCPUtil:
             context._custom_data = custom_data
 
         current_span = get_current_span()
-        if current_span:
+        if current_span is not None:
             if isinstance(current_span.span_data, FunctionSpanData):
                 if not isinstance(context, ToolContext) or (
                     context.run_config is None or context.run_config.trace_include_sensitive_data
                 ):
                     current_span.span_data.output = tool_output
                 current_span.span_data.mcp_data = {
-                    "server": server.name,
+                    "server": get_mcp_server_log_name(server.name),
                 }
             else:
                 if _debug.DONT_LOG_MODEL_DATA or _debug.DONT_LOG_TOOL_DATA:

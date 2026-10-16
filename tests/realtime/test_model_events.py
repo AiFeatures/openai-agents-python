@@ -27,6 +27,13 @@ def test_usage_event_types_are_publicly_exported() -> None:
         assert getattr(realtime, name) is not None
 
 
+def test_end_of_stream_event_is_publicly_exported() -> None:
+    assert "RealtimeModelEndOfStreamEvent" in realtime.__all__
+
+    event = realtime.RealtimeModelEndOfStreamEvent()
+    assert event.type == "end_of_stream"
+
+
 def test_custom_model_can_construct_typed_usage_without_openai_types() -> None:
     event = realtime.RealtimeModelUsageEvent(
         usage=Usage(requests=1, input_tokens=8, output_tokens=5, total_tokens=13),
@@ -49,3 +56,19 @@ def test_custom_model_can_construct_typed_usage_without_openai_types() -> None:
     assert event.input_tokens_details.audio_tokens == 6
     assert event.output_tokens_details is not None
     assert event.output_tokens_details.audio_tokens == 4
+
+
+def test_turn_ended_response_id_preserves_existing_positional_construction() -> None:
+    event = realtime.RealtimeModelTurnEndedEvent("turn_ended")
+
+    assert event.type == "turn_ended"
+    assert event.response_id is None
+
+
+def test_interrupt_playback_only_preserves_existing_positional_construction() -> None:
+    event = realtime.RealtimeModelSendInterrupt(True, "response_1", True)
+
+    assert event.force_response_cancel is True
+    assert event.response_id == "response_1"
+    assert event.cancel_response_only is True
+    assert event.playback_only is False

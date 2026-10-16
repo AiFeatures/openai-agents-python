@@ -1,4 +1,5 @@
 import abc
+import asyncio
 import io
 import shlex
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -14,6 +15,7 @@ from ...run_config import (
     SandboxArchiveLimits,
     SandboxConcurrencyLimits,
 )
+from .._mount_security import redact_mount_error_data, validate_manifest_mount_credential_boundaries
 from ..apply_patch import PatchFormat, WorkspaceEditor
 from ..entries import BaseEntry
 from ..errors import (
@@ -23,6 +25,7 @@ from ..errors import (
     InvalidManifestPathError,
     MountConfigError,
     PtySessionNotFoundError,
+    SandboxError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
     WorkspaceReadNotFoundError,
@@ -201,10 +204,13 @@ class BaseSandboxSession(abc.ABC):
     _runtime_persist_workspace_skip_relpaths: set[Path] | None = None
     _pre_stop_hooks: list[Callable[[], Awaitable[None]]] | None = None
     _pre_stop_hooks_ran: bool = False
+    _pre_stop_hooks_failed: bool = False
+    _pre_stop_hooks_lock: asyncio.Lock | None = None
+    _aclose_lock: asyncio.Lock | None = None
     _runtime_helpers_installed: set[PurePath] | None = None
     _runtime_helper_cache_key: object = _RUNTIME_HELPER_CACHE_KEY_UNSET
     _workspace_path_policy_cache: (
-        tuple[str, tuple[tuple[str, bool], ...], WorkspacePathPolicy] | None
+        tuple[str, tuple[tuple[str, bool, str | None], ...], WorkspacePathPolicy] | None
     ) = None
     # True when start() is reusing a backend whose workspace files may still be present.
     # This controls whether start() can avoid a full manifest apply for non-snapshot resumes.
@@ -219,7 +225,19 @@ class BaseSandboxSession(abc.ABC):
     _max_local_dir_file_concurrency: int | None = DEFAULT_MAX_LOCAL_DIR_FILE_CONCURRENCY
     _archive_limits: SandboxArchiveLimits | None = None
 
+    def _runtime_has_protected_mount_authority(self) -> bool:
+        """Return whether SDK-owned runtime state contains live mount authority."""
+
+        return False
+
+    @redact_mount_error_data
     async def start(self) -> None:
+        from .._mount_security import validate_manifest_mount_credential_boundaries
+
+        validate_manifest_mount_credential_boundaries(
+            self.state.manifest,
+            provider_backend_id=self.state.type,
+        )
         try:
             await self._ensure_backend_started()
             self._start_workspace_root_ready = self.state.workspace_root_ready
@@ -304,6 +322,10 @@ class BaseSandboxSession(abc.ABC):
     async def _start_workspace(self) -> None:
         """Restore snapshot or apply manifest state after backend startup is complete."""
 
+        validate_manifest_mount_credential_boundaries(
+            self.state.manifest,
+            provider_backend_id=self.state.type,
+        )
         if await self.state.snapshot.restorable(dependencies=self.dependencies):
             can_reuse_workspace = await self._can_reuse_restorable_snapshot_workspace()
             if can_reuse_workspace:
@@ -313,10 +335,7 @@ class BaseSandboxSession(abc.ABC):
             else:
                 # Fresh workspaces and drifted preserved workspaces both need the durable snapshot
                 # restored before ephemeral state is rebuilt.
-                await self._restore_snapshot_into_workspace_on_resume()
-                if self.should_provision_manifest_accounts_on_resume():
-                    await self.provision_manifest_accounts()
-                await self._reapply_ephemeral_manifest_on_resume()
+                await self._restore_snapshot_and_reapply_ephemeral_on_resume()
         elif self._can_reuse_preserved_workspace_on_resume():
             # There is no durable snapshot to restore, but a reconnected backend may still need
             # ephemeral mounts/files refreshed without reapplying the full manifest.
@@ -326,6 +345,12 @@ class BaseSandboxSession(abc.ABC):
             await self._apply_manifest(
                 provision_accounts=self.should_provision_manifest_accounts_on_resume()
             )
+
+    async def _restore_snapshot_and_reapply_ephemeral_on_resume(self) -> None:
+        await self._restore_snapshot_into_workspace_on_resume()
+        if self.should_provision_manifest_accounts_on_resume():
+            await self.provision_manifest_accounts()
+        await self._reapply_ephemeral_manifest_on_resume()
 
     async def _can_reuse_restorable_snapshot_workspace(self) -> bool:
         """Return whether a restorable snapshot can be skipped for this start."""
@@ -358,6 +383,7 @@ class BaseSandboxSession(abc.ABC):
 
         return error
 
+    @redact_mount_error_data
     async def stop(self) -> None:
         """
         Persist/snapshot the workspace.
@@ -366,6 +392,10 @@ class BaseSandboxSession(abc.ABC):
         sandbox resources (Docker containers, remote sessions, etc.) should implement
         `shutdown()` instead.
         """
+        validate_manifest_mount_credential_boundaries(
+            self.state.manifest,
+            provider_backend_id=self.state.type,
+        )
         try:
             try:
                 await self._before_stop()
@@ -406,6 +436,7 @@ class BaseSandboxSession(abc.ABC):
     def supports_pty(self) -> bool:
         return False
 
+    @redact_mount_error_data
     async def shutdown(self) -> None:
         """
         Tear down sandbox resources (best-effort).
@@ -431,10 +462,16 @@ class BaseSandboxSession(abc.ABC):
 
         return
 
+    async def _terminate_ambiguous_mount_transition(self) -> None:
+        """Make a session unusable after a mount transition has an unknown outcome."""
+
+        await self.shutdown()
+
     async def __aenter__(self) -> Self:
         await self.start()
         return self
 
+    @redact_mount_error_data
     async def aclose(self) -> None:
         """Run the session cleanup lifecycle outside of ``async with``.
 
@@ -444,12 +481,35 @@ class BaseSandboxSession(abc.ABC):
         ``delete()`` separately for backend-specific deletion such as removing a Docker container
         or deleting a temporary host workspace.
         """
+
+        lock = self._aclose_lock
+        if lock is None:
+            lock = asyncio.Lock()
+            self._aclose_lock = lock
+        async with lock:
+            await self._aclose_impl()
+
+    async def _aclose_impl(self) -> None:
+        cleanup_error: BaseException | None = None
         try:
             await self.run_pre_stop_hooks()
-            await self.stop()
+        except BaseException as exc:
+            cleanup_error = exc
+        try:
+            if cleanup_error is None and not self._pre_stop_hooks_failed:
+                await self.stop()
             await self.shutdown()
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
         finally:
-            await self._aclose_dependencies()
+            try:
+                await self._aclose_dependencies()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if cleanup_error is not None:
+            raise cleanup_error
 
     async def __aexit__(
         self,
@@ -484,22 +544,29 @@ class BaseSandboxSession(abc.ABC):
         hooks.append(hook)
         self._pre_stop_hooks_ran = False
 
+    @redact_mount_error_data
     async def run_pre_stop_hooks(self) -> None:
         """Run registered pre-stop hooks once before workspace persistence."""
 
-        hooks = self._pre_stop_hooks
-        if hooks is None or self._pre_stop_hooks_ran:
-            return
-        self._pre_stop_hooks_ran = True
-        cleanup_error: BaseException | None = None
-        for hook in hooks:
-            try:
-                await hook()
-            except BaseException as exc:
-                if cleanup_error is None:
-                    cleanup_error = exc
-        if cleanup_error is not None:
-            raise cleanup_error
+        lock = self._pre_stop_hooks_lock
+        if lock is None:
+            lock = asyncio.Lock()
+            self._pre_stop_hooks_lock = lock
+        async with lock:
+            hooks = self._pre_stop_hooks
+            if hooks is None or self._pre_stop_hooks_ran:
+                return
+            self._pre_stop_hooks_ran = True
+            cleanup_error: BaseException | None = None
+            for hook in hooks:
+                try:
+                    await hook()
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+            if cleanup_error is not None:
+                self._pre_stop_hooks_failed = True
+                raise cleanup_error
 
     async def _run_pre_stop_hooks(self) -> None:
         await self.run_pre_stop_hooks()
@@ -571,6 +638,7 @@ class BaseSandboxSession(abc.ABC):
             skip_paths.update(self._runtime_persist_workspace_skip_relpaths)
         return skip_paths
 
+    @redact_mount_error_data
     async def exec(
         self,
         *command: str | Path,
@@ -594,6 +662,7 @@ class BaseSandboxSession(abc.ABC):
         sanitized_command = self._prepare_exec_command(*command, shell=shell, user=user)
         return await self._exec_internal(*sanitized_command, timeout=timeout)
 
+    @redact_mount_error_data
     async def resolve_exposed_port(self, port: int) -> ExposedPortEndpoint:
         self._assert_exposed_port_configured(port)
         return await self._resolve_exposed_port(port)
@@ -742,7 +811,8 @@ class BaseSandboxSession(abc.ABC):
     def _workspace_path_policy(self) -> WorkspacePathPolicy:
         root = self.state.manifest.root
         grants_key = tuple(
-            (grant.path, grant.read_only) for grant in self.state.manifest.extra_path_grants
+            (grant.path, grant.read_only, grant.host_path)
+            for grant in self.state.manifest.extra_path_grants
         )
         cached = self._workspace_path_policy_cache
         if cached is not None and cached[0] == root and cached[1] == grants_key:
@@ -766,6 +836,7 @@ class BaseSandboxSession(abc.ABC):
         path: Path | str,
         *,
         for_write: bool = False,
+        recursive_remove: bool = False,
     ) -> Path:
         """Validate an SDK file path against the remote sandbox filesystem before IO.
 
@@ -778,6 +849,7 @@ class BaseSandboxSession(abc.ABC):
         root = path_policy.sandbox_root()
         workspace_path = path_policy.normalize_sandbox_path(path, for_write=for_write)
         original_path = coerce_posix_path(path)
+        access_mode = "2" if recursive_remove else "1" if for_write else "0"
         helper_path = await self._ensure_runtime_helper_installed(RESOLVE_WORKSPACE_PATH_HELPER)
         extra_grant_args = tuple(
             arg
@@ -788,7 +860,7 @@ class BaseSandboxSession(abc.ABC):
             str(helper_path),
             root.as_posix(),
             workspace_path.as_posix(),
-            "1" if for_write else "0",
+            access_mode,
             *extra_grant_args,
         )
         result = await self.exec(*command, shell=False)
@@ -803,7 +875,7 @@ class BaseSandboxSession(abc.ABC):
                     "resolve_workspace_path",
                     root.as_posix(),
                     workspace_path.as_posix(),
-                    "1" if for_write else "0",
+                    access_mode,
                     *extra_grant_args,
                 ),
                 context={
@@ -844,7 +916,7 @@ class BaseSandboxSession(abc.ABC):
                 "resolve_workspace_path",
                 root.as_posix(),
                 workspace_path.as_posix(),
-                "1" if for_write else "0",
+                access_mode,
                 *extra_grant_args,
             ),
         )
@@ -859,6 +931,55 @@ class BaseSandboxSession(abc.ABC):
         :returns: A readable file-like object.
         :raises: FileNotFoundError: If the path does not exist.
         """
+
+    async def read_bounded(self, path: Path, *, max_bytes: int) -> bytes:
+        """Read a prefix of at most ``max_bytes`` bytes.
+
+        Uses the session identity and the same path scope as ``read(path)``.
+        A result of exactly ``max_bytes`` bytes does not indicate EOF. Backends
+        provided by the SDK bound acquisition from the source. For compatibility,
+        custom backends inherit a fallback that consumes and closes the stream
+        returned by ``read()``. That fallback cannot bound any data acquired inside
+        ``read()`` before it returns. Override ``_read_bounded`` to provide that
+        guarantee. Encoded transports may reject responses exceeding their bounded
+        framing budget. Failures use payload-free ``WorkspaceArchiveReadError``
+        diagnostics.
+        """
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        # Raise outside the handler: provider exceptions may retain response bodies.
+        reason = "bounded_read_failed"
+        retryable: bool | None = None
+        missing = False
+        try:
+            return await self._read_bounded(path, max_bytes=max_bytes)
+        except (FileNotFoundError, WorkspaceReadNotFoundError):
+            missing = True
+        except SandboxError as error:
+            retryable = error.retryable
+            if error.context.get("reason") == "bounded_read_wire_limit":
+                reason = "bounded_read_wire_limit"
+        except Exception:
+            # Discard payload-bearing provider diagnostics at this boundary.
+            reason = "bounded_read_failed"
+        if missing:
+            raise WorkspaceReadNotFoundError(path=path)
+        raise WorkspaceArchiveReadError(path=path, context={"reason": reason}, retryable=retryable)
+
+    async def _read_bounded(self, path: Path, *, max_bytes: int) -> bytes:
+        stream = await self.read(path)
+        try:
+            result = bytearray()
+            while len(result) < max_bytes:
+                remaining = max_bytes - len(result)
+                payload = stream.read(remaining)
+                if not payload:
+                    break
+                chunk = payload.encode("utf-8") if isinstance(payload, str) else bytes(payload)
+                result.extend(chunk[:remaining])
+            return bytes(result)
+        finally:
+            stream.close()
 
     @abc.abstractmethod
     async def write(
@@ -875,6 +996,23 @@ class BaseSandboxSession(abc.ABC):
         :param data: A file-like object positioned at the start of the payload.
         :param user: Optional sandbox user to perform the write as.
         """
+
+    async def _write_new_file(
+        self,
+        path: Path,
+        data: io.IOBase,
+        *,
+        user: str | User | None = None,
+    ) -> None:
+        """Backend hook for apply_patch creation.
+
+        The default retains the provider's existing mkdir/write semantics. UnixLocal
+        overrides this hook to claim the leaf exclusively; other backends need a native
+        primitive before they can offer the same guarantee.
+        """
+        target = self.normalize_path(path)
+        await self.mkdir(target.parent, parents=True, user=user)
+        await self.write(target, data, user=user)
 
     async def _check_read_with_exec(
         self, path: Path | str, *, user: str | User | None = None
@@ -1070,12 +1208,108 @@ class BaseSandboxSession(abc.ABC):
 
         cmd: list[str] = ["rm"]
         if recursive:
+            if any(grant.read_only for grant in self.state.manifest.extra_path_grants):
+                await self._validate_remote_path_access(path, for_write=True, recursive_remove=True)
             cmd.append("-rf")
         cmd.extend(["--", sandbox_path_str(path)])
 
         result = await self.exec(*cmd, shell=False, user=user)
         if not result.ok():
             raise ExecNonZeroError(result, command=cmd)
+
+    async def mv(
+        self,
+        source: Path | str,
+        destination: Path | str,
+        *,
+        user: str | User | None = None,
+    ) -> None:
+        """Rename a regular file or symlink, replacing the destination entry if it exists.
+
+        Directory and special-file sources are unsupported and rejected before the move.
+        As with other workspace file APIs, callers must serialize conflicting mutations.
+
+        The exec fallback requires ``mv -T`` (GNU or compatible). A tool without that option
+        fails without moving the source. Do not replace it with a destination precheck: a
+        concurrently created directory could otherwise receive the source as a child.
+
+        This is the shell fallback for backends that only offer `exec`. A backend with
+        direct filesystem access, such as UnixLocal, overrides it with a descriptor-relative
+        `os.rename`, so the path it validated is the entry it renames.
+
+        :param source: Regular file or symlink to move.
+        :param destination: Path to move it to.
+        :param user: Optional sandbox user to move as.
+        :raises ExecNonZeroError: If the destination is an existing directory, or the move
+                fails.
+        """
+        source = await self._validate_path_access(source, for_write=True)
+        destination = await self._validate_path_access(destination, for_write=True)
+        source_arg = sandbox_path_str(source)
+        destination_arg = sandbox_path_str(destination)
+        script = (
+            'if [ ! -L "$1" ] && [ ! -f "$1" ]; then '
+            'printf "%s\\n" "Move source must be a regular file or symlink" >&2; exit 1; fi; '
+            'exec mv -fT -- "$1" "$2"'
+        )
+        cmd = ("sh", "-c", script, "sh", source_arg, destination_arg)
+        result = await self.exec(*cmd, shell=False, user=user)
+        if not result.ok():
+            raise ExecNonZeroError(
+                result, command=("sh", "-c", "<mv>", source_arg, destination_arg)
+            )
+
+    async def same_file(
+        self,
+        left: Path | str,
+        right: Path | str,
+        *,
+        follow_symlinks: bool = True,
+        user: str | User | None = None,
+    ) -> bool:
+        """Return whether two paths name the same file on the sandbox filesystem.
+
+        This asks the filesystem, through `test -ef`, which compares device and inode. Two
+        paths that differ as strings can be one file: a filesystem that folds case stores
+        `notes.txt` and `Notes.txt` as a single entry, and APFS folds Unicode normalization
+        as well, so the NFC and NFD spellings of one accented name are also a single entry.
+        No string comparison can answer this, and neither can the host that is driving the
+        session, which may not be the kind of system the sandbox is running on.
+
+        `test -ef` resolves symlinks. With ``follow_symlinks=False``, return false if either
+        leaf is a symlink, including two paths naming the same symlink. This mode compares
+        only non-symlink entries and is used before removing an apply-patch source.
+
+        This is the shell fallback for backends that only offer `exec`. UnixLocal overrides
+        it with a descriptor-relative `stat` on both entries.
+
+        :param left: First path to compare.
+        :param right: Second path to compare.
+        :param follow_symlinks: If false, return false when either leaf is a symlink.
+        :param user: Optional sandbox user to compare as.
+        :returns: True when both paths resolve to the same file.
+        """
+        left = await self._validate_path_access(left)
+        right = await self._validate_path_access(right)
+
+        left_arg = sandbox_path_str(left)
+        right_arg = sandbox_path_str(right)
+        test = '[ "$1" -ef "$2" ]'
+        if not follow_symlinks:
+            test = '[ ! -L "$1" ] && [ ! -L "$2" ] && ' + test
+        cmd = ("sh", "-lc", test, "sh", left_arg, right_arg)
+        result = await self.exec(*cmd, shell=False, user=user)
+        if result.exit_code == 0:
+            return True
+        # `[` answers "different file" with 1 and reports its own failures with 2, and a
+        # missing shell exits 127. Only 1 is an answer; anything else is the session
+        # failing to tell us, and a caller about to delete a file on the strength of this
+        # must not read that as "different".
+        if result.exit_code == 1:
+            return False
+        raise ExecNonZeroError(
+            result, command=("sh", "-lc", "<same_file_check>", left_arg, right_arg)
+        )
 
     async def mkdir(
         self,
@@ -1199,9 +1433,22 @@ class BaseSandboxSession(abc.ABC):
             provision_accounts=provision_accounts,
         )
 
-    async def _validate_manifest_application(self, *, only_ephemeral: bool = False) -> None:
-        _ = only_ephemeral
+    async def _validate_manifest_application(
+        self,
+        *,
+        only_ephemeral: bool = False,
+        manifest: Manifest | None = None,
+        session_running: bool | None = None,
+    ) -> None:
+        _ = (only_ephemeral, session_running)
+        from .._mount_security import validate_manifest_mount_credential_boundaries
 
+        validate_manifest_mount_credential_boundaries(
+            manifest or self.state.manifest,
+            provider_backend_id=self.state.type,
+        )
+
+    @redact_mount_error_data
     async def apply_manifest(self, *, only_ephemeral: bool = False) -> MaterializationResult:
         await self._validate_manifest_application(only_ephemeral=only_ephemeral)
         return await self._apply_manifest(
@@ -1255,10 +1502,14 @@ class BaseSandboxSession(abc.ABC):
 
         return True
 
-    async def _compute_and_cache_snapshot_fingerprint(self) -> dict[str, str]:
+    async def _compute_and_cache_snapshot_fingerprint(
+        self, *, version: str | None = None
+    ) -> dict[str, str]:
         """Compute the current workspace fingerprint in-container and atomically cache it."""
 
-        return await snapshot_lifecycle.compute_and_cache_snapshot_fingerprint(self)
+        return await snapshot_lifecycle.compute_and_cache_snapshot_fingerprint(
+            self, version=version
+        )
 
     async def _read_cached_snapshot_fingerprint(self) -> dict[str, str]:
         """Read the cached snapshot fingerprint record from the running sandbox."""
@@ -1315,6 +1566,10 @@ class BaseSandboxSession(abc.ABC):
         """
 
         await snapshot_lifecycle.clear_workspace_root_on_resume(self)
+
+    async def _remove_workspace_entry_on_resume(self, path: Path) -> None:
+        """Remove a stale workspace entry before restoring a snapshot."""
+        await self.rm(path, recursive=True)
 
     def _workspace_resume_mount_skip_relpaths(self) -> set[Path]:
         return snapshot_lifecycle.workspace_resume_mount_skip_relpaths(self)

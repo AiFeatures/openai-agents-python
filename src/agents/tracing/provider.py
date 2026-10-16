@@ -385,18 +385,12 @@ class DefaultTraceProvider(TraceProvider):
         """
         self._refresh_disabled_flag()
         if self._disabled or disabled:
-            if _debug.DONT_LOG_MODEL_DATA or _debug.DONT_LOG_TOOL_DATA:
-                logger.debug("Tracing is disabled. Not creating trace")
-            else:
-                logger.debug("Tracing is disabled. Not creating trace %s", name)
+            logger.debug("Tracing is disabled. Not creating trace")
             return NoOpTrace()
 
         trace_id = trace_id or self.gen_trace_id()
 
-        if _debug.DONT_LOG_MODEL_DATA or _debug.DONT_LOG_TOOL_DATA:
-            logger.debug("Creating trace with id %s", trace_id)
-        else:
-            logger.debug("Creating trace %s with id %s", name, trace_id)
+        logger.debug("Creating trace")
 
         return TraceImpl(
             name=name,
@@ -430,7 +424,7 @@ class DefaultTraceProvider(TraceProvider):
             logger.debug("Span id is no-op, returning NoOpSpan")
             return NoOpSpan(span_data)
 
-        if not parent:
+        if parent is None:
             current_span = Scope.get_current_span()
             current_trace = Scope.get_current_trace()
             if current_trace is None:
@@ -450,7 +444,7 @@ class DefaultTraceProvider(TraceProvider):
                     )
                 return NoOpSpan(span_data)
 
-            parent_id = current_span.span_id if current_span else None
+            parent_id = current_span.span_id if current_span is not None else None
             trace_id = current_trace.trace_id
             tracing_api_key = current_trace.tracing_api_key
             # Trace is an interface; custom implementations may omit metadata.
@@ -498,19 +492,12 @@ class DefaultTraceProvider(TraceProvider):
     def force_flush(self) -> None:
         """Force all processors to flush their buffers immediately."""
         self._refresh_disabled_flag()
-        if self._disabled:
-            return
-
         try:
             self._multi_processor.force_flush()
         except Exception as e:
             log_model_and_tool_action_error(logger, "Error flushing trace provider", e)
 
     def shutdown(self, timeout: float | None = None) -> None:
-        self._refresh_disabled_flag()
-        if self._disabled:
-            return
-
         try:
             _safe_debug("Shutting down trace provider")
             self._multi_processor.shutdown(timeout=timeout)

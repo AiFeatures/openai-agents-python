@@ -30,6 +30,7 @@ from agents import (
 )
 from agents.agent import ToolsToFinalOutputResult
 from agents.items import TResponseInputItem
+from agents.testing import ScriptedModel
 from agents.tool import FunctionToolResult, function_tool
 from examples.financial_research_agent.agents.verifier_agent import (
     VerificationIssue,
@@ -55,7 +56,6 @@ from examples.sandbox.sandbox_agents_as_tools import (
 from examples.tools.web_search_filters import _normalized_source_urls
 from examples.web_search_utils import extract_url_citations, extract_web_search_source_urls
 
-from .fake_model import FakeModel
 from .test_responses import (
     get_final_output_message,
     get_function_tool_call,
@@ -279,6 +279,30 @@ def test_financial_report_input_includes_cutoff_and_evidence() -> None:
     }
 
 
+def test_financial_verification_input_lists_exact_allowed_source_urls() -> None:
+    manager = object.__new__(FinancialResearchManager)
+    manager.research_cutoff = "2026-07-11"
+    source_url = "https://example.com/report?utm_source=openai"
+    evidence = FinancialSearchEvidence(
+        query="company annual report",
+        reason="Ground annual metrics",
+        summary="Revenue increased.",
+        sources=[FinancialSource(title="Annual report", url=source_url)],
+        retrieved_at="2026-07-11",
+    )
+    report = FinancialReportData(
+        short_summary="Summary",
+        markdown_report=f"Revenue increased ([source]({source_url})).",
+        follow_up_questions=[],
+    )
+
+    payload = json.loads(manager._verification_input("Analyze the company", report, [evidence]))
+
+    assert payload["allowed_source_urls"] == [source_url]
+    assert payload["report"] == report.model_dump(mode="json")
+    assert payload["evidence"] == [evidence.model_dump(mode="json")]
+
+
 def test_sandbox_basic_direct_run_imports_external_docker_sdk(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -317,16 +341,16 @@ class OutlineCheckerOutput:
 @pytest.mark.asyncio
 async def test_llm_as_judge_loop_handles_dataclass_feedback() -> None:
     """Mimics the llm_as_a_judge example: loop until the evaluator passes the outline."""
-    outline_model = FakeModel()
-    outline_model.add_multiple_turn_outputs(
+    outline_model = ScriptedModel()
+    outline_model.extend(
         [
             [get_text_message("Outline v1")],
             [get_text_message("Outline v2")],
         ]
     )
 
-    judge_model = FakeModel()
-    judge_model.add_multiple_turn_outputs(
+    judge_model = ScriptedModel()
+    judge_model.extend(
         [
             [
                 get_final_output_message(
@@ -376,14 +400,14 @@ async def test_llm_as_judge_loop_handles_dataclass_feedback() -> None:
 
     assert latest_outline == "Outline v2"
     assert len(conversation) == 4
-    assert judge_model.last_turn_args["input"] == conversation
+    assert judge_model.calls[-1].input == conversation
 
 
 @pytest.mark.asyncio
 async def test_parallel_translation_flow_reuses_runner_outputs() -> None:
     """Covers the parallelization example by feeding multiple translations into a picker agent."""
-    translation_model = FakeModel()
-    translation_model.add_multiple_turn_outputs(
+    translation_model = ScriptedModel()
+    translation_model.extend(
         [
             [get_text_message("Uno")],
             [get_text_message("Dos")],
@@ -392,8 +416,8 @@ async def test_parallel_translation_flow_reuses_runner_outputs() -> None:
     )
     spanish_agent = Agent(name="spanish_agent", model=translation_model)
 
-    picker_model = FakeModel()
-    picker_model.set_next_output([get_text_message("Pick: Dos")])
+    picker_model = ScriptedModel()
+    picker_model.enqueue([get_text_message("Pick: Dos")])
     picker_agent = Agent(name="picker", model=picker_model)
 
     translations: list[str] = []
@@ -409,7 +433,7 @@ async def test_parallel_translation_flow_reuses_runner_outputs() -> None:
 
     assert translations == ["Uno", "Dos", "Tres"]
     assert picker_result.final_output == "Pick: Dos"
-    assert picker_model.last_turn_args["input"] == [
+    assert picker_model.calls[-1].input == [
         {"content": f"Input: Hello\n\nTranslations:\n{combined}", "role": "user"}
     ]
 
@@ -417,18 +441,18 @@ async def test_parallel_translation_flow_reuses_runner_outputs() -> None:
 @pytest.mark.asyncio
 async def test_deterministic_story_flow_stops_when_checker_blocks() -> None:
     """Mimics deterministic flow: stop early when quality gate fails."""
-    outline_model = FakeModel()
-    outline_model.set_next_output([get_text_message("Outline v1")])
-    checker_model = FakeModel()
-    checker_model.set_next_output(
+    outline_model = ScriptedModel()
+    outline_model.enqueue([get_text_message("Outline v1")])
+    checker_model = ScriptedModel()
+    checker_model.enqueue(
         [
             get_final_output_message(
                 json.dumps({"response": {"good_quality": False, "is_scifi": True}})
             )
         ]
     )
-    story_model = FakeModel()
-    story_model.set_next_output(RuntimeError("story should not run"))
+    story_model = ScriptedModel()
+    story_model.enqueue(RuntimeError("story should not run"))
 
     outline_agent = Agent(name="outline", model=outline_model)
     checker_agent = Agent(
@@ -450,24 +474,24 @@ async def test_deterministic_story_flow_stops_when_checker_blocks() -> None:
     assert decision.is_scifi is True
     if decision.good_quality and decision.is_scifi:
         await Runner.run(story_agent, outline_result.final_output)
-    assert story_model.first_turn_args is None, "story agent should never be invoked when gated"
+    assert not story_model.calls, "story agent should never be invoked when gated"
 
 
 @pytest.mark.asyncio
 async def test_deterministic_story_flow_runs_story_on_pass() -> None:
     """Mimics deterministic flow: run full path when checker approves."""
-    outline_model = FakeModel()
-    outline_model.set_next_output([get_text_message("Outline ready")])
-    checker_model = FakeModel()
-    checker_model.set_next_output(
+    outline_model = ScriptedModel()
+    outline_model.enqueue([get_text_message("Outline ready")])
+    checker_model = ScriptedModel()
+    checker_model.enqueue(
         [
             get_final_output_message(
                 json.dumps({"response": {"good_quality": True, "is_scifi": True}})
             )
         ]
     )
-    story_model = FakeModel()
-    story_model.set_next_output([get_text_message("Final story")])
+    story_model = ScriptedModel()
+    story_model.enqueue([get_text_message("Final story")])
 
     outline_agent = Agent(name="outline", model=outline_model)
     checker_agent = Agent(
@@ -489,14 +513,14 @@ async def test_deterministic_story_flow_runs_story_on_pass() -> None:
 
     story_result = await Runner.run(story_agent, outline_result.final_output)
     assert story_result.final_output == "Final story"
-    assert story_model.last_turn_args["input"] == [{"content": "Outline ready", "role": "user"}]
+    assert story_model.calls[-1].input == [{"content": "Outline ready", "role": "user"}]
 
 
 @pytest.mark.asyncio
 async def test_routing_stream_emits_text_and_updates_inputs() -> None:
     """Mimics routing example stream: text deltas flow through and input history updates."""
-    model = FakeModel()
-    model.set_next_output([get_text_message("Bonjour")])
+    model = ScriptedModel()
+    model.enqueue([get_text_message("Bonjour")])
     triage_agent = Agent(name="triage_agent", model=model)
 
     streamed = Runner.run_streamed(triage_agent, input="Salut")
@@ -533,8 +557,8 @@ class MathHomeworkOutput(BaseModel):
 @pytest.mark.asyncio
 async def test_input_guardrail_agent_trips_and_returns_info() -> None:
     """Mimics math guardrail example: guardrail agent runs and trips before main agent completes."""
-    guardrail_model = FakeModel()
-    guardrail_model.set_next_output(
+    guardrail_model = ScriptedModel()
+    guardrail_model.enqueue(
         [
             get_final_output_message(
                 json.dumps({"reasoning": "math detected", "is_math_homework": True})
@@ -553,8 +577,8 @@ async def test_input_guardrail_agent_trips_and_returns_info() -> None:
             output_info=output, tripwire_triggered=output.is_math_homework
         )
 
-    main_model = FakeModel()
-    main_model.set_next_output([get_text_message("Should not run")])
+    main_model = ScriptedModel()
+    main_model.enqueue([get_text_message("Should not run")])
     main_agent = Agent(name="main", model=main_model, input_guardrails=[math_guardrail])
 
     with pytest.raises(InputGuardrailTripwireTriggered) as excinfo:
@@ -586,8 +610,8 @@ async def test_output_guardrail_blocks_sensitive_data() -> None:
             tripwire_triggered=contains_phone,
         )
 
-    model = FakeModel()
-    model.set_next_output(
+    model = ScriptedModel()
+    model.enqueue(
         [
             get_final_output_message(
                 json.dumps(
@@ -618,8 +642,8 @@ async def test_output_guardrail_blocks_sensitive_data() -> None:
 @pytest.mark.asyncio
 async def test_streaming_guardrail_style_cancel_after_threshold() -> None:
     """Mimics streaming guardrail example: stop streaming once threshold is reached."""
-    model = FakeModel()
-    model.set_next_output(
+    model = ScriptedModel()
+    model.enqueue(
         [
             get_text_message("Chunk1 "),
             get_text_message("Chunk2 "),
@@ -649,8 +673,8 @@ async def test_streaming_guardrail_style_cancel_after_threshold() -> None:
 @pytest.mark.asyncio
 async def test_streaming_cancel_after_turn_allows_turn_completion() -> None:
     """Ensure cancel(after_turn) lets the current turn finish and final_output is populated."""
-    model = FakeModel()
-    model.set_next_output([get_text_message("Hello"), get_text_message("World")])
+    model = ScriptedModel()
+    model.enqueue([get_text_message("Hello"), get_text_message("World")])
     agent = Agent(name="talkative", model=model)
 
     streamed = Runner.run_streamed(agent, input="Hi")
@@ -672,12 +696,12 @@ async def test_streaming_cancel_after_turn_allows_turn_completion() -> None:
 @pytest.mark.asyncio
 async def test_streaming_handoff_emits_agent_updated_event() -> None:
     """Mimics routing handoff stream: emits AgentUpdatedStreamEvent and switches agent."""
-    delegate_model = FakeModel()
-    delegate_model.set_next_output([get_text_message("delegate reply")])
+    delegate_model = ScriptedModel()
+    delegate_model.enqueue([get_text_message("delegate reply")])
     delegate_agent = Agent(name="delegate", model=delegate_model)
 
-    triage_model = FakeModel()
-    triage_model.set_next_output(
+    triage_model = ScriptedModel()
+    triage_model.enqueue(
         [
             get_text_message("triage summary"),
             get_handoff_tool_call(delegate_agent),
@@ -725,8 +749,8 @@ async def test_agent_as_tool_streaming_example_collects_events() -> None:
 
     billing_tool.on_invoke_tool = fake_invoke
 
-    main_model = FakeModel()
-    main_model.add_multiple_turn_outputs(
+    main_model = ScriptedModel()
+    main_model.extend(
         [
             [get_function_tool_call("billing_agent", json.dumps({"input": "Need bill"}))],
             [get_text_message("Final answer")],
@@ -752,8 +776,8 @@ async def test_agent_as_tool_streaming_example_collects_events() -> None:
 
 @pytest.mark.asyncio
 async def test_sandbox_agents_as_tools_example_serializes_structured_reviews() -> None:
-    pricing_model = FakeModel()
-    pricing_model.set_next_output(
+    pricing_model = ScriptedModel()
+    pricing_model.enqueue(
         [
             get_final_output_message(
                 json.dumps(
@@ -769,8 +793,8 @@ async def test_sandbox_agents_as_tools_example_serializes_structured_reviews() -
             )
         ]
     )
-    rollout_model = FakeModel()
-    rollout_model.set_next_output(
+    rollout_model = ScriptedModel()
+    rollout_model.enqueue(
         [
             get_final_output_message(
                 json.dumps(
@@ -788,8 +812,8 @@ async def test_sandbox_agents_as_tools_example_serializes_structured_reviews() -
             )
         ]
     )
-    orchestrator_model = FakeModel()
-    orchestrator_model.add_multiple_turn_outputs(
+    orchestrator_model = ScriptedModel()
+    orchestrator_model.extend(
         [
             [
                 get_function_tool_call(
@@ -854,7 +878,7 @@ async def test_sandbox_agents_as_tools_example_serializes_structured_reviews() -
     assert result.final_output == "Recommendation complete"
     outer_second_turn_input = cast(
         list[dict[str, Any]],
-        orchestrator_model.last_turn_args["input"],
+        orchestrator_model.calls[-1].input,
     )
     outer_tool_outputs = [
         item for item in outer_second_turn_input if item.get("type") == "function_call_output"
@@ -938,8 +962,8 @@ async def test_forcing_tool_use_behaviors_align_with_example() -> None:
         return f"{city}: Sunny"
 
     # default: run_llm_again -> model responds after tool call
-    default_model = FakeModel()
-    default_model.add_multiple_turn_outputs(
+    default_model = ScriptedModel()
+    default_model.extend(
         [
             [
                 get_text_message("Tool call coming"),
@@ -962,8 +986,8 @@ async def test_forcing_tool_use_behaviors_align_with_example() -> None:
     assert len(default_result.raw_responses) == 2
 
     # first_tool: stop_on_first_tool -> final output from first tool result
-    first_model = FakeModel()
-    first_model.set_next_output(
+    first_model = ScriptedModel()
+    first_model.enqueue(
         [
             get_text_message("Tool call coming"),
             get_function_tool_call("get_weather", json.dumps({"city": "Paris"})),
@@ -990,8 +1014,8 @@ async def test_forcing_tool_use_behaviors_align_with_example() -> None:
             is_final_output=True, final_output=f"Custom:{results[0].output}"
         )
 
-    custom_model = FakeModel()
-    custom_model.set_next_output(
+    custom_model = ScriptedModel()
+    custom_model.enqueue(
         [
             get_text_message("Tool call coming"),
             get_function_tool_call("get_weather", json.dumps({"city": "Berlin"})),
@@ -1013,12 +1037,12 @@ async def test_forcing_tool_use_behaviors_align_with_example() -> None:
 @pytest.mark.asyncio
 async def test_routing_multi_turn_continues_with_handoff_agent() -> None:
     """Mimics routing example multi-turn: first handoff, then continue with delegated agent."""
-    delegate_model = FakeModel()
-    delegate_model.set_next_output([get_text_message("Bonjour")])
+    delegate_model = ScriptedModel()
+    delegate_model.enqueue([get_text_message("Bonjour")])
     delegate_agent = Agent(name="delegate", model=delegate_model)
 
-    triage_model = FakeModel()
-    triage_model.add_multiple_turn_outputs(
+    triage_model = ScriptedModel()
+    triage_model.extend(
         [
             [get_handoff_tool_call(delegate_agent)],
             [get_text_message("handoff completed")],
@@ -1031,13 +1055,13 @@ async def test_routing_multi_turn_continues_with_handoff_agent() -> None:
     assert first_result.last_agent == delegate_agent
 
     # Next user turn continues with delegate.
-    delegate_model.set_next_output([get_text_message("Encore?")])
+    delegate_model.enqueue([get_text_message("Encore?")])
     follow_up_input = first_result.to_input_list()
     follow_up_input.append({"role": "user", "content": "Encore!"})
 
     second_result = await Runner.run(delegate_agent, follow_up_input)
     assert second_result.final_output == "Encore?"
-    assert delegate_model.last_turn_args["input"] == follow_up_input
+    assert delegate_model.calls[-1].input == follow_up_input
 
 
 @pytest.mark.asyncio
@@ -1060,25 +1084,29 @@ async def test_agents_as_tools_conditional_enabling_matches_preference() -> None
     ]
 
     for preference, expected_tools in scenarios:
-        spanish_model = FakeModel()
-        spanish_model.set_next_output([get_text_message("ES hola")])
+        spanish_model = ScriptedModel()
+        spanish_model.enqueue([get_text_message("ES hola")])
         spanish_agent = Agent(name="spanish", model=spanish_model)
 
-        french_model = FakeModel()
-        french_model.set_next_output([get_text_message("FR bonjour")])
+        french_model = ScriptedModel()
+        french_model.enqueue([get_text_message("FR bonjour")])
         french_agent = Agent(name="french", model=french_model)
 
-        italian_model = FakeModel()
-        italian_model.set_next_output([get_text_message("IT ciao")])
+        italian_model = ScriptedModel()
+        italian_model.enqueue([get_text_message("IT ciao")])
         italian_agent = Agent(name="italian", model=italian_model)
 
-        orchestrator_model = FakeModel()
+        orchestrator_model = ScriptedModel()
         # Build tool calls only for expected tools to avoid missing-tool errors.
         tool_calls = [
-            get_function_tool_call(tool_name, json.dumps({"input": "Hi"}))
+            get_function_tool_call(
+                tool_name,
+                json.dumps({"input": "Hi"}),
+                call_id=f"call_{tool_name}",
+            )
             for tool_name in sorted(expected_tools)
         ]
-        orchestrator_model.add_multiple_turn_outputs([tool_calls, [get_text_message("Done")]])
+        orchestrator_model.extend([tool_calls, [get_text_message("Done")]])
 
         context = AppContext(language_preference=preference)
 
@@ -1109,38 +1137,50 @@ async def test_agents_as_tools_conditional_enabling_matches_preference() -> None
 
         assert result.final_output == "Done"
         assert (
-            spanish_model.first_turn_args is not None
+            bool(spanish_model.calls)
             if "respond_spanish" in expected_tools
-            else spanish_model.first_turn_args is None
+            else not spanish_model.calls
         )
         assert (
-            french_model.first_turn_args is not None
+            bool(french_model.calls)
             if "respond_french" in expected_tools
-            else french_model.first_turn_args is None
+            else not french_model.calls
         )
         assert (
-            italian_model.first_turn_args is not None
+            bool(italian_model.calls)
             if "respond_italian" in expected_tools
-            else italian_model.first_turn_args is None
+            else not italian_model.calls
         )
 
 
 @pytest.mark.asyncio
 async def test_agents_as_tools_orchestrator_runs_multiple_translations() -> None:
     """Orchestrator calls multiple translation agent tools then summarizes."""
-    spanish_model = FakeModel()
-    spanish_model.set_next_output([get_text_message("ES hola")])
+    spanish_model = ScriptedModel()
+    spanish_model.enqueue([get_text_message("ES hola")])
     spanish_agent = Agent(name="spanish", model=spanish_model)
 
-    french_model = FakeModel()
-    french_model.set_next_output([get_text_message("FR bonjour")])
+    french_model = ScriptedModel()
+    french_model.enqueue([get_text_message("FR bonjour")])
     french_agent = Agent(name="french", model=french_model)
 
-    orchestrator_model = FakeModel()
-    orchestrator_model.add_multiple_turn_outputs(
+    orchestrator_model = ScriptedModel()
+    orchestrator_model.extend(
         [
-            [get_function_tool_call("translate_to_spanish", json.dumps({"input": "Hi"}))],
-            [get_function_tool_call("translate_to_french", json.dumps({"input": "Hi"}))],
+            [
+                get_function_tool_call(
+                    "translate_to_spanish",
+                    json.dumps({"input": "Hi"}),
+                    call_id="translate_spanish",
+                )
+            ],
+            [
+                get_function_tool_call(
+                    "translate_to_french",
+                    json.dumps({"input": "Hi"}),
+                    call_id="translate_french",
+                )
+            ],
             [get_text_message("Summary complete")],
         ]
     )
@@ -1157,8 +1197,8 @@ async def test_agents_as_tools_orchestrator_runs_multiple_translations() -> None
     result = await Runner.run(orchestrator, "Hi")
 
     assert result.final_output == "Summary complete"
-    assert spanish_model.last_turn_args["input"] == [{"content": "Hi", "role": "user"}]
-    assert french_model.last_turn_args["input"] == [{"content": "Hi", "role": "user"}]
+    assert spanish_model.calls[-1].input == [{"content": "Hi", "role": "user"}]
+    assert french_model.calls[-1].input == [{"content": "Hi", "role": "user"}]
     assert len(result.raw_responses) == 3
 
 
@@ -1169,14 +1209,15 @@ async def test_agents_as_tools_subagent_cancellation_preserves_parent_final_outp
     async def _cancel_tool() -> str:
         raise asyncio.CancelledError("tool-cancelled")
 
-    success_model = FakeModel()
-    success_model.set_next_output([get_text_message("Status: ok")])
+    success_model = ScriptedModel()
+    success_model.enqueue([get_text_message("Status: ok")])
     success_agent = Agent(name="status", model=success_model)
 
-    observability_model = FakeModel()
-    observability_model.set_next_output(
+    observability_model = ScriptedModel()
+    observability_model.enqueue(
         [get_function_tool_call("cancel_tool", "{}", call_id="inner_cancel")]
     )
+    observability_model.enqueue([])
     observability_agent = Agent(
         name="observability",
         model=observability_model,
@@ -1184,8 +1225,8 @@ async def test_agents_as_tools_subagent_cancellation_preserves_parent_final_outp
         model_settings=ModelSettings(tool_choice="required"),
     )
 
-    orchestrator_model = FakeModel()
-    orchestrator_model.add_multiple_turn_outputs(
+    orchestrator_model = ScriptedModel()
+    orchestrator_model.extend(
         [
             [
                 get_function_tool_call(
@@ -1217,11 +1258,11 @@ async def test_agents_as_tools_subagent_cancellation_preserves_parent_final_outp
 
     assert result.final_output == "Summary complete"
     assert len(result.raw_responses) == 2
-    assert success_model.last_turn_args["input"] == [{"content": "Hi", "role": "user"}]
-    assert observability_model.first_turn_args is not None
-    assert observability_model.first_turn_args["input"] == [{"content": "Hi", "role": "user"}]
+    assert success_model.calls[-1].input == [{"content": "Hi", "role": "user"}]
+    assert bool(observability_model.calls)
+    assert observability_model.calls[0].input == [{"content": "Hi", "role": "user"}]
 
-    second_turn_input = cast(list[dict[str, Any]], orchestrator_model.last_turn_args["input"])
+    second_turn_input = cast(list[dict[str, Any]], orchestrator_model.calls[-1].input)
     tool_outputs = [
         item for item in second_turn_input if item.get("type") == "function_call_output"
     ]
@@ -1234,9 +1275,11 @@ async def test_agents_as_tools_subagent_cancellation_preserves_parent_final_outp
     assert tool_outputs[1]["call_id"] == "outer_observability"
     assert tool_outputs[1]["type"] == "function_call_output"
     assert tool_outputs[1]["output"].startswith(
-        "An error occurred while running the tool. Please try again. Error:"
+        "An error occurred while running the tool. Please try again."
     )
-    assert "cancel" in tool_outputs[1]["output"].lower()
+    assert tool_outputs[1]["output"] == (
+        "An error occurred while running the tool. Please try again."
+    )
 
 
 @pytest.mark.asyncio
@@ -1254,12 +1297,12 @@ async def test_agents_as_tools_streaming_subagent_cancellation_preserves_parent_
     async def on_stream(event: AgentToolStreamEvent) -> None:
         received_events.append(event)
 
-    status_model = FakeModel()
-    status_model.set_next_output([get_text_message("Status: ok")])
+    status_model = ScriptedModel()
+    status_model.enqueue([get_text_message("Status: ok")])
     status_agent = Agent(name="status", model=status_model)
 
-    observability_model = FakeModel()
-    observability_model.add_multiple_turn_outputs(
+    observability_model = ScriptedModel()
+    observability_model.extend(
         [
             [
                 get_function_tool_call("ok_tool", "{}", call_id="inner_ok"),
@@ -1278,8 +1321,8 @@ async def test_agents_as_tools_streaming_subagent_cancellation_preserves_parent_
         model_settings=ModelSettings(tool_choice="required"),
     )
 
-    orchestrator_model = FakeModel()
-    orchestrator_model.add_multiple_turn_outputs(
+    orchestrator_model = ScriptedModel()
+    orchestrator_model.extend(
         [
             [
                 get_function_tool_call(
@@ -1316,12 +1359,12 @@ async def test_agents_as_tools_streaming_subagent_cancellation_preserves_parent_
     assert result.final_output == "Summary complete"
     assert len(result.raw_responses) == 2
     assert received_events, "on_stream should confirm the nested streaming path ran"
-    assert status_model.last_turn_args["input"] == [{"content": "Hi", "role": "user"}]
-    assert observability_model.last_turn_args is not None
+    assert status_model.calls[-1].input == [{"content": "Hi", "role": "user"}]
+    assert bool(observability_model.calls)
 
     nested_second_turn_input = cast(
         list[dict[str, Any]],
-        observability_model.last_turn_args["input"],
+        observability_model.calls[-1].input,
     )
     nested_tool_outputs = [
         item for item in nested_second_turn_input if item.get("type") == "function_call_output"
@@ -1334,16 +1377,14 @@ async def test_agents_as_tools_streaming_subagent_cancellation_preserves_parent_
         },
         {
             "call_id": "inner_cancel",
-            "output": (
-                "An error occurred while running the tool. Please try again. Error: tool-cancelled"
-            ),
+            "output": ("An error occurred while running the tool. Please try again."),
             "type": "function_call_output",
         },
     ]
 
     outer_second_turn_input = cast(
         list[dict[str, Any]],
-        orchestrator_model.last_turn_args["input"],
+        orchestrator_model.calls[-1].input,
     )
     outer_tool_outputs = [
         item for item in outer_second_turn_input if item.get("type") == "function_call_output"
@@ -1369,12 +1410,12 @@ async def test_agents_as_tools_failure_error_function_none_reraises_cancelled_er
     async def _cancel_tool() -> str:
         raise asyncio.CancelledError("tool-cancelled")
 
-    status_model = FakeModel()
-    status_model.set_next_output([get_text_message("Status: ok")])
+    status_model = ScriptedModel()
+    status_model.enqueue([get_text_message("Status: ok")])
     status_agent = Agent(name="status", model=status_model)
 
-    observability_model = FakeModel()
-    observability_model.set_next_output(
+    observability_model = ScriptedModel()
+    observability_model.enqueue(
         [get_function_tool_call("cancel_tool", "{}", call_id="inner_cancel")]
     )
     observability_agent = Agent(
@@ -1386,8 +1427,8 @@ async def test_agents_as_tools_failure_error_function_none_reraises_cancelled_er
         model_settings=ModelSettings(tool_choice="required"),
     )
 
-    orchestrator_model = FakeModel()
-    orchestrator_model.set_next_output(
+    orchestrator_model = ScriptedModel()
+    orchestrator_model.enqueue(
         [
             get_function_tool_call(
                 "status_agent",

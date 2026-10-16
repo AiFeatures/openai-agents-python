@@ -6,14 +6,14 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal, get_args, get_origin, get_type_hints
+from typing import Annotated, Any, Literal, cast, get_args, get_origin, get_type_hints
 
 # griffelib exposes the `griffe` package at runtime but currently does not ship typing markers.
 from griffe import Docstring, DocstringSectionKind  # type: ignore[import-untyped]
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model
 from pydantic.fields import FieldInfo
 
-from .exceptions import UserError
+from .exceptions import ModelBehaviorError, UserError
 from .run_context import RunContextWrapper
 from .strict_schema import ensure_strict_json_schema
 from .tool_context import ToolContext
@@ -47,10 +47,19 @@ class FuncSchema:
         """
         Converts validated data from the Pydantic model into (args, kwargs), suitable for calling
         the original function.
+
+        Raises:
+            ModelBehaviorError: If the ``**kwargs`` payload carries a key that names one of the
+                function's own keyword-bindable parameters. The schema allows it, but no Python
+                call expresses it.
         """
         positional_args: list[Any] = []
         keyword_args: dict[str, Any] = {}
         seen_var_positional = False
+        # Read instance storage first so Pydantic properties such as ``model_extra``
+        # and ``model_fields_set`` do not shadow tool parameters of the same name.
+        # ``model_dump()`` is unsuitable here because it converts nested models to dicts.
+        instance_values = object.__getattribute__(data, "__dict__")
 
         # Use enumerate() so we can skip the first parameter if it's context.
         for idx, (name, param) in enumerate(self.signature.parameters.items()):
@@ -58,14 +67,16 @@ class FuncSchema:
             if self.takes_context and idx == 0:
                 continue
 
-            value = getattr(data, name, None)
+            value = instance_values[name] if name in instance_values else getattr(data, name, None)
             if param.kind == param.VAR_POSITIONAL:
                 # e.g. *args: extend positional args and mark that *args is now seen
                 positional_args.extend(value or [])
                 seen_var_positional = True
             elif param.kind == param.VAR_KEYWORD:
                 # e.g. **kwargs handling
-                keyword_args.update(value or {})
+                var_keyword_values = value or {}
+                self._raise_on_var_keyword_collisions(name, var_keyword_values)
+                keyword_args.update(var_keyword_values)
             elif param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD):
                 # Before *args, add to positional args. After *args, add to keyword args.
                 if not seen_var_positional:
@@ -76,6 +87,37 @@ class FuncSchema:
                 # For KEYWORD_ONLY parameters, always use keyword args.
                 keyword_args[name] = value
         return positional_args, keyword_args
+
+    def _raise_on_var_keyword_collisions(
+        self, var_keyword_name: str, var_keyword_values: dict[str, Any]
+    ) -> None:
+        """Reject ``**kwargs`` keys that name a parameter the call already binds by name.
+
+        ``**kwargs`` is splatted last, so such a key either replaces the value the model
+        supplied for that parameter -- and Pydantic validated -- or makes the call fail with
+        "got multiple values for argument". Neither is what the schema promised, so treat it
+        as model misbehavior and say which keys clashed.
+
+        Positional-only parameters and ``*args`` are deliberately not reserved: for
+        ``def f(a, /, **kw)``, the call ``f(1, a=2)`` is legal and routes ``a=2`` into ``kw``.
+        The names below only ever reveal the tool's own signature, which the model already
+        has, so they are safe to name even when tool data is redacted.
+        """
+        reserved_names = {
+            name
+            for name, param in self.signature.parameters.items()
+            if param.kind in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY)
+        }
+        conflicts = sorted(reserved_names.intersection(var_keyword_values))
+        if not conflicts:
+            return
+
+        conflict_list = ", ".join(repr(conflict) for conflict in conflicts)
+        raise ModelBehaviorError(
+            f"Invalid arguments for tool {self.name}: {conflict_list} "
+            f"{'is' if len(conflicts) == 1 else 'are'} both a named parameter and a key in "
+            f"'{var_keyword_name}'. Pass each argument once, as a named parameter."
+        )
 
 
 @dataclass
@@ -139,7 +181,7 @@ def _detect_docstring_style(doc: str) -> DocstringStyle:
 def _suppress_griffe_logging():
     # Suppresses warnings about missing annotations for params
     logger = logging.getLogger("griffe")
-    previous_level = logger.getEffectiveLevel()
+    previous_level = logger.level
     logger.setLevel(logging.ERROR)
     try:
         yield
@@ -225,7 +267,9 @@ def generate_func_documentation(
         doc = _ensure_blank_line_before_google_sections(doc)
 
     with _suppress_griffe_logging():
-        docstring = Docstring(doc, lineno=1, parser=resolved_style)
+        # Griffe runs cleandoc again. A leading newline keeps the already-cleaned first
+        # line in its indentation calculation, preserving an initial Args: section's body.
+        docstring = Docstring("\n" + doc, lineno=1, parser=resolved_style)
         parsed = docstring.parse()
 
     description: str | None = next(
@@ -233,7 +277,10 @@ def generate_func_documentation(
     )
 
     param_descriptions: dict[str, str] = {
-        param.name: param.description
+        # Google and NumPy style docstrings write variadic parameters with their
+        # stars ("*args:", "**kwargs:") and griffe returns those names verbatim.
+        # Strip the stars so lookups by the signature parameter name succeed.
+        param.name.lstrip("*"): param.description
         for section in parsed
         if section.kind == DocstringSectionKind.parameters
         for param in section.value
@@ -267,15 +314,6 @@ def _extract_description_from_metadata(metadata: tuple[Any, ...]) -> str | None:
 
     for item in metadata:
         if isinstance(item, str):
-            return item
-    return None
-
-
-def _extract_field_info_from_metadata(metadata: tuple[Any, ...]) -> FieldInfo | None:
-    """Returns the first FieldInfo in Annotated metadata, or None."""
-
-    for item in metadata:
-        if isinstance(item, FieldInfo):
             return item
     return None
 
@@ -352,7 +390,7 @@ def function_schema(
         first_name, first_param = params[0]
         # Prefer the evaluated type hint if available
         ann = type_hints.get(first_name, first_param.annotation)
-        if ann != inspect._empty:
+        if ann is not inspect._empty:
             origin = get_origin(ann) or ann
             if origin is RunContextWrapper or origin is ToolContext:
                 takes_context = True  # Mark that the function takes context
@@ -364,7 +402,7 @@ def function_schema(
     # For parameters other than the first, raise error if any use RunContextWrapper or ToolContext.
     for name, param in params[1:]:
         ann = type_hints.get(name, param.annotation)
-        if ann != inspect._empty:
+        if ann is not inspect._empty:
             origin = get_origin(ann) or ann
             if origin is RunContextWrapper or origin is ToolContext:
                 raise UserError(
@@ -376,31 +414,53 @@ def function_schema(
     # We will collect field definitions for create_model as a dict:
     #   field_name -> (type_annotation, default_value_or_Field(...))
     fields: dict[str, Any] = {}
+    model_config = ConfigDict()
 
     for name, param in filtered_params:
         ann = type_hints.get(name, param.annotation)
         default = param.default
 
         # If there's no type hint, assume `Any`
-        if ann == inspect._empty:
+        if ann is inspect._empty:
             ann = Any
 
         # If a docstring param description exists, use it
         field_description = param_descs.get(name, None)
 
+        # Let Pydantic combine all Field entries and retain other Annotated metadata,
+        # including constrained type aliases and validators, in its original order.
+        field_info_from_annotated = (
+            FieldInfo.from_annotation(type_hints_with_extras[name])
+            if param_metadata.get(name)
+            else None
+        )
+        value_ann = ann
+        if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
+            if field_info_from_annotated is not None and field_info_from_annotated.metadata:
+                # Constraints apply to each value, not the collected container or its defaults.
+                value_ann = Annotated[(ann, *cast(Any, field_info_from_annotated).metadata)]
+
         # Handle different parameter kinds
         if param.kind == param.VAR_POSITIONAL:
             # e.g. *args: extend positional args
             if get_origin(ann) is tuple:
-                # e.g. def foo(*args: tuple[int, ...]) -> treat as List[int]
+                # Preserve a homogeneous tuple as the type of each positional argument.
                 args_of_tuple = get_args(ann)
                 if len(args_of_tuple) == 2 and args_of_tuple[1] is Ellipsis:
-                    ann = list[args_of_tuple[0]]  # type: ignore
+                    ann = list[value_ann]  # type: ignore
+                # tuple[()] parameterizes an empty tuple and reports no args, while a bare
+                # typing.Tuple is unparameterized and carries no element type to reject.
+                elif hasattr(ann, "__args__"):
+                    raise UserError(
+                        f"Variadic parameter `*{name}` in function {func.__name__} is annotated"
+                        f" with the fixed-length tuple `{ann}`. A variadic annotation describes"
+                        " each positional argument, so use tuple[T, ...] or list[T] instead."
+                    )
                 else:
                     ann = list[Any]
             else:
                 # If user wrote *args: int, treat as List[int]
-                ann = list[ann]  # type: ignore
+                ann = list[value_ann]  # type: ignore
 
             # Default factory to empty list
             fields[name] = (
@@ -409,17 +469,21 @@ def function_schema(
             )
 
         elif param.kind == param.VAR_KEYWORD:
-            # **kwargs handling
-            if get_origin(ann) is dict:
-                # e.g. def foo(**kwargs: dict[str, int])
-                dict_args = get_args(ann)
-                if len(dict_args) == 2:
-                    ann = dict[dict_args[0], dict_args[1]]  # type: ignore
-                else:
-                    ann = dict[str, Any]
-            else:
-                # e.g. def foo(**kwargs: int) -> Dict[str, int]
-                ann = dict[str, ann]  # type: ignore
+            if strict_json_schema:
+                raise UserError(
+                    f"Variadic keyword parameter `**{name}` in function {func.__name__} cannot"
+                    " use a strict schema. Set strict_mode=False on the function tool"
+                    " (or strict_json_schema=False on function_schema) and pass keyword arguments"
+                    f" in the nested `{name}` object, or use explicit parameters for a strict tool."
+                )
+            # Reject flat keyword arguments instead of silently dropping them before invocation.
+            model_config["extra"] = "forbid"
+            # **kwargs handling: a ``**kwargs: X`` annotation applies to each keyword *value*
+            # (PEP 484), so the collected container is always ``dict[str, X]``. Preserve the full
+            # annotation as the value type -- mirroring the variadic-positional handling above,
+            # where ``*args: X`` becomes ``list[X]`` (see #4655). A bare ``**kwargs`` has ``ann``
+            # set to ``Any`` above, yielding ``dict[str, Any]``.
+            ann = dict[str, value_ann]  # type: ignore
 
             fields[name] = (
                 ann,
@@ -428,20 +492,27 @@ def function_schema(
 
         else:
             # Normal parameter
-            metadata = param_metadata.get(name, ())
-            field_info_from_annotated = _extract_field_info_from_metadata(metadata)
-
             if field_info_from_annotated is not None:
                 merged = FieldInfo.merge_field_infos(
                     field_info_from_annotated,
                     description=field_description or field_info_from_annotated.description,
                 )
-                if default != inspect._empty and not isinstance(default, FieldInfo):
+                if default is not inspect._empty and not isinstance(default, FieldInfo):
                     merged = FieldInfo.merge_field_infos(merged, default=default)
                 elif isinstance(default, FieldInfo):
-                    merged = FieldInfo.merge_field_infos(merged, default)
+                    merged = FieldInfo.from_annotated_attribute(
+                        cast(Any, Annotated[ann, merged]), default
+                    )
+                    if not any(
+                        isinstance(item, FieldInfo) for item in param_metadata.get(name, ())
+                    ):
+                        # Without an Annotated Field, descriptions retain the same precedence
+                        # as a plain annotation with a Field default below.
+                        merged = FieldInfo.merge_field_infos(
+                            merged, description=field_description or default.description
+                        )
                 fields[name] = (ann, merged)
-            elif default == inspect._empty:
+            elif default is inspect._empty:
                 # Required field
                 fields[name] = (
                     ann,
@@ -463,7 +534,9 @@ def function_schema(
                 )
 
     # 3. Dynamically build a Pydantic model
-    dynamic_model = create_model(f"{func_name}_args", __base__=BaseModel, **fields)
+    dynamic_model = create_model(
+        f"{func_name}_args", __base__=BaseModel, __config__=model_config, **fields
+    )
 
     # 4. Build JSON schema from that model
     json_schema = dynamic_model.model_json_schema()

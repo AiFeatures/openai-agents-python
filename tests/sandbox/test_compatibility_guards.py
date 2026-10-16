@@ -40,6 +40,7 @@ from agents.sandbox.entries.mounts.patterns import (
     RcloneMountPattern,
     S3FilesMountPattern,
 )
+from agents.sandbox.manifest import EnvValue, StrEnvValue
 from agents.sandbox.session.sandbox_client import BaseSandboxClientOptions
 from agents.sandbox.session.sandbox_session_state import SandboxSessionState
 from agents.sandbox.snapshot import LocalSnapshot, NoopSnapshot, RemoteSnapshot, SnapshotBase
@@ -63,7 +64,7 @@ def _make_session_state(cls: type[StateT], **overrides: object) -> StateT:
 
 
 def _import_optional_class(module_name: str, class_name: str) -> type[Any]:
-    module = pytest.importorskip(module_name)
+    module = pytest.importorskip(module_name, exc_type=ImportError)
     value = getattr(module, class_name)
     assert isinstance(value, type)
     return cast(type[Any], value)
@@ -114,6 +115,7 @@ def test_core_sandbox_public_export_surface_is_stable() -> None:
             "SandboxAgent",
             "SandboxArchiveLimits",
             "SandboxPathGrant",
+            "SandboxWorkspaceScope",
             "SandboxConcurrencyLimits",
             "SandboxError",
             "SandboxRunConfig",
@@ -303,6 +305,7 @@ def test_core_sandbox_public_export_surface_is_stable() -> None:
                 "DEFAULT_RUNLOOP_WORKSPACE_ROOT",
                 "DEFAULT_RUNLOOP_ROOT_WORKSPACE_ROOT",
                 "RunloopAfterIdle",
+                "RunloopExistingSecret",
                 "RunloopGatewaySpec",
                 "RunloopLaunchParameters",
                 "RunloopMcpSpec",
@@ -340,7 +343,7 @@ def test_extension_sandbox_package_export_surfaces_are_stable(
     module_name: str,
     expected_exports: set[str],
 ) -> None:
-    module = pytest.importorskip(module_name)
+    module = pytest.importorskip(module_name, exc_type=ImportError)
 
     assert set(module.__all__) == expected_exports
     for name in expected_exports:
@@ -366,6 +369,7 @@ def test_sandbox_dataclass_constructor_field_order_is_stable() -> None:
         "snapshot",
         "concurrency_limits",
         "archive_limits",
+        "cwd",
     )
 
 
@@ -412,7 +416,7 @@ def test_optional_sandbox_dataclass_constructor_field_order_is_stable(
         (
             "agents.sandbox.sandboxes.docker",
             "DockerSandboxClientOptions",
-            ("image", "exposed_ports"),
+            ("image", "exposed_ports", "network_mode", "labels"),
         ),
         (
             "agents.extensions.sandbox.e2b",
@@ -449,6 +453,8 @@ def test_optional_sandbox_dataclass_constructor_field_order_is_stable(
                 "use_sleep_cmd",
                 "image_builder_version",
                 "idle_timeout",
+                "cpu",
+                "memory",
             ),
         ),
         (
@@ -569,6 +575,8 @@ def test_optional_sandbox_client_options_positional_field_order_is_stable(
                 "workspace_root_ready",
                 "image",
                 "container_id",
+                "network_mode",
+                "labels",
             ),
         ),
         (
@@ -624,6 +632,8 @@ def test_optional_sandbox_client_options_positional_field_order_is_stable(
                 "use_sleep_cmd",
                 "image_builder_version",
                 "idle_timeout",
+                "cpu",
+                "memory",
             ),
         ),
         (
@@ -746,6 +756,7 @@ def test_optional_sandbox_client_options_positional_field_order_is_stable(
                 "snapshot_expiration_ms",
                 "network_policy",
                 "s3_mounts_non_resumable",
+                "sandbox_name",
             ),
         ),
     ],
@@ -891,6 +902,7 @@ def test_core_discriminator_type_strings_are_stable() -> None:
         S3FilesMountPattern: "s3files",
         InContainerMountStrategy: "in_container",
         DockerVolumeMountStrategy: "docker_volume",
+        StrEnvValue: "str",
     }
 
     for cls, expected_type in expected_types.items():
@@ -1001,6 +1013,7 @@ def test_core_discriminator_registries_parse_released_payload_shapes() -> None:
         MountStrategyBase.parse({"type": "docker_volume", "driver": "rclone"}),
         DockerVolumeMountStrategy,
     )
+    assert isinstance(EnvValue.parse({"type": "str", "value": "env-value"}), StrEnvValue)
 
 
 @pytest.mark.asyncio

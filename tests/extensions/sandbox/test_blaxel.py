@@ -4,6 +4,8 @@ import asyncio
 import io
 import json
 import logging
+import shlex
+import sys
 import tarfile
 import time
 import uuid
@@ -19,16 +21,19 @@ import agents._debug as _debug
 from agents.run_config import SandboxRunConfig
 from agents.sandbox import Manifest, SandboxPathGrant
 from agents.sandbox.config import DEFAULT_PYTHON_SANDBOX_IMAGE
+from agents.sandbox.entries import InContainerMountStrategy, RcloneMountPattern, S3Mount
 from agents.sandbox.errors import (
     ExecTimeoutError,
     ExecTransportError,
     ExposedPortUnavailableError,
     InvalidManifestPathError,
+    MountConfigError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
     WorkspaceReadNotFoundError,
     WorkspaceWriteTypeError,
 )
+from agents.sandbox.session.base_sandbox_session import BaseSandboxSession
 from agents.sandbox.snapshot import NoopSnapshot
 from agents.sandbox.types import ExposedPortEndpoint
 from agents.sandbox.util.tar_utils import validate_tar_bytes
@@ -351,14 +356,17 @@ class TestBlaxelSandboxSession:
 
     @pytest.mark.asyncio
     async def test_exec_transport_error(self, fake_sandbox: _FakeSandboxInstance) -> None:
+        from agents.extensions.sandbox.blaxel import sandbox as mod
+
         session = _make_session(fake_sandbox)
 
         async def _raise(*args: object, **kw: object) -> None:
             raise ConnectionError("transport error")
 
         fake_sandbox.process.exec = _raise  # type: ignore[assignment]
-        with pytest.raises(ExecTransportError) as exc_info:
-            await session._exec_internal("echo", "hello")
+        with patch.object(mod, "_import_sandbox_api_error", return_value=None):
+            with pytest.raises(ExecTransportError) as exc_info:
+                await session._exec_internal("echo", "hello")
         assert str(exc_info.value) == "Blaxel exec failed: ConnectionError: transport error"
         assert exc_info.value.context["backend"] == "blaxel"
         assert exc_info.value.context["provider_error"] == "ConnectionError: transport error"
@@ -598,14 +606,14 @@ class TestBlaxelSandboxSession:
         from agents.extensions.sandbox.blaxel.sandbox import BlaxelTimeouts
 
         state = _make_state()
-        state.timeouts = BlaxelTimeouts(exec_timeout_s=1)
+        state.timeouts = BlaxelTimeouts.model_construct(exec_timeout_s=0.01)
         session = _make_session(fake_sandbox, state=state)
         fake_sandbox.process.delay = 10.0
 
         with pytest.raises(ExecTimeoutError) as exc_info:
             await session._exec_internal("sleep", "100")
 
-        assert exc_info.value.timeout_s == 1.0
+        assert exc_info.value.timeout_s == 0.01
 
     @pytest.mark.asyncio
     async def test_stop_calls_pty_terminate(self, fake_sandbox: _FakeSandboxInstance) -> None:
@@ -829,6 +837,7 @@ class TestBlaxelSandboxClient:
 
         client = mod.BlaxelSandboxClient(token="test-token")
         state = _make_state(sandbox_name="resume-sandbox", pause_on_exit=True)
+        state = client.deserialize_session_state(client.serialize_session_state(state))
         session = await client.resume(state)
         assert session is not None
 
@@ -929,6 +938,64 @@ class TestHelpers:
         assert "token=tok123" in url
         assert "sessionId=sess-1" in url
         assert "workingDir=/workspace" in url
+
+    @pytest.mark.parametrize(
+        "field, value",
+        [
+            ("cwd", "/workspace/my project"),
+            ("cwd", "/workspace/a&rows=9999"),
+            ("cwd", "/workspace/a#b"),
+            ("cwd", "/workspace/café"),
+            ("token", "ab+cd/ef=="),
+            ("session_id", "a&b"),
+        ],
+        ids=["space", "ampersand", "hash", "non_ascii", "token_plus", "session_amp"],
+    )
+    def test_build_ws_url_percent_encodes_query_values(self, field: str, value: str) -> None:
+        """Caller-controlled values must survive the round trip intact.
+
+        The workspace path and session id can contain characters that are structural in a
+        query string. Interpolating them raw let a path such as `/w/a&rows=1` append or
+        override parameters, let a `#` truncate the rest into a fragment, and let a `+` in a
+        token decode back as a space.
+        """
+        from urllib.parse import parse_qs, urlsplit
+
+        from agents.extensions.sandbox.blaxel.sandbox import _build_ws_url
+
+        kwargs: dict[str, Any] = {
+            "sandbox_url": "https://test.bl.run",
+            "token": "tok123",
+            "session_id": "sess-1",
+            "cwd": "/workspace",
+        }
+        kwargs[field] = value
+
+        url = _build_ws_url(**kwargs)
+        parts = urlsplit(url)
+        query = parse_qs(parts.query, keep_blank_values=True)
+
+        assert parts.fragment == ""
+        assert " " not in url
+        assert query["token"] == [kwargs["token"]]
+        assert query["sessionId"] == [kwargs["session_id"]]
+        assert query["workingDir"] == [kwargs["cwd"]]
+        # A structural character in a value must not add or override a parameter.
+        assert query["rows"] == ["24"]
+        assert query["cols"] == ["80"]
+
+    def test_build_ws_url_rewrites_only_the_scheme(self) -> None:
+        """`replace` also rewrote an occurrence inside the path, such as a proxied URL."""
+        from agents.extensions.sandbox.blaxel.sandbox import _build_ws_url
+
+        url = _build_ws_url(
+            sandbox_url="https://test.bl.run/proxy/http://inner",
+            token="t",
+            session_id="s",
+            cwd="/workspace",
+        )
+
+        assert url.startswith("wss://test.bl.run/proxy/http://inner/terminal/ws?")
 
     def test_extract_preview_url(self) -> None:
         from agents.extensions.sandbox.blaxel.sandbox import _extract_preview_url
@@ -1565,6 +1632,34 @@ class TestTarExcludeArgs:
 
 class TestStartLifecycle:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("skip_start", [False, True])
+    async def test_start_rejects_unsafe_mount_before_provider_work(
+        self,
+        fake_sandbox: _FakeSandboxInstance,
+        skip_start: bool,
+    ) -> None:
+        sentinel = "blaxel-start-secret"
+        state = _make_state()
+        state.manifest = Manifest(
+            entries={
+                "data": S3Mount(
+                    bucket="bucket",
+                    access_key_id="access-key",
+                    secret_access_key=sentinel,
+                    mount_strategy=InContainerMountStrategy(pattern=RcloneMountPattern()),
+                )
+            }
+        )
+        session = _make_session(fake_sandbox, state=state)
+        session._skip_start = skip_start
+
+        with pytest.raises(MountConfigError) as exc:
+            await session.start()
+
+        assert fake_sandbox.process.exec_calls == []
+        assert sentinel not in str(exc.value)
+
+    @pytest.mark.asyncio
     async def test_start_mkdir_failure_suppressed(self, fake_sandbox: _FakeSandboxInstance) -> None:
         session = _make_session(fake_sandbox)
 
@@ -1572,15 +1667,10 @@ class TestStartLifecycle:
             raise ConnectionError("mkdir failed")
 
         fake_sandbox.process.exec = _raise  # type: ignore[assignment]
-        # start() should suppress the mkdir error and call super().start().
-        # super().start() will try to materialize the manifest, which may
-        # also call process.exec. We just verify it does not raise from the
-        # initial mkdir.
-        try:
+        with patch.object(BaseSandboxSession, "start", new_callable=AsyncMock) as base_start:
             await session.start()
-        except Exception:
-            # May fail in super().start() but not from the mkdir.
-            pass
+
+        base_start.assert_awaited_once_with()
 
 
 # ---------------------------------------------------------------------------
@@ -1657,20 +1747,238 @@ class _FakeAiohttp:
 
 class TestPtyExec:
     @pytest.mark.asyncio
-    async def test_pty_exec_start_success(self, fake_sandbox: _FakeSandboxInstance) -> None:
+    async def test_pty_exec_start_cancellation_closes_unregistered_http_session(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
         from agents.extensions.sandbox.blaxel import sandbox as mod
 
-        output_msg = json.dumps({"type": "output", "data": "hello from pty"})
-        ws = _FakeWS(messages=[_FakeWSMessage(_FakeAiohttp.WSMsgType.TEXT, output_msg)])
-        fake_aiohttp = _FakeAiohttp(ws=ws)
+        connect_started = asyncio.Event()
 
+        class _BlockingSession:
+            def __init__(self) -> None:
+                self._closed = False
+
+            async def ws_connect(self, url: str) -> None:
+                _ = url
+                connect_started.set()
+                await asyncio.Event().wait()
+
+            async def close(self) -> None:
+                self._closed = True
+
+        class _BlockingAiohttp:
+            WSMsgType = _FakeAiohttp.WSMsgType
+
+            def __init__(self) -> None:
+                self.session: _BlockingSession | None = None
+
+            def ClientSession(self) -> _BlockingSession:
+                self.session = _BlockingSession()
+                return self.session
+
+        fake_aiohttp = _BlockingAiohttp()
+        session = _make_session(fake_sandbox)
+
+        with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
+            task = asyncio.create_task(session.pty_exec_start("echo", "hello"))
+            await connect_started.wait()
+            task.cancel("connect-cancel")
+
+            with pytest.raises(asyncio.CancelledError) as exc_info:
+                await task
+
+            if sys.version_info >= (3, 11):
+                assert exc_info.value.args == ("connect-cancel",)
+            assert task.cancelled()
+
+        assert fake_aiohttp.session is not None
+        assert fake_aiohttp.session._closed
+        assert session._pty_sessions == {}
+        assert session._reserved_pty_process_ids == set()
+
+    @pytest.mark.asyncio
+    async def test_pty_exec_start_preserves_cancellation_during_cleanup(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
+        from agents.extensions.sandbox.blaxel import sandbox as mod
+
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+
+        class _TimeoutSession:
+            def __init__(self) -> None:
+                self._closed = False
+
+            async def ws_connect(self, url: str) -> None:
+                _ = url
+                raise asyncio.TimeoutError()
+
+            async def close(self) -> None:
+                cleanup_started.set()
+                await allow_cleanup.wait()
+                self._closed = True
+
+        class _TimeoutAiohttp:
+            WSMsgType = _FakeAiohttp.WSMsgType
+
+            def __init__(self) -> None:
+                self.session: _TimeoutSession | None = None
+
+            def ClientSession(self) -> _TimeoutSession:
+                self.session = _TimeoutSession()
+                return self.session
+
+        fake_aiohttp = _TimeoutAiohttp()
+        session = _make_session(fake_sandbox)
+
+        with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
+            task = asyncio.create_task(session.pty_exec_start("echo", "hello"))
+            await cleanup_started.wait()
+            task.cancel("cleanup-cancel")
+            allow_cleanup.set()
+
+            with pytest.raises(asyncio.CancelledError) as exc_info:
+                await task
+
+            if sys.version_info >= (3, 11):
+                assert exc_info.value.args == ("cleanup-cancel",)
+        assert fake_aiohttp.session is not None
+        assert fake_aiohttp.session._closed
+        assert session._pty_sessions == {}
+        assert session._reserved_pty_process_ids == set()
+
+    @pytest.mark.asyncio
+    async def test_pty_exec_start_preserves_cancellation_when_cleanup_fails(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
+        from agents.extensions.sandbox.blaxel import sandbox as mod
+
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+
+        class _FailingCleanupSession:
+            def __init__(self) -> None:
+                self._closed = False
+
+            async def ws_connect(self, url: str) -> None:
+                _ = url
+                raise asyncio.TimeoutError()
+
+            async def close(self) -> None:
+                cleanup_started.set()
+                await allow_cleanup.wait()
+                self._closed = True
+                raise RuntimeError("synthetic cleanup failure")
+
+        class _FailingCleanupAiohttp:
+            WSMsgType = _FakeAiohttp.WSMsgType
+
+            def __init__(self) -> None:
+                self.session: _FailingCleanupSession | None = None
+
+            def ClientSession(self) -> _FailingCleanupSession:
+                self.session = _FailingCleanupSession()
+                return self.session
+
+        fake_aiohttp = _FailingCleanupAiohttp()
+        session = _make_session(fake_sandbox)
+
+        with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
+            task = asyncio.create_task(session.pty_exec_start("echo", "hello"))
+            await cleanup_started.wait()
+            task.cancel()
+            allow_cleanup.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert fake_aiohttp.session is not None
+        assert fake_aiohttp.session._closed
+        assert session._pty_sessions == {}
+        assert session._reserved_pty_process_ids == set()
+
+    @pytest.mark.parametrize(
+        ("messages", "expected_output"),
+        [
+            pytest.param(
+                [
+                    _FakeWSMessage(
+                        _FakeAiohttp.WSMsgType.TEXT,
+                        json.dumps({"type": "output", "data": "hello from pty"}),
+                    )
+                ],
+                b"hello from pty",
+                id="text",
+            ),
+            pytest.param(
+                [
+                    _FakeWSMessage(
+                        _FakeAiohttp.WSMsgType.BINARY,
+                        json.dumps({"type": "output", "data": "binary-data"}).encode(),
+                    )
+                ],
+                b"binary-data",
+                id="binary",
+            ),
+            pytest.param(
+                [
+                    _FakeWSMessage(
+                        _FakeAiohttp.WSMsgType.TEXT,
+                        json.dumps({"Type": "output", "Data": "cap-data"}),
+                    )
+                ],
+                b"cap-data",
+                id="capitalized-keys",
+            ),
+            pytest.param(
+                [
+                    _FakeWSMessage(_FakeAiohttp.WSMsgType.TEXT, "not json"),
+                    _FakeWSMessage(
+                        _FakeAiohttp.WSMsgType.TEXT,
+                        json.dumps({"type": "output", "data": "valid"}),
+                    ),
+                ],
+                b"valid",
+                id="invalid-json-ignored",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_pty_exec_start_decodes_output_messages(
+        self,
+        fake_sandbox: _FakeSandboxInstance,
+        messages: list[_FakeWSMessage],
+        expected_output: bytes,
+    ) -> None:
+        from agents.extensions.sandbox.blaxel import sandbox as mod
+
+        ws = _FakeWS(messages=[*messages, _FakeWSMessage(_FakeAiohttp.WSMsgType.CLOSE, "")])
+        fake_aiohttp = _FakeAiohttp(ws=ws)
         session = _make_session(fake_sandbox)
 
         with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
             update = await session.pty_exec_start("echo", "hello", yield_time_s=0.5)
-            assert update.output is not None
-            assert b"hello from pty" in update.output
-            # process_id may be None if the reader finishes before finalize (entry.done=True).
+            assert expected_output in update.output
+
+    @pytest.mark.asyncio
+    async def test_pty_exec_start_preserves_active_session(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
+        from agents.extensions.sandbox.blaxel import sandbox as mod
+
+        session = _make_session(fake_sandbox)
+        output_msg = json.dumps({"type": "output", "data": "still running"})
+        ws = _FakeWS(messages=[_FakeWSMessage(_FakeAiohttp.WSMsgType.TEXT, output_msg)])
+
+        try:
+            with patch.object(mod, "_import_aiohttp", return_value=_FakeAiohttp(ws=ws)):
+                update = await session.pty_exec_start("echo", "hello", yield_time_s=0.01)
+
+            assert b"still running" in update.output
+            assert update.process_id is not None
+            assert session._pty_sessions[update.process_id].ws is ws
+        finally:
+            await session.pty_terminate_all()
 
     @pytest.mark.asyncio
     async def test_pty_exec_start_timeout(self, fake_sandbox: _FakeSandboxInstance) -> None:
@@ -1703,7 +2011,7 @@ class TestPtyExec:
         from agents.extensions.sandbox.blaxel.sandbox import BlaxelTimeouts
 
         state = _make_state()
-        state.timeouts = BlaxelTimeouts(exec_timeout_s=1)
+        state.timeouts = BlaxelTimeouts.model_construct(exec_timeout_s=0.01)
         session = _make_session(fake_sandbox, state=state)
 
         class _SlowAiohttp:
@@ -1723,7 +2031,7 @@ class TestPtyExec:
             with pytest.raises(ExecTimeoutError) as exc_info:
                 await session.pty_exec_start("echo", "hello")
 
-        assert exc_info.value.timeout_s == 1.0
+        assert exc_info.value.timeout_s == 0.01
 
     @pytest.mark.asyncio
     async def test_pty_exec_start_connection_error(
@@ -1750,8 +2058,20 @@ class TestPtyExec:
             with pytest.raises(ExecTransportError):
                 await session.pty_exec_start("echo", "hello")
 
+    @pytest.mark.parametrize(
+        ("chars", "expected_send_count"),
+        [
+            pytest.param("input\n", 1, id="input"),
+            pytest.param("", 0, id="empty"),
+        ],
+    )
     @pytest.mark.asyncio
-    async def test_pty_write_stdin(self, fake_sandbox: _FakeSandboxInstance) -> None:
+    async def test_pty_write_stdin_sends_only_nonempty_input(
+        self,
+        fake_sandbox: _FakeSandboxInstance,
+        chars: str,
+        expected_send_count: int,
+    ) -> None:
         from agents.extensions.sandbox.blaxel import sandbox as mod
         from agents.extensions.sandbox.blaxel.sandbox import _BlaxelPtySessionEntry
 
@@ -1765,31 +2085,28 @@ class TestPtyExec:
         session._pty_sessions[1] = entry
         session._reserved_pty_process_ids.add(1)
 
-        with patch.object(mod, "_import_aiohttp", return_value=_FakeAiohttp()):
-            update = await session.pty_write_stdin(session_id=1, chars="input\n", yield_time_s=0.2)
+        try:
+            with (
+                patch.object(mod, "_import_aiohttp", return_value=_FakeAiohttp()),
+                patch.object(asyncio, "sleep", new=AsyncMock()),
+                patch.object(
+                    session,
+                    "_collect_pty_output",
+                    new=AsyncMock(return_value=(b"", None, False)),
+                ),
+            ):
+                update = await session.pty_write_stdin(
+                    session_id=1,
+                    chars=chars,
+                    yield_time_s=0.2,
+                )
+
             assert update.output is not None
-            assert len(ws._sent) == 1
-
-    @pytest.mark.asyncio
-    async def test_pty_write_stdin_empty_chars(self, fake_sandbox: _FakeSandboxInstance) -> None:
-        from agents.extensions.sandbox.blaxel import sandbox as mod
-        from agents.extensions.sandbox.blaxel.sandbox import _BlaxelPtySessionEntry
-
-        session = _make_session(fake_sandbox)
-        ws = _FakeWS()
-        entry = _BlaxelPtySessionEntry(
-            ws_session_id="empty-write",
-            ws=ws,
-            http_session=_FakeHTTPSession(ws),
-        )
-        session._pty_sessions[1] = entry
-        session._reserved_pty_process_ids.add(1)
-
-        with patch.object(mod, "_import_aiohttp", return_value=_FakeAiohttp()):
-            update = await session.pty_write_stdin(session_id=1, chars="", yield_time_s=0.2)
-            assert update.output is not None
-            # Empty chars should not send anything.
-            assert len(ws._sent) == 0
+            assert update.process_id == 1
+            assert session._pty_sessions[1] is entry
+            assert len(ws._sent) == expected_send_count
+        finally:
+            await session.pty_terminate_all()
 
     @pytest.mark.asyncio
     async def test_pty_terminate_all(self, fake_sandbox: _FakeSandboxInstance) -> None:
@@ -1825,19 +2142,6 @@ class TestPtyExec:
             assert b"something failed" in update.output
 
     @pytest.mark.asyncio
-    async def test_pty_ws_reader_binary_message(self, fake_sandbox: _FakeSandboxInstance) -> None:
-        from agents.extensions.sandbox.blaxel import sandbox as mod
-
-        output_msg = json.dumps({"type": "output", "data": "binary-data"}).encode()
-        ws = _FakeWS(messages=[_FakeWSMessage(_FakeAiohttp.WSMsgType.BINARY, output_msg)])
-        fake_aiohttp = _FakeAiohttp(ws=ws)
-        session = _make_session(fake_sandbox)
-
-        with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
-            update = await session.pty_exec_start("echo", "test", yield_time_s=0.5)
-            assert b"binary-data" in update.output
-
-    @pytest.mark.asyncio
     async def test_pty_ws_reader_close_message(self, fake_sandbox: _FakeSandboxInstance) -> None:
         from agents.extensions.sandbox.blaxel import sandbox as mod
 
@@ -1855,27 +2159,6 @@ class TestPtyExec:
         with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
             update = await session.pty_exec_start("echo", "test", yield_time_s=0.5)
             assert b"hi" in update.output
-
-    @pytest.mark.asyncio
-    async def test_pty_ws_reader_invalid_json(self, fake_sandbox: _FakeSandboxInstance) -> None:
-        from agents.extensions.sandbox.blaxel import sandbox as mod
-
-        ws = _FakeWS(
-            messages=[
-                _FakeWSMessage(_FakeAiohttp.WSMsgType.TEXT, "not json"),
-                _FakeWSMessage(
-                    _FakeAiohttp.WSMsgType.TEXT,
-                    json.dumps({"type": "output", "data": "valid"}),
-                ),
-            ]
-        )
-        fake_aiohttp = _FakeAiohttp(ws=ws)
-        session = _make_session(fake_sandbox)
-
-        with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
-            update = await session.pty_exec_start("echo", "test", yield_time_s=0.5)
-            # Invalid JSON should be silently ignored; valid output should appear.
-            assert b"valid" in update.output
 
     @pytest.mark.asyncio
     async def test_pty_ws_reader_error_type_message(
@@ -1917,6 +2200,7 @@ class TestPtyExec:
             entry=entry,
             output=b"done output",
             original_token_count=None,
+            output_closed=True,
         )
         assert result.process_id is None
         assert result.exit_code == 0
@@ -2000,32 +2284,15 @@ class TestPtyExec:
                     _FakeAiohttp.WSMsgType.TEXT,
                     json.dumps({"type": "output", "data": "quick"}),
                 ),
+                _FakeWSMessage(_FakeAiohttp.WSMsgType.CLOSE, ""),
             ]
         )
         fake_aiohttp = _FakeAiohttp(ws=ws)
         session = _make_session(fake_sandbox)
 
         with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
-            # Pass yield_time_s=None to test default (10s), but with a short timeout.
-            # We use a small timeout to not wait 10 seconds.
-            update = await session.pty_exec_start("echo", "test", yield_time_s=0.1)
+            update = await session.pty_exec_start("echo", "test")
             assert b"quick" in update.output
-
-    @pytest.mark.asyncio
-    async def test_pty_ws_reader_capital_type_keys(
-        self, fake_sandbox: _FakeSandboxInstance
-    ) -> None:
-        from agents.extensions.sandbox.blaxel import sandbox as mod
-
-        # Test the alternative capitalized key paths (Type/Data).
-        output_msg = json.dumps({"Type": "output", "Data": "cap-data"})
-        ws = _FakeWS(messages=[_FakeWSMessage(_FakeAiohttp.WSMsgType.TEXT, output_msg)])
-        fake_aiohttp = _FakeAiohttp(ws=ws)
-        session = _make_session(fake_sandbox)
-
-        with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
-            update = await session.pty_exec_start("echo", "test", yield_time_s=0.5)
-            assert b"cap-data" in update.output
 
     @pytest.mark.asyncio
     async def test_pty_max_output_tokens(self, fake_sandbox: _FakeSandboxInstance) -> None:
@@ -2033,7 +2300,12 @@ class TestPtyExec:
 
         long_output = "x" * 10000
         output_msg = json.dumps({"type": "output", "data": long_output})
-        ws = _FakeWS(messages=[_FakeWSMessage(_FakeAiohttp.WSMsgType.TEXT, output_msg)])
+        ws = _FakeWS(
+            messages=[
+                _FakeWSMessage(_FakeAiohttp.WSMsgType.TEXT, output_msg),
+                _FakeWSMessage(_FakeAiohttp.WSMsgType.CLOSE, ""),
+            ]
+        )
         fake_aiohttp = _FakeAiohttp(ws=ws)
         session = _make_session(fake_sandbox)
 
@@ -2195,15 +2467,19 @@ class TestValidateTarBytesExtra:
 class TestTarExcludeArgsWithSkipPaths:
     @pytest.mark.asyncio
     async def test_exclude_args_with_skip_paths(self, fake_sandbox: _FakeSandboxInstance) -> None:
+        from agents.extensions.sandbox.blaxel.mounts import _mount_credential_path
+
         session = _make_session(fake_sandbox)
-        session._runtime_persist_workspace_skip_relpaths = {
-            Path("node_modules"),
-            Path(".git"),
-        }
+        session.register_persist_workspace_skip_path(Path("node_modules"))
+        session.register_persist_workspace_skip_path(Path(".git"))
+        credential_path = _mount_credential_path(session, "s3fs-passwd")
+        credential_relative_path = credential_path.relative_to(Path(session.state.manifest.root))
         args = session._tar_exclude_args()
         assert len(args) > 0
         assert any("node_modules" in a for a in args)
         assert any(".git" in a for a in args)
+        assert any(credential_relative_path.as_posix() in arg for arg in args)
+        assert credential_relative_path in session._workspace_fingerprint_skip_relpaths()
 
     @pytest.mark.asyncio
     async def test_exclude_args_skips_empty_and_dot(
@@ -2290,10 +2566,11 @@ class TestCollectPtyOutputEdgeCases:
             done=True,
         )
         entry.output_chunks.append(b"final output")
-        output, token_count = await session._collect_pty_output(
+        output, token_count, output_closed = await session._collect_pty_output(
             entry=entry, yield_time_ms=100, max_output_tokens=None
         )
         assert b"final output" in output
+        assert output_closed is True
 
     @pytest.mark.asyncio
     async def test_collect_output_timeout_path(self, fake_sandbox: _FakeSandboxInstance) -> None:
@@ -2306,10 +2583,11 @@ class TestCollectPtyOutputEdgeCases:
             http_session=None,
         )
         # Very short yield time, no output, not done.
-        output, token_count = await session._collect_pty_output(
+        output, token_count, output_closed = await session._collect_pty_output(
             entry=entry, yield_time_ms=1, max_output_tokens=None
         )
         assert output == b""
+        assert output_closed is False
 
 
 # ---------------------------------------------------------------------------
@@ -2554,6 +2832,7 @@ class TestFinalCoverageGaps:
                     _FakeAiohttp.WSMsgType.TEXT,
                     json.dumps({"type": "output", "data": "pruned-test"}),
                 ),
+                _FakeWSMessage(_FakeAiohttp.WSMsgType.CLOSE, ""),
             ]
         )
         fake_aiohttp = _FakeAiohttp(ws=ws)
@@ -2587,6 +2866,7 @@ class TestFinalCoverageGaps:
                     _FakeAiohttp.WSMsgType.TEXT,
                     json.dumps({"type": "output", "data": "warn-test"}),
                 ),
+                _FakeWSMessage(_FakeAiohttp.WSMsgType.CLOSE, ""),
             ]
         )
         fake_aiohttp = _FakeAiohttp(ws=ws)
@@ -2658,6 +2938,7 @@ class TestFinalCoverageGaps:
     @pytest.mark.asyncio
     async def test_prune_returns_none_when_no_pid(self, fake_sandbox: _FakeSandboxInstance) -> None:
         """Cover line 819: prune returns None when process_id_to_prune_from_meta returns None."""
+        from agents.extensions.sandbox.blaxel import sandbox as blaxel_sandbox
         from agents.extensions.sandbox.blaxel.sandbox import _BlaxelPtySessionEntry
         from agents.sandbox.session.pty_types import PTY_PROCESSES_MAX
 
@@ -2673,10 +2954,7 @@ class TestFinalCoverageGaps:
             session._pty_sessions[i + 300] = entry
             session._reserved_pty_process_ids.add(i + 300)
 
-        with patch(
-            "agents.extensions.sandbox.blaxel.sandbox.process_id_to_prune_from_meta",
-            return_value=None,
-        ):
+        with patch.object(blaxel_sandbox, "process_id_to_prune_from_meta", return_value=None):
             result = session._prune_pty_sessions_if_needed()
             assert result is None
 
@@ -2694,10 +2972,11 @@ class TestFinalCoverageGaps:
         entry.output_chunks.append(b"some data")
 
         # yield_time_ms=1 means very short deadline, should hit deadline break.
-        output, _ = await session._collect_pty_output(
+        output, _, output_closed = await session._collect_pty_output(
             entry=entry, yield_time_ms=1, max_output_tokens=None
         )
         assert b"some data" in output
+        assert output_closed is False
 
     @pytest.mark.asyncio
     async def test_collect_output_done_with_remaining_chunks(
@@ -2717,11 +2996,12 @@ class TestFinalCoverageGaps:
         entry.output_chunks.append(b"chunk1")
         entry.output_chunks.append(b"chunk2")
 
-        output, _ = await session._collect_pty_output(
+        output, _, output_closed = await session._collect_pty_output(
             entry=entry, yield_time_ms=5000, max_output_tokens=None
         )
         assert b"chunk1" in output
         assert b"chunk2" in output
+        assert output_closed is True
 
 
 # ---------------------------------------------------------------------------
@@ -2743,14 +3023,35 @@ class _FakeMountSession:
 
     def __init__(self) -> None:
         self.exec_calls: list[tuple[tuple[str, ...], dict[str, float]]] = []
+        self.write_calls: list[tuple[Path, bytes]] = []
+        self.persist_workspace_skip_paths: list[Path] = []
+        self.credential_lifecycle_events: list[tuple[str, Path]] = []
+        self.persist_workspace_skip_error: Exception | None = None
         self._next_results: list[_FakeExecResultForMount] = []
         self._default_result = _FakeExecResultForMount()
+        self.state = MagicMock()
+        self.state.manifest = Manifest()
 
     async def exec(self, *cmd: str, timeout: float = 120) -> _FakeExecResultForMount:
         self.exec_calls.append((cmd, {"timeout": timeout}))
         if self._next_results:
             return self._next_results.pop(0)
         return self._default_result
+
+    async def write(self, path: Path, data: io.IOBase, *, user: object = None) -> None:
+        _ = user
+        payload = data.read()
+        assert isinstance(payload, bytes)
+        self.credential_lifecycle_events.append(("write", path))
+        self.write_calls.append((path, payload))
+
+    def register_persist_workspace_skip_path(self, path: Path | str) -> Path:
+        relative_path = Path(path)
+        self.credential_lifecycle_events.append(("register", relative_path))
+        if self.persist_workspace_skip_error is not None:
+            raise self.persist_workspace_skip_error
+        self.persist_workspace_skip_paths.append(relative_path)
+        return relative_path
 
     class __class__:
         __name__ = "BlaxelSandboxSession"
@@ -2853,7 +3154,6 @@ class TestMountsModule:
 
     def test_build_mount_config_unsupported(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import _build_mount_config
-        from agents.sandbox.errors import MountConfigError
 
         # Use a MagicMock with a type attribute to simulate an unsupported mount.
         mount = MagicMock()
@@ -2863,7 +3163,6 @@ class TestMountsModule:
 
     def test_assert_blaxel_session_wrong_type(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import _assert_blaxel_session
-        from agents.sandbox.errors import MountConfigError
 
         class _WrongSession:
             pass
@@ -2892,10 +3191,11 @@ class TestMountsModule:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelCloudBucketMountConfig, _mount_s3
 
         session = _FakeMountSession()
+        secret_access_key = "s3-secret-command-sentinel"
         # Simulate: which s3fs succeeds.
         session._next_results = [
             _FakeExecResultForMount(exit_code=0, stdout=b"/usr/bin/s3fs"),  # which s3fs
-            _FakeExecResultForMount(exit_code=0),  # write cred file
+            _FakeExecResultForMount(exit_code=0),  # chmod cred file
             _FakeExecResultForMount(exit_code=0),  # mkdir
             _FakeExecResultForMount(exit_code=0),  # s3fs mount
             _FakeExecResultForMount(exit_code=0),  # rm cred file
@@ -2906,13 +3206,93 @@ class TestMountsModule:
             bucket="my-bucket",
             mount_path="/mnt/s3",
             access_key_id="AKID",
-            secret_access_key="SECRET",
+            secret_access_key=secret_access_key,
             region="us-east-1",
             prefix="data/",
             read_only=True,
         )
         await _mount_s3(session, config)  # type: ignore[arg-type]
         assert len(session.exec_calls) == 5
+        assert len(session.write_calls) == 1
+        credential_path, credential_payload = session.write_calls[0]
+        assert credential_path.parent == Path("/workspace")
+        assert credential_path.name.startswith(".openai-agents-s3fs-passwd-")
+        assert credential_payload == f"AKID:{secret_access_key}".encode()
+        assert secret_access_key not in repr(session.exec_calls)
+
+    @pytest.mark.asyncio
+    async def test_mount_s3_fails_when_credential_cleanup_fails(self) -> None:
+        from agents.extensions.sandbox.blaxel.mounts import BlaxelCloudBucketMountConfig, _mount_s3
+
+        session = _FakeMountSession()
+        secret_access_key = "s3-cleanup-secret"
+        session._next_results = [
+            _FakeExecResultForMount(exit_code=0),  # which s3fs
+            _FakeExecResultForMount(exit_code=0),  # chmod credential file
+            _FakeExecResultForMount(exit_code=0),  # mkdir
+            _FakeExecResultForMount(exit_code=0),  # s3fs mount
+            _FakeExecResultForMount(exit_code=1),  # rm credential file
+        ]
+
+        config = BlaxelCloudBucketMountConfig(
+            provider="s3",
+            bucket="my-bucket",
+            mount_path="/mnt/s3",
+            access_key_id="AKID",
+            secret_access_key=secret_access_key,
+        )
+        with pytest.raises(MountConfigError, match="failed to remove mount credential file"):
+            await _mount_s3(session, config)  # type: ignore[arg-type]
+
+        assert session.exec_calls[-1][0][2].startswith("rm -f ")
+        assert secret_access_key not in repr(session.exec_calls)
+        credential_path, _credential_payload = session.write_calls[0]
+        assert session.persist_workspace_skip_paths == [
+            credential_path.relative_to(Path("/workspace"))
+        ]
+        assert [event for event, _path in session.credential_lifecycle_events] == [
+            "register",
+            "write",
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("provider", ["s3", "gcs"])
+    async def test_mount_credentials_reject_registration_before_write(self, provider: str) -> None:
+        from agents.extensions.sandbox.blaxel.mounts import (
+            BlaxelCloudBucketMountConfig,
+            _mount_gcs,
+            _mount_s3,
+        )
+
+        session = _FakeMountSession()
+        session.persist_workspace_skip_error = RuntimeError("registration rejected")
+        session._next_results = [_FakeExecResultForMount(exit_code=0)]  # which
+        if provider == "s3":
+            mount = _mount_s3
+            config = BlaxelCloudBucketMountConfig(
+                provider="s3",
+                bucket="bucket",
+                mount_path="/mnt/data",
+                access_key_id="AKID",
+                secret_access_key="SECRET",
+            )
+        else:
+            mount = _mount_gcs
+            config = BlaxelCloudBucketMountConfig(
+                provider="gcs",
+                bucket="bucket",
+                mount_path="/mnt/data",
+                service_account_key='{"private_key":"SECRET"}',
+            )
+
+        with pytest.raises(RuntimeError, match="registration rejected"):
+            await mount(session, config)  # type: ignore[arg-type]
+
+        assert [event for event, _path in session.credential_lifecycle_events] == ["register"]
+        assert session.persist_workspace_skip_paths == []
+        assert session.write_calls == []
+        assert len(session.exec_calls) == 1
+        assert session.exec_calls[0][0][2].startswith("which ")
 
     @pytest.mark.asyncio
     async def test_mount_s3_public_bucket(self) -> None:
@@ -2932,6 +3312,9 @@ class TestMountsModule:
             read_only=True,
         )
         await _mount_s3(session, config)  # type: ignore[arg-type]
+        assert len(session.exec_calls) == 3
+        assert not any(call[0][2].startswith("rm -f ") for call in session.exec_calls)
+        assert session.persist_workspace_skip_paths == []
 
     @pytest.mark.asyncio
     async def test_mount_s3_with_endpoint(self) -> None:
@@ -2978,7 +3361,6 @@ class TestMountsModule:
     @pytest.mark.asyncio
     async def test_mount_s3_fails(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelCloudBucketMountConfig, _mount_s3
-        from agents.sandbox.errors import MountConfigError
 
         session = _FakeMountSession()
         session._next_results = [
@@ -3000,9 +3382,10 @@ class TestMountsModule:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelCloudBucketMountConfig, _mount_gcs
 
         session = _FakeMountSession()
+        service_account_key = '{"private_key":"gcs-secret-command-sentinel"}'
         session._next_results = [
             _FakeExecResultForMount(exit_code=0),  # which gcsfuse
-            _FakeExecResultForMount(exit_code=0),  # write key
+            _FakeExecResultForMount(exit_code=0),  # chmod key
             _FakeExecResultForMount(exit_code=0),  # mkdir
             _FakeExecResultForMount(exit_code=0),  # gcsfuse mount
             _FakeExecResultForMount(exit_code=0),  # rm key
@@ -3012,11 +3395,111 @@ class TestMountsModule:
             provider="gcs",
             bucket="gcs-bucket",
             mount_path="/mnt/gcs",
-            service_account_key='{"type":"service_account"}',
+            service_account_key=service_account_key,
             read_only=True,
             prefix="data/",
         )
         await _mount_gcs(session, config)  # type: ignore[arg-type]
+        assert len(session.exec_calls) == 5
+        assert len(session.write_calls) == 1
+        credential_path, credential_payload = session.write_calls[0]
+        assert credential_path.parent == Path("/workspace")
+        assert credential_path.name.startswith(".openai-agents-gcs-creds-")
+        assert credential_payload == service_account_key.encode()
+        assert "gcs-secret-command-sentinel" not in repr(session.exec_calls)
+
+    @pytest.mark.asyncio
+    async def test_mount_gcs_fails_when_credential_cleanup_fails(self) -> None:
+        from agents.extensions.sandbox.blaxel.mounts import BlaxelCloudBucketMountConfig, _mount_gcs
+
+        session = _FakeMountSession()
+        service_account_key = '{"private_key":"gcs-cleanup-secret"}'
+        session._next_results = [
+            _FakeExecResultForMount(exit_code=0),  # which gcsfuse
+            _FakeExecResultForMount(exit_code=0),  # chmod credential file
+            _FakeExecResultForMount(exit_code=0),  # mkdir
+            _FakeExecResultForMount(exit_code=0),  # gcsfuse mount
+            _FakeExecResultForMount(exit_code=1),  # rm credential file
+        ]
+
+        config = BlaxelCloudBucketMountConfig(
+            provider="gcs",
+            bucket="gcs-bucket",
+            mount_path="/mnt/gcs",
+            service_account_key=service_account_key,
+        )
+        with pytest.raises(MountConfigError, match="failed to remove mount credential file"):
+            await _mount_gcs(session, config)  # type: ignore[arg-type]
+
+        assert session.exec_calls[-1][0][2].startswith("rm -f ")
+        assert "gcs-cleanup-secret" not in repr(session.exec_calls)
+        credential_path, _credential_payload = session.write_calls[0]
+        assert session.persist_workspace_skip_paths == [
+            credential_path.relative_to(Path("/workspace"))
+        ]
+        assert [event for event, _path in session.credential_lifecycle_events] == [
+            "register",
+            "write",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_mount_gcs_quotes_generated_key_path(self) -> None:
+        from agents.extensions.sandbox.blaxel.mounts import BlaxelCloudBucketMountConfig, _mount_gcs
+
+        session = _FakeMountSession()
+        session.state.manifest = Manifest(root="/workspace data;echo not-executed")
+        session._next_results = [
+            _FakeExecResultForMount(exit_code=0),  # which gcsfuse
+            _FakeExecResultForMount(exit_code=0),  # chmod key
+            _FakeExecResultForMount(exit_code=0),  # mkdir
+            _FakeExecResultForMount(exit_code=0),  # gcsfuse mount
+            _FakeExecResultForMount(exit_code=0),  # rm key
+        ]
+
+        config = BlaxelCloudBucketMountConfig(
+            provider="gcs",
+            bucket="gcs-bucket",
+            mount_path="/mnt/gcs",
+            service_account_key='{"private_key":"gcs-secret"}',
+        )
+        await _mount_gcs(session, config)  # type: ignore[arg-type]
+
+        credential_path, _credential_payload = session.write_calls[0]
+        mount_command = session.exec_calls[3][0][2]
+        assert f"--key-file={credential_path.as_posix()}" in shlex.split(mount_command)
+        assert "echo" not in shlex.split(mount_command)
+
+    @pytest.mark.asyncio
+    async def test_mount_gcs_aborts_and_cleans_up_when_credential_chmod_fails(self) -> None:
+        from agents.extensions.sandbox.blaxel.mounts import BlaxelCloudBucketMountConfig, _mount_gcs
+
+        session = _FakeMountSession()
+        service_account_key = '{"private_key":"gcs-chmod-secret"}'
+        session._next_results = [
+            _FakeExecResultForMount(exit_code=0),  # which gcsfuse
+            _FakeExecResultForMount(exit_code=1),  # chmod key
+            _FakeExecResultForMount(exit_code=0),  # rm key
+        ]
+
+        config = BlaxelCloudBucketMountConfig(
+            provider="gcs",
+            bucket="gcs-bucket",
+            mount_path="/mnt/gcs",
+            service_account_key=service_account_key,
+        )
+        with pytest.raises(
+            MountConfigError,
+            match="failed to restrict mount credential file permissions",
+        ):
+            await _mount_gcs(session, config)  # type: ignore[arg-type]
+
+        commands = [call[0][2] for call in session.exec_calls]
+        assert len(session.write_calls) == 1
+        assert any(command.startswith("chmod 600 ") for command in commands)
+        assert any(command.startswith("rm -f ") for command in commands)
+        assert not any(command.startswith("mkdir -p ") for command in commands)
+        assert not any(command.startswith("gcsfuse ") for command in commands)
+        assert "gcs-chmod-secret" not in repr(session.exec_calls)
 
     @pytest.mark.asyncio
     async def test_mount_gcs_anonymous(self) -> None:
@@ -3035,11 +3518,13 @@ class TestMountsModule:
             mount_path="/mnt/pub-gcs",
         )
         await _mount_gcs(session, config)  # type: ignore[arg-type]
+        assert len(session.exec_calls) == 3
+        assert not any(call[0][2].startswith("rm -f ") for call in session.exec_calls)
+        assert session.persist_workspace_skip_paths == []
 
     @pytest.mark.asyncio
     async def test_mount_gcs_fails(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelCloudBucketMountConfig, _mount_gcs
-        from agents.sandbox.errors import MountConfigError
 
         session = _FakeMountSession()
         session._next_results = [
@@ -3149,7 +3634,6 @@ class TestMountsModule:
     @pytest.mark.asyncio
     async def test_install_tool_fails_after_retries(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import _install_tool
-        from agents.sandbox.errors import MountConfigError
 
         session = _FakeMountSession()
         session._next_results = [
@@ -3208,6 +3692,44 @@ class TestMountsModule:
         assert result == []
 
     @pytest.mark.asyncio
+    async def test_activate_preserves_safe_credential_cleanup_error(self) -> None:
+        from agents.extensions.sandbox.blaxel.mounts import BlaxelCloudBucketMountStrategy
+        from agents.sandbox.entries import S3Mount
+
+        strategy = BlaxelCloudBucketMountStrategy()
+        mount = S3Mount(
+            bucket="test",
+            access_key_id="AKID",
+            secret_access_key="s3-cleanup-secret",
+            mount_strategy=strategy,
+        )
+        session = _FakeMountSession()
+        session.state.manifest = Manifest(
+            entries={"data": mount}
+        ).with_in_container_mount_credential_exposure_acknowledged("data")
+        session._next_results = [
+            _FakeExecResultForMount(exit_code=0),  # which
+            _FakeExecResultForMount(exit_code=0),  # chmod credential file
+            _FakeExecResultForMount(exit_code=0),  # mkdir
+            _FakeExecResultForMount(exit_code=0),  # mount
+            _FakeExecResultForMount(exit_code=1),  # rm credential file
+        ]
+        mount._resolve_mount_path = lambda s, d: Path("/workspace/data")  # type: ignore[assignment]
+
+        with pytest.raises(
+            MountConfigError,
+            match="failed to remove mount credential file",
+        ):
+            await strategy.activate(
+                mount,
+                session,  # type: ignore[arg-type]
+                Path("/workspace/data"),
+                Path("/workspace"),
+            )
+
+        assert "s3-cleanup-secret" not in repr(session.exec_calls)
+
+    @pytest.mark.asyncio
     async def test_deactivate(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelCloudBucketMountStrategy
         from agents.sandbox.entries import S3Mount
@@ -3257,6 +3779,41 @@ class TestMountsModule:
             session,  # type: ignore[arg-type]
             Path("/workspace/mnt/s3"),
         )
+
+    @pytest.mark.asyncio
+    async def test_restore_preserves_cleanup_error_over_mount_error(self) -> None:
+        from agents.extensions.sandbox.blaxel.mounts import BlaxelCloudBucketMountStrategy
+        from agents.sandbox.entries import GCSMount
+
+        strategy = BlaxelCloudBucketMountStrategy()
+        mount = GCSMount(
+            bucket="test",
+            service_account_credentials='{"private_key":"gcs-cleanup-secret"}',
+            mount_strategy=strategy,
+        )
+        session = _FakeMountSession()
+        session.state.manifest = Manifest(
+            entries={"data": mount}
+        ).with_in_container_mount_credential_exposure_acknowledged("data")
+        session._next_results = [
+            _FakeExecResultForMount(exit_code=0),  # which
+            _FakeExecResultForMount(exit_code=0),  # chmod credential file
+            _FakeExecResultForMount(exit_code=0),  # mkdir
+            _FakeExecResultForMount(exit_code=1, stderr=b"mount failed"),  # mount
+            _FakeExecResultForMount(exit_code=1),  # rm credential file
+        ]
+
+        with pytest.raises(
+            MountConfigError,
+            match="failed to remove mount credential file",
+        ):
+            await strategy.restore_after_snapshot(
+                mount,
+                session,  # type: ignore[arg-type]
+                Path("/workspace/data"),
+            )
+
+        assert "gcs-cleanup-secret" not in repr(session.exec_calls)
 
 
 # ---------------------------------------------------------------------------
@@ -3508,7 +4065,6 @@ class TestDriveMounts:
     @pytest.mark.asyncio
     async def test_attach_drive_error(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelDriveMountConfig, _attach_drive
-        from agents.sandbox.errors import MountConfigError
 
         sandbox = _FakeSandboxInstance()
         sandbox.drives.mount_error = RuntimeError("mount api error")
@@ -3521,7 +4077,6 @@ class TestDriveMounts:
     @pytest.mark.asyncio
     async def test_attach_drive_no_drives_api(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelDriveMountConfig, _attach_drive
-        from agents.sandbox.errors import MountConfigError
 
         class _NoDrives:
             pass
@@ -3594,7 +4149,6 @@ class TestDriveMounts:
     @pytest.mark.asyncio
     async def test_drive_strategy_validate_wrong_mount_type(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelDriveMountStrategy
-        from agents.sandbox.errors import MountConfigError
 
         strategy = BlaxelDriveMountStrategy()
         mount = MagicMock()
@@ -3605,7 +4159,6 @@ class TestDriveMounts:
     @pytest.mark.asyncio
     async def test_drive_strategy_validate_non_drive_mount(self) -> None:
         from agents.extensions.sandbox.blaxel.mounts import BlaxelDriveMountStrategy
-        from agents.sandbox.errors import MountConfigError
 
         strategy = BlaxelDriveMountStrategy()
         mount = MagicMock()
@@ -3628,18 +4181,59 @@ class TestDriveMounts:
 
 class TestUnmountBucketLogging:
     @pytest.mark.asyncio
-    async def test_unmount_all_attempts_fail_logs_warning(self) -> None:
+    @pytest.mark.parametrize(
+        ("model_redacted", "tool_redacted"),
+        [(False, True), (True, True), (False, False), (True, False)],
+    )
+    async def test_unmount_all_attempts_follow_tool_data_policy(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        model_redacted: bool,
+        tool_redacted: bool,
+    ) -> None:
         from agents.extensions.sandbox.blaxel.mounts import _unmount_bucket
 
+        mount_path = "/mnt/SECRET_BUCKET_PATH"
         session = _FakeMountSession()
         session._next_results = [
             _FakeExecResultForMount(exit_code=1),  # fusermount fails
             _FakeExecResultForMount(exit_code=1),  # umount fails
             _FakeExecResultForMount(exit_code=1),  # umount -l fails
         ]
+        monkeypatch.setattr(_debug, "DONT_LOG_MODEL_DATA", model_redacted)
+        monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", tool_redacted)
+        caplog.set_level(logging.DEBUG, logger="agents.extensions.sandbox.blaxel.mounts")
+
         # Should not raise, just log warning.
-        await _unmount_bucket(session, "/mnt/test")  # type: ignore[arg-type]
+        await _unmount_bucket(session, mount_path)  # type: ignore[arg-type]
+
         assert len(session.exec_calls) == 3
+        records = [
+            record
+            for record in caplog.records
+            if record.name == "agents.extensions.sandbox.blaxel.mounts"
+        ]
+        assert len(records) == 3
+        assert [record.levelno for record in records] == [
+            logging.DEBUG,
+            logging.DEBUG,
+            logging.WARNING,
+        ]
+        for record in records:
+            assert record.exc_info is None
+            assert record.exc_text is None
+            assert all(value is not mount_path for value in record.__dict__.values())
+
+        rendered = [logging.Formatter().format(record) for record in records]
+        if tool_redacted:
+            assert all(mount_path not in message for message in rendered)
+            assert [record.args for record in records] == [(1,), (1,), (1,)]
+        else:
+            assert all(mount_path in message for message in rendered)
+            for record in records:
+                assert isinstance(record.args, tuple)
+                assert mount_path in record.args
 
 
 # ---------------------------------------------------------------------------

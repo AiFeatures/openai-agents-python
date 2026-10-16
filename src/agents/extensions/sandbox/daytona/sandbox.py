@@ -27,12 +27,14 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, Field
 
 from ....logger import log_tool_action_debug
+from ....sandbox._mount_security import redact_mount_error_data
 from ....sandbox.entries import Mount
 from ....sandbox.errors import (
     ExecTimeoutError,
     ExecTransportError,
     ExposedPortUnavailableError,
     InvalidManifestPathError as InvalidManifestPathError,
+    SandboxError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
     WorkspaceReadNotFoundError,
@@ -42,6 +44,7 @@ from ....sandbox.errors import (
 from ....sandbox.manifest import Manifest
 from ....sandbox.session import SandboxSession, SandboxSessionState
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
+from ....sandbox.session.bounded_read import collect_bounded
 from ....sandbox.session.dependencies import Dependencies
 from ....sandbox.session.manager import Instrumentation
 from ....sandbox.session.pty_output import collect_pty_output
@@ -386,8 +389,8 @@ class _DaytonaPtySessionEntry:
     output_chunks: deque[bytes] = field(default_factory=deque)
     output_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     output_notify: asyncio.Event = field(default_factory=asyncio.Event)
+    output_closed: asyncio.Event = field(default_factory=asyncio.Event)
     last_used: float = field(default_factory=time.monotonic)
-    done: bool = False
     exit_code: int | None = None
     worker_task: asyncio.Task[None] | None = None
 
@@ -754,7 +757,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
             )
 
         yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
+        output, original_token_count, output_closed = await self._collect_pty_output(
             entry=entry,
             yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
             max_output_tokens=max_output_tokens,
@@ -764,6 +767,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
             entry=entry,
             output=output,
             original_token_count=original_token_count,
+            output_closed=output_closed,
         )
 
     async def _run_pty_waiter(self, entry: _DaytonaPtySessionEntry) -> None:
@@ -775,7 +779,10 @@ class DaytonaSandboxSession(BaseSandboxSession):
         except Exception:
             pass
         finally:
-            entry.done = True
+            # AsyncPtyHandle.wait() completes only after its WebSocket reader exits.
+            # That reader awaits every async on_data callback before it can finish,
+            # so this is Daytona's authoritative output-stream close boundary.
+            entry.output_closed.set()
             entry.output_notify.set()
 
     async def _run_session_reader(
@@ -800,11 +807,13 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 cmd = await self._sandbox.process.get_session_command(session_id, cmd_id)
                 if cmd.exit_code is not None:
                     entry.exit_code = int(cmd.exit_code)
-                    entry.done = True
             except Exception:
                 pass
-            if not logs_failed:
-                entry.done = True
+            # Once the log callback stream has returned, or has failed after the
+            # provider reports a final exit code, this worker is the only output
+            # producer and no later callback can append bytes.
+            if not logs_failed or entry.exit_code is not None:
+                entry.output_closed.set()
             entry.output_notify.set()
 
     async def pty_write_stdin(
@@ -831,7 +840,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
             await asyncio.sleep(0.1)
 
         yield_time_ms = 250 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
+        output, original_token_count, output_closed = await self._collect_pty_output(
             entry=entry,
             yield_time_ms=resolve_pty_write_yield_time_ms(
                 yield_time_ms=yield_time_ms, input_empty=chars == ""
@@ -844,6 +853,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
             entry=entry,
             output=output,
             original_token_count=original_token_count,
+            output_closed=output_closed,
         )
 
     async def _finalize_pty_update(
@@ -853,11 +863,12 @@ class DaytonaSandboxSession(BaseSandboxSession):
         entry: _DaytonaPtySessionEntry,
         output: bytes,
         original_token_count: int | None,
+        output_closed: bool,
     ) -> PtyExecUpdate:
-        exit_code = entry.exit_code if entry.done else None
+        exit_code = entry.exit_code if output_closed else None
         live_process_id: int | None = process_id
 
-        if entry.done:
+        if output_closed:
             async with self._pty_lock:
                 removed = self._pty_sessions.pop(process_id, None)
                 self._reserved_pty_process_ids.discard(process_id)
@@ -886,12 +897,12 @@ class DaytonaSandboxSession(BaseSandboxSession):
         entry: _DaytonaPtySessionEntry,
         yield_time_ms: int,
         max_output_tokens: int | None,
-    ) -> tuple[bytes, int | None]:
+    ) -> tuple[bytes, int | None, bool]:
         return await collect_pty_output(
             output_chunks=entry.output_chunks,
             output_lock=entry.output_lock,
             output_notify=entry.output_notify,
-            is_done=lambda: entry.done,
+            is_done=entry.output_closed.is_set,
             yield_time_ms=yield_time_ms,
             max_output_tokens=max_output_tokens,
         )
@@ -900,7 +911,8 @@ class DaytonaSandboxSession(BaseSandboxSession):
         if len(self._pty_sessions) < PTY_PROCESSES_MAX:
             return None
         meta: list[tuple[int, float, bool]] = [
-            (pid, entry.last_used, entry.done) for pid, entry in self._pty_sessions.items()
+            (pid, entry.last_used, entry.output_closed.is_set())
+            for pid, entry in self._pty_sessions.items()
         ]
         pid = process_id_to_prune_from_meta(meta)
         if pid is None:
@@ -929,6 +941,31 @@ class DaytonaSandboxSession(BaseSandboxSession):
                     )
                 except asyncio.TimeoutError:
                     pass
+
+    async def _read_bounded(self, path: Path, *, max_bytes: int) -> bytes:
+        workspace_path = await self._validate_path_access(path)
+        # The high-level download buffers the response. The generated toolbox
+        # client exposes the same endpoint without preloading its body.
+        try:
+            response = await self._sandbox.fs._api_client.download_file_without_preload_content(
+                path=sandbox_path_str(workspace_path),
+                _request_timeout=float(self.state.timeouts.file_download_s),
+            )
+            try:
+                if response.status == 404:
+                    raise WorkspaceReadNotFoundError(path=path)
+                if response.status != 200:
+                    raise WorkspaceArchiveReadError(
+                        path=path, retryable=_DAYTONA_HTTP_STATUS_RETRYABLE.get(response.status)
+                    )
+                return await collect_bounded(response.content.iter_chunked(65536), max_bytes)
+            finally:
+                response.close()
+        except SandboxError:
+            raise
+        except Exception as error:
+            retryable, _ = _daytona_provider_retryability(error)
+            raise WorkspaceArchiveReadError(path=path, retryable=retryable) from None
 
     async def read(self, path: Path | str, *, user: str | User | None = None) -> io.IOBase:
         error_path = posix_path_as_path(coerce_posix_path(path))
@@ -1195,7 +1232,9 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
         AsyncDaytona, DaytonaConfig, _, _ = _import_daytona_sdk()
         config = DaytonaConfig(api_key=api_key, api_url=api_url) if (api_key or api_url) else None
         self._daytona = AsyncDaytona(config)
-        self._instrumentation = instrumentation or Instrumentation()
+        self._instrumentation = (
+            instrumentation if instrumentation is not None else Instrumentation()
+        )
         self._dependencies = dependencies
 
     async def _build_create_params(
@@ -1246,6 +1285,7 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
             auto_stop_interval=auto_stop_interval,
         )
 
+    @redact_mount_error_data
     async def create(
         self,
         *,
@@ -1255,6 +1295,7 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
     ) -> SandboxSession:
         if manifest is None:
             manifest = Manifest(root=DEFAULT_DAYTONA_WORKSPACE_ROOT)
+        self._validate_manifest_for_create(manifest)
 
         timeouts_in = options.timeouts
         if isinstance(timeouts_in, DaytonaSandboxTimeouts):
@@ -1320,12 +1361,14 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
             pass
         return session
 
+    @redact_mount_error_data
     async def resume(
         self,
         state: SandboxSessionState,
     ) -> SandboxSession:
         if not isinstance(state, DaytonaSandboxSessionState):
             raise TypeError("DaytonaSandboxClient.resume expects a DaytonaSandboxSessionState")
+        state.assert_path_grants_rebound()
 
         daytona_sandbox = None
         reconnected = False
@@ -1357,7 +1400,7 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
     def deserialize_session_state(self, payload: dict[str, object]) -> SandboxSessionState:
-        return DaytonaSandboxSessionState.model_validate(payload)
+        return self._deserialize_session_state_payload(payload, DaytonaSandboxSessionState)
 
 
 __all__ = [

@@ -10,6 +10,9 @@ from ..handoffs import (
 from ..items import (
     HandoffCallItem,
     HandoffOutputItem,
+    MCPApprovalRequestItem,
+    MCPApprovalResponseItem,
+    MCPListToolsItem,
     ReasoningItem,
     RunItem,
     ToolApprovalItem,

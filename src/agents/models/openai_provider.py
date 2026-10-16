@@ -5,8 +5,8 @@ import os
 import weakref
 from typing import Any
 
-import httpx
-from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+import httpx2
+from openai import AsyncOpenAI, DefaultAsyncHttpx2Client
 
 from ..exceptions import UserError
 from . import _openai_shared
@@ -24,21 +24,21 @@ from .openai_responses import (
     OpenAIResponsesWSModel,
 )
 
-# This is kept for backward compatiblity but using get_default_model() method is recommended.
+# This is kept for backward compatibility but using get_default_model() method is recommended.
 DEFAULT_MODEL: str = "gpt-4o"
 
 
-_http_client: httpx.AsyncClient | None = None
+_http_client: httpx2.AsyncClient | None = None
 _WSModelCacheKey = tuple[str, bool]
 _WSLoopModelCache = dict[_WSModelCacheKey, Model]
 
 
-# If we create a new httpx client for each request, that would mean no sharing of connection pools,
+# If we create a new HTTP client for each request, that would mean no sharing of connection pools,
 # which would mean worse latency and resource usage. So, we share the client across requests.
-def shared_http_client() -> httpx.AsyncClient:
+def shared_http_client() -> httpx2.AsyncClient:
     global _http_client
     if _http_client is None:
-        _http_client = DefaultAsyncHttpxClient()
+        _http_client = DefaultAsyncHttpx2Client()
     return _http_client
 
 
@@ -88,10 +88,13 @@ class OpenAIProvider(ModelProvider):
                 chunk semantics are not reliable enough for incremental processing.
         """
         if openai_client is not None:
-            if api_key is not None or base_url is not None or websocket_base_url is not None:
+            if any(
+                value is not None
+                for value in (api_key, base_url, websocket_base_url, organization, project)
+            ):
                 raise UserError(
-                    "Don't provide api_key, base_url, or websocket_base_url if you provide "
-                    "openai_client"
+                    "Don't provide api_key, base_url, websocket_base_url, organization, or project "
+                    "if you provide openai_client"
                 )
             self._client: AsyncOpenAI | None = openai_client
         else:
@@ -134,15 +137,42 @@ class OpenAIProvider(ModelProvider):
     # AsyncOpenAI() raises an error if you don't have an API key set.
     def _get_client(self) -> AsyncOpenAI:
         if self._client is None:
-            self._client = _openai_shared.get_default_openai_client() or AsyncOpenAI(
-                api_key=self._stored_api_key or _openai_shared.get_default_openai_key(),
-                base_url=self._stored_base_url or os.getenv("OPENAI_BASE_URL"),
-                websocket_base_url=(
-                    self._stored_websocket_base_url or os.getenv("OPENAI_WEBSOCKET_BASE_URL")
-                ),
-                organization=self._stored_organization,
-                project=self._stored_project,
-                http_client=shared_http_client(),
+            has_explicit_client_options = any(
+                value is not None
+                for value in (
+                    self._stored_api_key,
+                    self._stored_base_url,
+                    self._stored_websocket_base_url,
+                    self._stored_organization,
+                    self._stored_project,
+                )
+            )
+            default_client = (
+                None if has_explicit_client_options else _openai_shared.get_default_openai_client()
+            )
+            self._client = (
+                default_client
+                if default_client is not None
+                else AsyncOpenAI(
+                    api_key=(
+                        self._stored_api_key
+                        if self._stored_api_key is not None
+                        else _openai_shared.get_default_openai_key()
+                    ),
+                    base_url=(
+                        self._stored_base_url
+                        if self._stored_base_url is not None
+                        else os.getenv("OPENAI_BASE_URL")
+                    ),
+                    websocket_base_url=(
+                        self._stored_websocket_base_url
+                        if self._stored_websocket_base_url is not None
+                        else os.getenv("OPENAI_WEBSOCKET_BASE_URL")
+                    ),
+                    organization=self._stored_organization,
+                    project=self._stored_project,
+                    http_client=shared_http_client(),
+                )
             )
 
         return self._client

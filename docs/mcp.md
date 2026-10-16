@@ -9,6 +9,10 @@ context to language models. From the official documentation:
 
 The Agents Python SDK understands multiple MCP transports. This lets you reuse existing MCP servers or build your own to expose filesystem, HTTP, or connector backed tools to an agent.
 
+!!! warning "Trust MCP servers before connecting"
+
+    MCP tools can expose data from the model context and perform actions with the credentials you provide. Connect only to servers you trust, use least-privilege credentials, keep access tokens in authorization fields or headers rather than URLs, and require approval for sensitive operations. See the [OpenAI MCP security guidance](https://developers.openai.com/api/docs/guides/tools-connectors-mcp#risks-and-safety).
+
 ## Choosing an MCP integration
 
 Before wiring an MCP server into an agent decide where the tool calls should execute and which transports you can reach. The matrix below summarises the options that the Python SDK supports.
@@ -21,6 +25,36 @@ Before wiring an MCP server into an agent decide where the tool calls should exe
 | Launch a local process and communicate over stdin/stdout                             | **stdio MCP servers** via [`MCPServerStdio`][agents.mcp.server.MCPServerStdio] |
 
 The sections below walk through each option, how to configure it, and when to prefer one transport over another.
+
+For a remote MCP server, obtain the endpoint URL and authentication requirements from the server provider's documentation. You can also find published servers in the [official MCP Registry](https://registry.modelcontextprotocol.io/). Configure the SDK with the provider's MCP endpoint URL, which may differ from the provider's website URL.
+
+## MCP Python SDK v1 and v2
+
+The Agents SDK supports both major versions of the `mcp` Python package through the dependency range `mcp>=1.19.0,<3`. The installed `mcp` package version is separate from the MCP protocol version negotiated with a server. The Agents SDK detects the installed package major version and adapts stdio, SSE, and Streamable HTTP connections automatically, so ordinary server configuration does not need a version switch.
+
+When MCP Python SDK v2 is installed, the Agents SDK creates the v2 `mcp.Client` with `mode="auto"` around the configured local transport. The client first sends a `server/discover` probe at the newest protocol version supported by the installed MCP SDK. A modern server answers the probe, and the client adopts the result. If an older server does not support `server/discover`, the client falls back to the legacy `initialize` handshake and uses the protocol version negotiated there. Installing MCP Python SDK v2 therefore does not force every connection to use the newest MCP protocol version. See the MCP Python SDK's [protocol version negotiation guide](https://py.sdk.modelcontextprotocol.io/protocol-versions/).
+
+Most applications should let their dependency resolver select a compatible version. If your application must stay on one major version, add an explicit constraint alongside `openai-agents`:
+
+```bash
+# MCP Python SDK v1
+pip install "mcp>=1.19.0,<2"
+
+# MCP Python SDK v2
+pip install "mcp>=2,<3"
+```
+
+HTTP transport customization must use the HTTP stack owned by the installed MCP package:
+
+| Customization | MCP Python SDK v1 | MCP Python SDK v2 |
+| --- | --- | --- |
+| `params["auth"]` | `httpx.Auth` | `httpx2.Auth` |
+| `params["httpx_client_factory"]` return value | `httpx.AsyncClient` | `httpx2.AsyncClient` |
+| `MCPServerStreamableHttp` `params["ignore_initialized_notification_failure"] = True` | Supported | Not supported; rejected before connecting |
+
+Use an `Authorization` header when possible, as shown in the Streamable HTTP example below; an `Authorization` header works unchanged with both package versions. When an application supplies `params["auth"]` or `params["httpx_client_factory"]`, those values must use the HTTP types for the installed `mcp` package major version. When an application sets `MCPServerStreamableHttp`'s `params["ignore_initialized_notification_failure"] = True`, the application must keep `mcp<2` or disable the option before upgrading.
+
+These local `mcp` dependency requirements do not apply to [`HostedMCPTool`][agents.tool.HostedMCPTool] because the OpenAI Responses API owns the remote MCP connection.
 
 ## Agent-level MCP configuration
 
@@ -50,7 +84,7 @@ Notes:
 - `failure_error_function` controls how MCP tool call failures are surfaced to the model.
 - When `failure_error_function` is unset, the SDK uses the default tool error formatter.
 - Server-level `failure_error_function` overrides `Agent.mcp_config["failure_error_function"]` for that server.
-- `include_server_in_tool_names` is opt-in. When enabled, each local MCP tool is exposed to the model with a deterministic server-prefixed name, which helps avoid collisions when multiple MCP servers publish tools with the same name. Generated names are ASCII-safe, stay within the function-tool name length limit, and avoid existing local function tool and enabled handoff names on the same agent. The SDK still invokes the original MCP tool name on the original server.
+- `include_server_in_tool_names` is opt-in. When enabled, each local MCP tool is exposed to the model with a deterministic server-prefixed name, which helps avoid collisions when multiple MCP servers publish tools with the same name. Generated names are ASCII-safe, stay within the name-length limit for `FunctionTool` instances, and do not collide with the configured names of local `FunctionTool` instances or enabled handoffs on the same agent. The SDK still invokes the original MCP tool name on the original server.
 
 ## Shared patterns across transports
 
@@ -77,6 +111,7 @@ import asyncio
 
 from agents import Agent, HostedMCPTool, Runner
 
+
 async def main() -> None:
     agent = Agent(
         name="Assistant",
@@ -98,6 +133,7 @@ async def main() -> None:
         "Which language is the repository openai/openai-agents-python written in?",
     )
     print(result.final_output)
+
 
 asyncio.run(main())
 ```
@@ -128,10 +164,12 @@ from agents import MCPToolApprovalFunctionResult, MCPToolApprovalRequest
 
 SAFE_TOOLS = {"read_wiki_structure", "read_wiki_contents", "ask_question"}
 
+
 def approve_tool(request: MCPToolApprovalRequest) -> MCPToolApprovalFunctionResult:
     if request.data.name in SAFE_TOOLS:
         return {"approve": True}
     return {"approve": False, "reason": "Escalate to a human reviewer"}
+
 
 agent = Agent(
     name="Assistant",
@@ -183,6 +221,7 @@ from agents import Agent, Runner
 from agents.mcp import MCPServerStreamableHttp
 from agents.model_settings import ModelSettings
 
+
 async def main() -> None:
     token = os.environ["MCP_SERVER_TOKEN"]
     async with MCPServerStreamableHttp(
@@ -205,12 +244,13 @@ async def main() -> None:
         result = await Runner.run(agent, "Add 7 and 22.")
         print(result.final_output)
 
+
 asyncio.run(main())
 ```
 
 The constructor accepts additional options:
 
-- `client_session_timeout_seconds` controls HTTP read timeouts.
+- `client_session_timeout_seconds` controls MCP ClientSession read timeouts. Positive finite values representable by `datetime.timedelta` and at least one microsecond set a finite timeout; `None` and `0` disable it. Other values are rejected when the server is constructed.
 - `use_structured_content` toggles whether `tool_result.structured_content` is preferred over textual output.
 - `max_retry_attempts` and `retry_backoff_seconds_base` add automatic retries for `list_tools()` and `call_tool()`.
 - `tool_filter` lets you expose only a subset of tools (see [Tool filtering](#tool-filtering)).
@@ -225,9 +265,10 @@ The constructor accepts additional options:
 Supported forms:
 
 - `"always"` or `"never"` for all tools.
-- `True` / `False` (equivalent to always/never).
+- `True` requires approval for all tools, and `False` requires approval for none (equivalent to `"always"` and `"never"`, respectively).
 - A per-tool map, for example `{"delete_file": "always", "read_file": "never"}`.
 - A grouped object: `{"always": {"tool_names": [...]}, "never": {"tool_names": [...]}}`.
+- A synchronous or asynchronous callable with the signature `(run_context, agent, tool) -> bool | Awaitable[bool]`. Return `True` to require approval or `False` to allow the call without approval.
 
 ```python
 async with MCPServerStreamableHttp(
@@ -237,6 +278,12 @@ async with MCPServerStreamableHttp(
 ) as server:
     ...
 ```
+
+The callable receives the current `RunContextWrapper`, the agent, and the original MCP SDK `Tool`, including `tool.annotations`. The callable can use application context or tool metadata to decide whether approval is required. Server-provided annotations are advisory hints; use them to bypass approval only when your application trusts the server's classification.
+
+Unlike a `FunctionTool.needs_approval` callable, a local MCP `require_approval` callable does not receive the specific call's arguments or call ID.
+
+If you call `MCPUtil.to_function_tool()` directly without supplying an `agent`, a callable policy is not invoked and the converted tool requires approval. This fail-closed fallback applies to legacy direct conversion calls.
 
 For a full pause/resume flow, see [Human-in-the-loop](human_in_the_loop.md) and `examples/mcp/get_all_mcp_tools_example/main.py`.
 
@@ -265,9 +312,9 @@ server = MCPServerStreamableHttp(
 
 If your run context is a Pydantic model, dataclass, or custom class, read the tenant ID with attribute access instead.
 
-### MCP tool outputs: text and images
+### MCP tool outputs: text, images, and other content
 
-When an MCP tool returns image content, the SDK maps it to image tool output entries automatically. Mixed text/image responses are forwarded as a list of output items, so agents can consume MCP image results the same way they consume image output from regular function tools.
+When an MCP result uses its content blocks, the SDK forwards text content as text output and maps image content to image-type entries in the tool output. For other MCP content block types, including audio and resource blocks, the SDK forwards a text output whose value is the block's valid JSON serialization. Responses that contain multiple content blocks are forwarded as a list of output items. If `use_structured_content=True` selects a non-empty, non-error `structuredContent` payload, that structured payload takes precedence over these content blocks. Missing or empty structured content falls back to the content blocks.
 
 ## 3. HTTP with SSE MCP servers
 
@@ -278,7 +325,6 @@ When an MCP tool returns image content, the SDK maps it to image tool output ent
 If the MCP server implements the HTTP with SSE transport, instantiate [`MCPServerSse`][agents.mcp.server.MCPServerSse]. Apart from the transport, the API is identical to the Streamable HTTP server.
 
 ```python
-
 from agents import Agent, Runner
 from agents.model_settings import ModelSettings
 from agents.mcp import MCPServerSse
@@ -332,7 +378,7 @@ async with MCPServerStdio(
 
 ## 5. MCP server manager
 
-When you have multiple MCP servers, use `MCPServerManager` to connect them up front and expose the connected subset to your agents. See the [MCPServerManager API reference](ref/mcp/manager.md) for constructor options and reconnect behavior.
+When you have multiple MCP servers, use `MCPServerManager` to connect them up front and expose the successfully connected subset of those servers to your agents. See the [MCPServerManager API reference](ref/mcp/manager.md) for constructor options and reconnect behavior.
 
 ```python
 from agents import Agent, Runner
@@ -356,10 +402,12 @@ async with MCPServerManager(servers) as manager:
 Key behaviors:
 
 - `active_servers` includes only successfully connected servers when `drop_failed_servers=True` (the default).
+- If the input iterable repeats the same server object, the manager owns that server once: `all_servers` and `active_servers` contain one entry, and connection and cleanup run once for that server.
 - Failures are tracked in `failed_servers` and `errors`.
 - Set `strict=True` to raise on the first connection failure.
 - Call `reconnect(failed_only=True)` to retry failed servers, or `reconnect(failed_only=False)` to restart all servers.
-- Use `connect_timeout_seconds`, `cleanup_timeout_seconds`, and `connect_in_parallel` to tune lifecycle behavior.
+- Calls to `connect_all()`, `reconnect()`, and `cleanup_all()` are serialized. If one lifecycle operation is already running, another lifecycle operation waits for it to finish instead of connecting or cleaning up the same servers concurrently.
+- Set `connect_timeout_seconds`, `cleanup_timeout_seconds`, and `connect_in_parallel` to tune lifecycle behavior. Both lifecycle timeouts default to 10 seconds. They accept positive finite seconds, or `None` to disable them, and are validated both during construction and assignment; zero is rejected because it would create an immediate deadline.
 
 ## Common server capabilities
 
@@ -402,10 +450,12 @@ from agents.mcp import MCPServerStdio, ToolFilterContext
 
 samples_dir = Path("/path/to/files")
 
+
 async def context_aware_filter(context: ToolFilterContext, tool) -> bool:
     if context.agent.name == "Code Reviewer" and tool.name.startswith("danger_"):
         return False
     return True
+
 
 async with MCPServerStdio(
     params={
@@ -418,6 +468,39 @@ async with MCPServerStdio(
 ```
 
 The filter context exposes the active `run_context`, the `agent` requesting the tools, and the `server_name`.
+
+## Tool guardrails
+
+Local MCP server classes accept `tool_input_guardrails` and `tool_output_guardrails`. The SDK attaches these server-wide guardrails to every MCP tool that remains after filtering. Input guardrails can prevent the MCP server call and supply replacement content, while output guardrails inspect the converted MCP result before the SDK sends that result back to the model. These guardrails use the same function-tool execution pipeline, approval ordering, result tracking, and tripwire exceptions described in [Tool guardrails](guardrails.md#tool-guardrails).
+
+```python
+import json
+
+from agents import ToolGuardrailFunctionOutput
+from agents.decorators import tool_input_guardrail
+from agents.mcp import MCPServerStdio
+
+
+@tool_input_guardrail
+def block_secret_arguments(data):
+    arguments = json.loads(data.context.tool_arguments or "{}")
+    if "secret" in arguments:
+        return ToolGuardrailFunctionOutput.reject_content(
+            "Remove secrets before calling this MCP tool."
+        )
+    return ToolGuardrailFunctionOutput.allow()
+
+
+filesystem_server = MCPServerStdio(
+    params={
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+    },
+    tool_input_guardrails=[block_secret_arguments],
+)
+```
+
+This configuration applies only to tools exposed by local MCP server objects such as `MCPServerStdio`, `MCPServerSse`, and `MCPServerStreamableHttp`. It does not add client-side tool guardrails to [`HostedMCPTool`][agents.tool.HostedMCPTool], which the Responses API executes as a hosted tool.
 
 ## Prompts
 
@@ -443,9 +526,17 @@ agent = Agent(
 )
 ```
 
+## Pagination
+
+The built-in local MCP server classes automatically follow `nextCursor` when listing tools and prompts. `list_tools()` collects the complete tool list before applying filters or populating its cache, and `list_prompts()` returns one combined result with `nextCursor=None`. If a later page fails or a server repeats a cursor, the operation raises an error instead of exposing or caching partial results.
+
+Resources remain explicitly paginated. Pass the `nextCursor` from `list_resources()` or `list_resource_templates()` back as the `cursor` argument to retrieve the next page.
+
 ## Caching
 
 Every agent run calls `list_tools()` on each MCP server. Remote servers can introduce noticeable latency, so all of the MCP server classes expose a `cache_tools_list` option. Set it to `True` only if you are confident that the tool definitions do not change frequently. To force a fresh list later, call `invalidate_tools_cache()` on the server instance.
+
+When caching is enabled, each `list_tools()` result contains detached copies of the cached tool definitions, including nested input schemas. Dynamic tool-filter callbacks also inspect detached copies. Mutating a returned tool or a tool received by a filter therefore does not change the server's cached schema or later `list_tools()` results.
 
 ## Tracing
 

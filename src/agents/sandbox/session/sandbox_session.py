@@ -12,8 +12,13 @@ from typing import Any, TypeVar, cast
 
 from ...run_config import SandboxArchiveLimits, SandboxConcurrencyLimits
 from ...tracing import Span, custom_span, get_current_trace
+from .._mount_security import (
+    redact_mount_error_data,
+    validate_manifest_mount_credential_boundaries,
+)
 from ..errors import OpName, SandboxError
 from ..files import FileEntry
+from ..manifest import Manifest
 from ..materialization import MaterializationResult
 from ..types import ExecResult, ExposedPortEndpoint, User
 from .base_sandbox_session import BaseSandboxSession
@@ -229,7 +234,9 @@ class SandboxSession(BaseSandboxSession):
     ) -> None:
         self._inner = inner
         self._inner.set_dependencies(dependencies)
-        self._instrumentation = instrumentation or Instrumentation()
+        self._instrumentation = (
+            instrumentation if instrumentation is not None else Instrumentation()
+        )
         self._seq = 0
 
         self._bind_session_to_sinks()
@@ -253,6 +260,9 @@ class SandboxSession(BaseSandboxSession):
     @state.setter
     def state(self, value: SandboxSessionState) -> None:  # pragma: no cover
         self._inner.state = value
+
+    def _runtime_has_protected_mount_authority(self) -> bool:
+        return self._inner._runtime_has_protected_mount_authority()
 
     @property
     def dependencies(self) -> Dependencies:
@@ -281,9 +291,9 @@ class SandboxSession(BaseSandboxSession):
     def supports_pty(self) -> bool:
         return self._inner.supports_pty()
 
-    async def aclose(self) -> None:
+    async def _aclose_impl(self) -> None:
         try:
-            await super().aclose()
+            await super()._aclose_impl()
         finally:
             await self._instrumentation.flush()
 
@@ -518,15 +528,27 @@ class SandboxSession(BaseSandboxSession):
         await self._inner.start()
 
     @instrumented_op("stop")
+    @redact_mount_error_data
     async def stop(self) -> None:
         await self._inner.stop()
 
     @instrumented_op("shutdown")
+    @redact_mount_error_data
     async def shutdown(self) -> None:
         await self._inner.shutdown()
 
-    async def _validate_manifest_application(self, *, only_ephemeral: bool = False) -> None:
-        await self._inner._validate_manifest_application(only_ephemeral=only_ephemeral)
+    async def _validate_manifest_application(
+        self,
+        *,
+        only_ephemeral: bool = False,
+        manifest: Manifest | None = None,
+        session_running: bool | None = None,
+    ) -> None:
+        await self._inner._validate_manifest_application(
+            only_ephemeral=only_ephemeral,
+            manifest=manifest,
+            session_running=session_running,
+        )
 
     async def apply_manifest(self, *, only_ephemeral: bool = False) -> MaterializationResult:
         return await super().apply_manifest(only_ephemeral=only_ephemeral)
@@ -619,6 +641,25 @@ class SandboxSession(BaseSandboxSession):
     ) -> None:
         await self._inner.rm(path, recursive=recursive, user=user)
 
+    async def mv(
+        self,
+        source: Path | str,
+        destination: Path | str,
+        *,
+        user: str | User | None = None,
+    ) -> None:
+        await self._inner.mv(source, destination, user=user)
+
+    async def same_file(
+        self,
+        left: Path | str,
+        right: Path | str,
+        *,
+        follow_symlinks: bool = True,
+        user: str | User | None = None,
+    ) -> bool:
+        return await self._inner.same_file(left, right, follow_symlinks=follow_symlinks, user=user)
+
     async def mkdir(
         self,
         path: Path | str,
@@ -645,6 +686,13 @@ class SandboxSession(BaseSandboxSession):
     async def read(self, path: Path, *, user: str | User | None = None) -> io.IOBase:
         return await self._read(path, user=user)
 
+    async def read_bounded(self, path: Path, *, max_bytes: int) -> bytes:
+        return await self._annotate(
+            op="read",
+            start_data={**_read_start_data(self, path), "max_bytes": max_bytes},
+            run=lambda: self._inner.read_bounded(path, max_bytes=max_bytes),
+        )
+
     @instrumented_op("write", data=_write_start_data)
     async def write(
         self,
@@ -654,6 +702,19 @@ class SandboxSession(BaseSandboxSession):
         user: str | User | None = None,
     ) -> None:
         await self._inner.write(path, data, user=user)
+
+    @instrumented_op("write", data=_write_start_data)
+    async def _write_new_file(
+        self,
+        path: Path,
+        data: io.IOBase,
+        *,
+        user: str | User | None = None,
+    ) -> None:
+        # Forwarded so a backend with a native exclusive-create primitive is actually
+        # used. Without this the wrapper would fall back to the shared implementation and
+        # bypass the inner session's override.
+        await self._inner._write_new_file(path, data, user=user)
 
     @instrumented_op(
         "running",
@@ -677,14 +738,24 @@ class SandboxSession(BaseSandboxSession):
         data=_persist_start_data,
         finish_data=_persist_finish_data,
     )
+    @redact_mount_error_data
     async def persist_workspace(self) -> io.IOBase:
+        validate_manifest_mount_credential_boundaries(
+            self._inner.state.manifest,
+            provider_backend_id=self._inner.state.type,
+        )
         return await self._inner.persist_workspace()
 
     @instrumented_op(
         "hydrate_workspace",
         data=_hydrate_start_data,
     )
+    @redact_mount_error_data
     async def hydrate_workspace(self, data: io.IOBase) -> None:
+        validate_manifest_mount_credential_boundaries(
+            self._inner.state.manifest,
+            provider_backend_id=self._inner.state.type,
+        )
         await self._inner.hydrate_workspace(data)
 
 

@@ -1,8 +1,9 @@
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
-import httpx
+import httpx2
 import pytest
 from openai.types.chat.chat_completion import ChatCompletion, Choice as ChatCompletionChoice
 from openai.types.chat.chat_completion_chunk import (
@@ -33,9 +34,10 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 
-from agents import Agent, Runner, function_tool
-from agents.exceptions import ModelBehaviorError, UserError
+from agents import Agent, Runner, function_tool, trace
+from agents.exceptions import AgentsException, ModelBehaviorError, UserError
 from agents.model_settings import ModelSettings
+from agents.models.chatcmpl_converter import Converter
 from agents.models.chatcmpl_stream_handler import (
     ChatCmplStreamHandler,
     Part,
@@ -48,6 +50,8 @@ from agents.models.chatcmpl_stream_handler import (
 from agents.models.interface import ModelTracing
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.models.openai_provider import OpenAIProvider
+from agents.tracing import get_current_span
+from tests.testing_processor import fetch_ordered_spans
 from tests.utils.simple_session import SimpleListSession
 
 
@@ -80,11 +84,15 @@ async def _completion_stream(
 async def _collect_handler_events(
     *chunks: ChatCompletionChunk,
     model: str | None = None,
+    raise_on_length_truncation: bool = False,
 ) -> list[Any]:
     return [
         event
         async for event in ChatCmplStreamHandler.handle_stream(
-            _empty_response(), cast(Any, _completion_stream(*chunks)), model=model
+            _empty_response(),
+            cast(Any, _completion_stream(*chunks)),
+            model=model,
+            raise_on_length_truncation=raise_on_length_truncation,
         )
     ]
 
@@ -98,6 +106,50 @@ async def _collect_buffered_tool_call_chunks(
             _completion_stream(*chunks)
         )
     ]
+
+
+def _url_citation(
+    url: str = "https://example.com/weather",
+    title: str = "Weather",
+    start_index: int = 0,
+    end_index: int = 22,
+) -> dict[str, Any]:
+    return {
+        "type": "url_citation",
+        "url_citation": {
+            "start_index": start_index,
+            "end_index": end_index,
+            "url": url,
+            "title": title,
+        },
+    }
+
+
+def _annotated_chunk(
+    delta_payload: dict[str, Any], finish_reason: str | None = None
+) -> ChatCompletionChunk:
+    # `annotations` is not a declared field on ChoiceDelta, so it is built through
+    # model_validate to reach the object the same way a provider payload does.
+    return ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[
+            Choice(
+                index=0,
+                delta=ChoiceDelta.model_validate(delta_payload),
+                finish_reason=cast(Any, finish_reason),
+            )
+        ],
+    )
+
+
+def _streamed_annotations(events: list[Any]) -> list[dict[str, Any]]:
+    completed = cast(ResponseCompletedEvent, events[-1])
+    message = cast(ResponseOutputMessage, completed.response.output[0])
+    text_part = cast(ResponseOutputText, message.content[0])
+    return [annotation.model_dump() for annotation in text_part.annotations]
 
 
 @pytest.mark.allow_call_model_methods
@@ -131,7 +183,7 @@ async def test_stream_response_forwards_dictionary_agent_model_settings(
     class DummyClient:
         def __init__(self, completions: DummyCompletions) -> None:
             self.chat = type("_Chat", (), {"completions": completions})()
-            self.base_url = httpx.URL("https://api.openai.com/v1/")
+            self.base_url = httpx2.URL("https://api.openai.com/v1/")
 
     completions = DummyCompletions()
     model = OpenAIChatCompletionsModel(
@@ -163,7 +215,9 @@ async def test_stream_response_forwards_dictionary_agent_model_settings(
             system_instructions=None,
             input="hi",
             model_settings=agent.model_settings,
-            tools=[],
+            # parallel_tool_calls is only forwarded alongside tools, so this parity check
+            # needs a tool for that setting to reach the request.
+            tools=[function_tool(lambda: "ok", name_override="test_tool")],
             output_schema=None,
             handoffs=[],
             tracing=ModelTracing.DISABLED,
@@ -226,6 +280,7 @@ async def test_stream_response_yields_events_for_text_content(monkeypatch) -> No
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
         for c in (chunk1, chunk2):
             yield c
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="stop")])
 
     # Patch _fetch_response to inject our fake stream
     async def patched_fetch_response(self, *args, **kwargs):
@@ -353,6 +408,104 @@ async def test_stream_response_close_closes_provider_stream_with_async_close(
     assert provider_stream.close_calls == 1
 
 
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_stream_response_lets_in_flight_close_finish_after_cancellation(
+    monkeypatch,
+) -> None:
+    """Cancelling during the cleanup `aclose` continues that close instead of abandoning it."""
+    chunk = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(content="Hi"))],
+    )
+
+    class CloseSignalingChatStream:
+        """Exhausts normally, then signals from `aclose` and blocks until released."""
+
+        def __init__(self, close_started: asyncio.Event, release: asyncio.Event) -> None:
+            self._yielded = False
+            self._close_started = close_started
+            self._release = release
+            self.aclose_calls = 0
+            self.aclose_completed = 0
+
+        def __aiter__(self) -> "CloseSignalingChatStream":
+            return self
+
+        async def __anext__(self) -> ChatCompletionChunk:
+            if self._yielded:
+                raise StopAsyncIteration
+            self._yielded = True
+            return chunk
+
+        async def aclose(self) -> None:
+            self.aclose_calls += 1
+            self._close_started.set()
+            await self._release.wait()
+            self.aclose_completed += 1
+
+    close_started = asyncio.Event()
+    release = asyncio.Event()
+    provider_stream = CloseSignalingChatStream(close_started, release)
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        return _empty_response(), provider_stream
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(use_responses=False).get_model("gpt-4")
+
+    stream_agen = cast(
+        Any,
+        model.stream_response(
+            system_instructions=None,
+            input="",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
+        ),
+    )
+
+    async def consume() -> None:
+        async for _event in stream_agen:
+            pass
+
+    task = asyncio.create_task(consume())
+    try:
+        # The stream exhausts on its own, so the consumer reaches the cleanup `finally`
+        # and suspends inside the provider close.
+        await asyncio.wait_for(close_started.wait(), timeout=5)
+        assert provider_stream.aclose_calls == 1
+        assert provider_stream.aclose_completed == 0
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+
+        # The cancelled consumer must not have started a second close.
+        assert provider_stream.aclose_calls == 1
+        assert provider_stream.aclose_completed == 0
+
+        release.set()
+        for _ in range(200):
+            if provider_stream.aclose_completed == 1:
+                break
+            await asyncio.sleep(0.01)
+
+        assert provider_stream.aclose_calls == 1
+        assert provider_stream.aclose_completed == 1
+    finally:
+        release.set()
+        task.cancel()
+
+
 @pytest.mark.asyncio
 async def test_stream_handler_filters_multiple_choices_by_default(
     caplog: pytest.LogCaptureFixture,
@@ -424,7 +577,14 @@ async def test_stream_handler_keeps_empty_choice_usage_chunks() -> None:
         model="fake",
         object="chat.completion.chunk",
         choices=[],
-        usage=CompletionUsage(completion_tokens=1, prompt_tokens=2, total_tokens=3),
+        usage=CompletionUsage.model_validate(
+            {
+                "completion_tokens": 1,
+                "prompt_tokens": 2,
+                "total_tokens": 3,
+                "prompt_tokens_details": {"cached_tokens": 0},
+            }
+        ),
     )
 
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
@@ -433,7 +593,7 @@ async def test_stream_handler_keeps_empty_choice_usage_chunks() -> None:
     events = [
         event
         async for event in ChatCmplStreamHandler.handle_stream(
-            _empty_response(), cast(Any, fake_stream())
+            _empty_response(), cast(Any, fake_stream()), preserve_raw_usage=True
         )
     ]
 
@@ -443,6 +603,12 @@ async def test_stream_handler_keeps_empty_choice_usage_chunks() -> None:
     assert completed_event.response.output == []
     assert completed_event.response.usage
     assert completed_event.response.usage.total_tokens == 3
+    assert cast(Any, completed_event.response)._agents_sdk_raw_usage == {
+        "completion_tokens": 1,
+        "prompt_tokens": 2,
+        "total_tokens": 3,
+        "prompt_tokens_details": {"cached_tokens": 0},
+    }
 
 
 @pytest.mark.asyncio
@@ -625,6 +791,26 @@ def test_finish_reasoning_summary_part_clears_invalid_active_index() -> None:
 
 
 @pytest.mark.asyncio
+async def test_audio_delta_raises_like_the_sync_path() -> None:
+    """Audio output must fail loudly on the streamed path, matching the sync converter."""
+    chunk = _annotated_chunk({"content": "partial", "audio": {"id": "audio-1", "transcript": "hi"}})
+
+    with pytest.raises(AgentsException, match="Audio is not currently supported"):
+        await _collect_handler_events(chunk)
+
+
+@pytest.mark.asyncio
+async def test_buffered_audio_only_delta_raises_instead_of_completing_empty() -> None:
+    """Tool-call buffering must not swallow an audio-only delta into a silent empty run."""
+    audio_chunk = _annotated_chunk({"audio": {"id": "audio-1", "transcript": "hi"}})
+
+    buffered = ChatCmplStreamHandler.buffer_tool_call_stream(_completion_stream(audio_chunk))
+    with pytest.raises(AgentsException, match="Audio is not currently supported"):
+        async for _ in ChatCmplStreamHandler.handle_stream(_empty_response(), cast(Any, buffered)):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_buffer_tool_call_stream_preserves_empty_choice_chunks() -> None:
     chunk = ChatCompletionChunk(
         id="chunk-id",
@@ -684,6 +870,7 @@ async def test_buffer_tool_call_stream_keeps_passthrough_index_passthrough() -> 
         (ChoiceDelta.model_construct(reasoning_content="summary"), True),
         (ChoiceDelta.model_construct(reasoning="scratchpad"), True),
         (ChoiceDelta.model_construct(thinking_blocks=[{"thinking": "hidden"}]), True),
+        (ChoiceDelta.model_construct(audio={"id": "audio-1"}), True),
     ],
 )
 def test_stream_handler_detects_passthrough_delta_shapes(
@@ -730,6 +917,13 @@ async def test_stream_handler_converts_third_party_reasoning_text() -> None:
             object="chat.completion.chunk",
             choices=[Choice(index=0, delta=reasoning_delta2)],
         ),
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=ChoiceDelta(content="answer"))],
+        ),
     ]
 
     events = await _collect_handler_events(*chunks, model="third-party")
@@ -756,9 +950,121 @@ async def test_stream_handler_converts_third_party_reasoning_text() -> None:
     assert completed_reasoning_item.content
     assert cast(Any, completed_reasoning_item.content[0]).text == "think hard"
     assert completed_reasoning_item.model_dump().get("provider_data") == {
+        "_chat_completions_reasoning_field": "reasoning",
         "model": "third-party",
         "response_id": "chunk-id",
     }
+
+    replayed_messages = Converter.items_to_messages(
+        [item.model_dump() for item in completed_event.response.output],
+        model="third-party",
+    )
+    assert len(replayed_messages) == 1
+    assert replayed_messages[0]["reasoning"] == "think hard"  # type: ignore[typeddict-item]
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_ignores_non_string_plaintext_reasoning() -> None:
+    chunks = [
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=ChoiceDelta.model_construct(reasoning={"bad": 1}))],
+        ),
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=ChoiceDelta(content="answer"))],
+        ),
+    ]
+
+    events = await _collect_handler_events(*chunks, model="third-party")
+
+    assert not any(
+        event.type in {"response.reasoning_text.delta", "response.reasoning_text.done"}
+        for event in events
+    )
+    completed_event = next(event for event in events if event.type == "response.completed")
+    assert len(completed_event.response.output) == 1
+    assert isinstance(completed_event.response.output[0], ResponseOutputMessage)
+    assert completed_event.response.output[0].content[0].text == "answer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("split_across_chunks", [False, True])
+async def test_stream_handler_prefers_reasoning_content_over_plaintext_reasoning(
+    split_across_chunks: bool,
+) -> None:
+    if split_across_chunks:
+        reasoning_deltas = [
+            ChoiceDelta.model_construct(reasoning="raw"),
+            ChoiceDelta.model_construct(reasoning_content="summary"),
+        ]
+    else:
+        reasoning_deltas = [
+            ChoiceDelta.model_construct(reasoning="raw", reasoning_content="summary")
+        ]
+    chunks = [
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=delta)],
+        )
+        for delta in [*reasoning_deltas, ChoiceDelta(content="answer")]
+    ]
+
+    events = await _collect_handler_events(*chunks, model="deepseek-r1")
+    completed_event = next(event for event in events if event.type == "response.completed")
+    reasoning_item = completed_event.response.output[0]
+    assert isinstance(reasoning_item, ResponseReasoningItem)
+    assert reasoning_item.summary[0].text == "summary"
+    assert reasoning_item.content
+    assert [part.text for part in reasoning_item.content] == ["raw"]
+    assert "_chat_completions_reasoning_field" not in cast(Any, reasoning_item).provider_data
+
+    replayed_messages = Converter.items_to_messages(
+        [item.model_dump() for item in completed_event.response.output],
+        model="deepseek-r1",
+    )
+    assert len(replayed_messages) == 1
+    assert replayed_messages[0]["reasoning_content"] == "summary"  # type: ignore[typeddict-item]
+    assert "reasoning" not in replayed_messages[0]
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_prefers_later_thinking_blocks_over_plaintext_reasoning() -> None:
+    chunks = [
+        _thinking_chunk(reasoning="raw"),
+        _thinking_chunk(
+            thinking_blocks=[{"type": "thinking", "thinking": "hidden", "signature": "sig"}]
+        ),
+        _thinking_chunk(content="answer"),
+    ]
+
+    events = await _collect_handler_events(*chunks, model="anthropic/claude-4-opus")
+    completed_event = next(event for event in events if event.type == "response.completed")
+    reasoning_item = completed_event.response.output[0]
+    assert isinstance(reasoning_item, ResponseReasoningItem)
+    assert reasoning_item.content
+    assert [part.text for part in reasoning_item.content] == ["raw", "hidden"]
+    assert "_chat_completions_reasoning_field" not in cast(Any, reasoning_item).provider_data
+
+    replayed_messages = Converter.items_to_messages(
+        [item.model_dump() for item in completed_event.response.output],
+        model="anthropic/claude-4-opus",
+        preserve_thinking_blocks=True,
+    )
+    assert len(replayed_messages) == 1
+    assert replayed_messages[0]["thinking_blocks"] == [  # type: ignore[typeddict-item]
+        {"type": "thinking", "thinking": "hidden", "signature": "sig"}
+    ]
+    assert "reasoning" not in replayed_messages[0]
 
 
 @pytest.mark.asyncio
@@ -785,8 +1091,354 @@ async def test_stream_handler_preserves_thinking_blocks_with_reasoning_summary()
     assert isinstance(reasoning_item, ResponseReasoningItem)
     assert reasoning_item.summary[0].text == "summary"
     assert reasoning_item.content
-    assert cast(Any, reasoning_item.content[0]).text == "hidden one hidden two"
+    # Preserve the released normalized projection while provider_data retains exact blocks.
+    assert [cast(Any, part).text for part in reasoning_item.content] == ["hidden one hidden two"]
     assert reasoning_item.encrypted_content == "sig-2"
+    assert cast(Any, reasoning_item).provider_data["thinking_blocks"] == [
+        {"type": "thinking", "thinking": "hidden one ", "signature": "sig-1"},
+        {"type": "thinking", "thinking": "hidden two", "signature": "sig-2"},
+    ]
+
+
+def _thinking_chunk(**delta_kwargs: Any) -> ChatCompletionChunk:
+    return ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="anthropic/claude-4-opus",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta.model_construct(**delta_kwargs))],
+    )
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_segments_thinking_blocks_at_signature_deltas() -> None:
+    """A streamed block ends at its signature_delta, so each block keeps its own signature.
+
+    Anthropic streams a thinking block as a run of `thinking_delta` chunks terminated by one
+    `signature_delta`. Accumulating the text into a single scalar merged interleaved blocks and
+    kept only the last signature, which cannot be verified against the merged text on replay.
+    """
+    events = await _collect_handler_events(
+        _thinking_chunk(reasoning_content="summary"),
+        _thinking_chunk(
+            thinking_blocks=[{"type": "thinking", "thinking": "step ", "signature": ""}]
+        ),
+        _thinking_chunk(thinking_blocks=[{"type": "thinking", "thinking": "one", "signature": ""}]),
+        _thinking_chunk(
+            thinking_blocks=[{"type": "thinking", "thinking": "", "signature": "SIG-1"}]
+        ),
+        _thinking_chunk(
+            thinking_blocks=[{"type": "thinking", "thinking": "step two", "signature": ""}]
+        ),
+        _thinking_chunk(
+            thinking_blocks=[{"type": "thinking", "thinking": "", "signature": "SIG-2"}]
+        ),
+    )
+
+    completed_event = next(event for event in events if event.type == "response.completed")
+    reasoning_item = completed_event.response.output[0]
+    assert isinstance(reasoning_item, ResponseReasoningItem)
+    assert cast(Any, reasoning_item).provider_data["thinking_blocks"] == [
+        {"type": "thinking", "thinking": "step one", "signature": "SIG-1"},
+        {"type": "thinking", "thinking": "step two", "signature": "SIG-2"},
+    ]
+    assert [cast(Any, part).text for part in (reasoning_item.content or [])] == ["step onestep two"]
+    assert reasoning_item.encrypted_content == "SIG-2"
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_finalizes_thinking_blocks_before_item_done() -> None:
+    """The done event must carry the finalized item at the time it is yielded."""
+    snapshots = [
+        event.model_dump()
+        async for event in ChatCmplStreamHandler.handle_stream(
+            _empty_response(),
+            cast(
+                Any,
+                _completion_stream(
+                    _thinking_chunk(reasoning_content="summary"),
+                    _thinking_chunk(
+                        thinking_blocks=[
+                            {"type": "thinking", "thinking": "hidden", "signature": ""}
+                        ]
+                    ),
+                    _thinking_chunk(
+                        thinking_blocks=[{"type": "thinking", "thinking": "", "signature": "SIG"}]
+                    ),
+                ),
+            ),
+        )
+    ]
+
+    done_event = next(
+        event
+        for event in snapshots
+        if event["type"] == "response.output_item.done" and event["item"]["type"] == "reasoning"
+    )
+    completed_event = next(event for event in snapshots if event["type"] == "response.completed")
+    completed_reasoning_item = completed_event["response"]["output"][0]
+
+    assert done_event["item"] == completed_reasoning_item
+    assert done_event["item"]["provider_data"]["thinking_blocks"] == [
+        {"type": "thinking", "thinking": "hidden", "signature": "SIG"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_preserves_redacted_thinking_without_summary() -> None:
+    """LiteLLM emits redacted blocks without reasoning_content, so they need their own item."""
+    events = await _collect_handler_events(
+        _thinking_chunk(thinking_blocks=[{"type": "redacted_thinking", "data": "BLOB"}]),
+        _thinking_chunk(content="visible answer"),
+    )
+
+    reasoning_done_event = next(
+        event
+        for event in events
+        if event.type == "response.output_item.done"
+        and isinstance(event.item, ResponseReasoningItem)
+    )
+    assert reasoning_done_event.output_index == 0
+    assert cast(Any, reasoning_done_event.item).provider_data["thinking_blocks"] == [
+        {"type": "redacted_thinking", "data": "BLOB"}
+    ]
+
+    completed_event = next(event for event in events if event.type == "response.completed")
+    assert [item.type for item in completed_event.response.output] == ["reasoning", "message"]
+    assert cast(Any, completed_event.response.output[0]).provider_data["thinking_blocks"] == [
+        {"type": "redacted_thinking", "data": "BLOB"}
+    ]
+
+    text_events = [
+        event
+        for event in events
+        if event.type
+        in {
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.content_part.done",
+        }
+    ]
+    assert text_events
+    assert all(event.output_index == 1 and event.content_index == 0 for event in text_events)
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_places_refusal_after_redacted_thinking_item() -> None:
+    events = await _collect_handler_events(
+        _thinking_chunk(thinking_blocks=[{"type": "redacted_thinking", "data": "BLOB"}]),
+        _thinking_chunk(refusal="blocked"),
+    )
+
+    refusal_events = [
+        event
+        for event in events
+        if event.type
+        in {
+            "response.content_part.added",
+            "response.refusal.delta",
+            "response.content_part.done",
+        }
+    ]
+    assert refusal_events
+    assert all(event.output_index == 1 and event.content_index == 0 for event in refusal_events)
+
+    completed_event = next(event for event in events if event.type == "response.completed")
+    message = completed_event.response.output[1]
+    assert isinstance(message, ResponseOutputMessage)
+    assert message.content == [ResponseOutputRefusal(refusal="blocked", type="refusal")]
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_keeps_redacted_block_metadata_opaque() -> None:
+    """Additional redacted-block keys must not become normalized thinking fields."""
+    redacted_block = {
+        "type": "redacted_thinking",
+        "data": "BLOB",
+        "thinking": {"opaque": True},
+        "signature": {"opaque": True},
+    }
+
+    events = await _collect_handler_events(_thinking_chunk(thinking_blocks=[redacted_block]))
+
+    done_event = next(
+        event
+        for event in events
+        if event.type == "response.output_item.done"
+        and isinstance(event.item, ResponseReasoningItem)
+    )
+    reasoning_item = cast(ResponseReasoningItem, done_event.item)
+    assert cast(Any, reasoning_item).provider_data["thinking_blocks"] == [redacted_block]
+    assert reasoning_item.content is None
+    assert reasoning_item.encrypted_content is None
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_emits_complete_signed_thinking_only_lifecycle() -> None:
+    """Signed thinking without a summary must produce one complete reasoning item."""
+    snapshots = [
+        event.model_dump()
+        async for event in ChatCmplStreamHandler.handle_stream(
+            _empty_response(),
+            cast(
+                Any,
+                _completion_stream(
+                    _thinking_chunk(
+                        thinking_blocks=[
+                            {"type": "thinking", "thinking": "hidden", "signature": ""}
+                        ]
+                    ),
+                    _thinking_chunk(
+                        thinking_blocks=[{"type": "thinking", "thinking": "", "signature": "SIG"}]
+                    ),
+                ),
+            ),
+        )
+    ]
+
+    assert [event["type"] for event in snapshots] == [
+        "response.created",
+        "response.output_item.added",
+        "response.reasoning_text.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    assert snapshots[1]["output_index"] == 0
+    assert snapshots[2]["output_index"] == 0
+    assert snapshots[2]["text"] == "hidden"
+
+    done_item = snapshots[3]["item"]
+    assert snapshots[3]["output_index"] == 0
+    assert done_item["content"] == [{"text": "hidden", "type": "reasoning_text"}]
+    assert done_item["encrypted_content"] == "SIG"
+    assert done_item["provider_data"]["thinking_blocks"] == [
+        {"type": "thinking", "thinking": "hidden", "signature": "SIG"}
+    ]
+    assert snapshots[4]["response"]["output"] == [done_item]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    [
+        ("thinking", {"opaque": True}),
+        ("signature", {"opaque": True}),
+        ("thinking", None),
+        ("signature", None),
+    ],
+)
+async def test_stream_handler_rejects_non_string_thinking_fields(
+    field_name: str, field_value: Any
+) -> None:
+    block: dict[str, Any] = {"type": "thinking", "thinking": "", "signature": ""}
+    block[field_name] = field_value
+
+    with pytest.raises(
+        ModelBehaviorError,
+        match=rf"Expected streamed thinking block field '{field_name}' to be a string, "
+        rf"got {type(field_value).__name__}",
+    ):
+        await _collect_handler_events(_thinking_chunk(thinking_blocks=[block]))
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_ignores_explicit_null_thinking_block_type() -> None:
+    events = await _collect_handler_events(
+        _thinking_chunk(
+            thinking_blocks=[
+                {"type": None, "thinking": "hidden", "signature": "SIG"},
+            ]
+        )
+    )
+
+    completed_event = next(event for event in events if event.type == "response.completed")
+    assert completed_event.response.output == []
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_preserves_redacted_thinking_blocks() -> None:
+    """A redacted_thinking block carries neither text nor signature and was dropped entirely.
+
+    Anthropic requires redacted blocks to be replayed unmodified during tool-use continuation,
+    and the normalized content/encrypted_content pair cannot represent them.
+    """
+    events = await _collect_handler_events(
+        _thinking_chunk(reasoning_content="summary"),
+        _thinking_chunk(thinking_blocks=[{"type": "redacted_thinking", "data": "REDACTED-BLOB"}]),
+        _thinking_chunk(
+            thinking_blocks=[{"type": "thinking", "thinking": "visible", "signature": ""}]
+        ),
+        _thinking_chunk(thinking_blocks=[{"type": "thinking", "thinking": "", "signature": "SIG"}]),
+    )
+
+    completed_event = next(event for event in events if event.type == "response.completed")
+    reasoning_item = completed_event.response.output[0]
+    assert isinstance(reasoning_item, ResponseReasoningItem)
+    assert cast(Any, reasoning_item).provider_data["thinking_blocks"] == [
+        {"type": "redacted_thinking", "data": "REDACTED-BLOB"},
+        {"type": "thinking", "thinking": "visible", "signature": "SIG"},
+    ]
+    # The redacted block contributes no reasoning_text and no signature.
+    assert [cast(Any, part).text for part in (reasoning_item.content or [])] == ["visible"]
+    assert reasoning_item.encrypted_content == "SIG"
+
+
+@pytest.mark.asyncio
+async def test_streamed_thinking_blocks_replay_through_the_converter() -> None:
+    """End-to-end: a streamed Anthropic response must replay as the same ordered blocks.
+
+    This covers the streaming counterpart of the non-streaming replay path, so a signed block
+    survives item serialization and reaches the outbound request unchanged.
+    """
+    events = await _collect_handler_events(
+        _thinking_chunk(reasoning_content="summary"),
+        _thinking_chunk(
+            thinking_blocks=[
+                {
+                    "type": "thinking",
+                    "thinking": "alpha",
+                    "signature": "",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+        ),
+        _thinking_chunk(
+            thinking_blocks=[{"type": "thinking", "thinking": "", "signature": "SIG-A"}]
+        ),
+        _thinking_chunk(thinking_blocks=[{"type": "redacted_thinking", "data": "BLOB"}]),
+        _thinking_chunk(
+            thinking_blocks=[{"type": "thinking", "thinking": "beta", "signature": ""}]
+        ),
+        _thinking_chunk(
+            thinking_blocks=[{"type": "thinking", "thinking": "", "signature": "SIG-B"}]
+        ),
+        _thinking_chunk(content="visible answer"),
+    )
+
+    completed_event = next(event for event in events if event.type == "response.completed")
+    stored_items = [item.model_dump() for item in completed_event.response.output]
+
+    messages = Converter.items_to_messages(
+        cast(Any, stored_items),
+        model="anthropic/claude-4-opus",
+        preserve_thinking_blocks=True,
+    )
+
+    assistant_messages = [msg for msg in messages if msg.get("role") == "assistant"]
+    assert len(assistant_messages) == 1
+    # The complete sequence replays through LiteLLM's native assistant thinking_blocks field,
+    # which round-trips redacted blocks and per-block signatures unchanged.
+    assert cast(Any, assistant_messages[0])["thinking_blocks"] == [
+        {
+            "type": "thinking",
+            "thinking": "alpha",
+            "signature": "SIG-A",
+            "cache_control": {"type": "ephemeral"},
+        },
+        {"type": "redacted_thinking", "data": "BLOB"},
+        {"type": "thinking", "thinking": "beta", "signature": "SIG-B"},
+    ]
+    assert assistant_messages[0].get("content") == "visible answer"
 
 
 @pytest.mark.asyncio
@@ -880,6 +1532,13 @@ async def test_stream_handler_places_text_after_existing_refusal_part() -> None:
 
     events = await _collect_handler_events(*chunks)
 
+    refusal_part_added = next(
+        event
+        for event in events
+        if event.type == "response.content_part.added"
+        and isinstance(event.part, ResponseOutputRefusal)
+    )
+    assert refusal_part_added.content_index == 0
     text_part_added = next(
         event
         for event in events
@@ -891,10 +1550,76 @@ async def test_stream_handler_places_text_after_existing_refusal_part() -> None:
     completed_event = next(event for event in events if event.type == "response.completed")
     assistant_item = completed_event.response.output[0]
     assert isinstance(assistant_item, ResponseOutputMessage)
-    assert isinstance(assistant_item.content[0], ResponseOutputText)
-    assert isinstance(assistant_item.content[1], ResponseOutputRefusal)
-    assert assistant_item.content[0].text == "partial"
-    assert assistant_item.content[1].refusal == "blocked"
+    # The completed content must line up with the content indexes announced above: the
+    # refusal opened first at index 0 and the text followed at index 1.
+    assert isinstance(assistant_item.content[0], ResponseOutputRefusal)
+    assert isinstance(assistant_item.content[1], ResponseOutputText)
+    assert assistant_item.content[0].refusal == "blocked"
+    assert assistant_item.content[1].text == "partial"
+
+
+@pytest.mark.parametrize(
+    "deltas",
+    [
+        pytest.param(
+            [
+                ChoiceDelta.model_construct(refusal="blocked"),
+                ChoiceDelta.model_construct(content="partial"),
+            ],
+            id="refusal_then_text",
+        ),
+        pytest.param(
+            [
+                ChoiceDelta.model_construct(content="partial"),
+                ChoiceDelta.model_construct(refusal="blocked"),
+            ],
+            id="text_then_refusal",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_stream_handler_announces_assistant_message_once_for_text_and_refusal(
+    deltas: list[ChoiceDelta],
+) -> None:
+    """A message holding both a text and a refusal part is announced by a single added event."""
+    chunks = [
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=delta)],
+        )
+        for delta in deltas
+    ]
+
+    events = await _collect_handler_events(*chunks)
+
+    message_added = [
+        event
+        for event in events
+        if event.type == "response.output_item.added"
+        and isinstance(event.item, ResponseOutputMessage)
+    ]
+    message_done = [
+        event
+        for event in events
+        if event.type == "response.output_item.done"
+        and isinstance(event.item, ResponseOutputMessage)
+    ]
+    assert len(message_added) == 1
+    assert len(message_done) == 1
+    assert message_added[0].output_index == message_done[0].output_index
+
+    # The single added event still opens the message before its first content part.
+    event_types = [event.type for event in events]
+    assert event_types.index("response.output_item.added") < event_types.index(
+        "response.content_part.added"
+    )
+    # Both content parts are still announced, one each.
+    part_added = [event for event in events if event.type == "response.content_part.added"]
+    assert sorted(event.content_index for event in part_added) == [0, 1]
+    assert {event.part.type for event in part_added} == {"output_text", "refusal"}
 
 
 @pytest.mark.allow_call_model_methods
@@ -957,7 +1682,9 @@ async def test_stream_response_warns_and_ignores_server_managed_conversation_sta
     async def patched_fetch_response(self, *args, **kwargs):
         nonlocal called
         called = True
-        return _empty_response(), _empty_chat_completion_stream()
+        return _empty_response(), _completion_stream(
+            _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="stop")])
+        )
 
     monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
     model = OpenAIProvider(use_responses=False).get_model("gpt-4")
@@ -992,7 +1719,9 @@ async def test_stream_response_warns_and_ignores_prompt_by_default(
     async def patched_fetch_response(self, *args, **kwargs):
         nonlocal captured_prompt
         captured_prompt = kwargs.get("prompt")
-        return _empty_response(), _empty_chat_completion_stream()
+        return _empty_response(), _completion_stream(
+            _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="stop")])
+        )
 
     monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
     model = OpenAIProvider(use_responses=False).get_model("gpt-4")
@@ -1150,6 +1879,7 @@ async def test_stream_response_includes_logprobs(monkeypatch) -> None:
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
         for c in (chunk1, chunk2):
             yield c
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="stop")])
 
     async def patched_fetch_response(self, *args, **kwargs):
         resp = Response(
@@ -1233,6 +1963,7 @@ async def test_stream_response_accumulates_logprobs_across_many_deltas(monkeypat
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
         for token in tokens:
             yield make_chunk(token)
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="stop")])
 
     async def patched_fetch_response(self, *args, **kwargs):
         resp = Response(
@@ -1305,6 +2036,7 @@ async def test_stream_response_yields_events_for_refusal_content(monkeypatch) ->
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
         for c in (chunk1, chunk2):
             yield c
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="stop")])
 
     async def patched_fetch_response(self, *args, **kwargs):
         resp = Response(
@@ -1396,6 +2128,7 @@ async def test_stream_response_yields_events_for_tool_call(monkeypatch) -> None:
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
         for c in (chunk1, chunk2):
             yield c
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="tool_calls")])
 
     async def patched_fetch_response(self, *args, **kwargs):
         resp = Response(
@@ -1484,6 +2217,7 @@ async def test_stream_response_buffers_tool_call_deltas_when_enabled(monkeypatch
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
         for chunk in (chunk1, chunk2):
             yield chunk
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="tool_calls")])
 
     async def patched_fetch_response(self, *args, **kwargs):
         return _empty_response(), fake_stream()
@@ -1680,6 +2414,7 @@ async def test_stream_response_buffers_tool_call_usage_chunk_without_replay(
 
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
         yield chunk
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="tool_calls")])
 
     async def patched_fetch_response(self, *args, **kwargs):
         return _empty_response(), fake_stream()
@@ -1759,6 +2494,7 @@ async def test_stream_response_buffers_tool_call_provider_fields(monkeypatch) ->
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
         for chunk in (chunk1, chunk2):
             yield chunk
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="tool_calls")])
 
     async def patched_fetch_response(self, *args, **kwargs):
         return _empty_response(), fake_stream()
@@ -1912,6 +2648,7 @@ async def test_buffered_tool_calls_do_not_merge_nonzero_choice_tool_call_indexes
 
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
         yield chunk
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="tool_calls")])
 
     async def patched_fetch_response(self, *args, **kwargs):
         return _empty_response(), fake_stream()
@@ -2148,6 +2885,7 @@ async def test_stream_response_ignores_custom_tool_call_chunks_by_default(monkey
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
         for chunk in chunks:
             yield chunk
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="tool_calls")])
 
     async def patched_fetch_response(self, *args, **kwargs):
         return _empty_response(), fake_stream()
@@ -2253,6 +2991,7 @@ async def test_stream_response_yields_real_time_function_call_arguments(monkeypa
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
         for c in (chunk1, chunk2, chunk3, chunk4):
             yield c
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="tool_calls")])
 
     async def patched_fetch_response(self, *args, **kwargs):
         resp = Response(
@@ -2367,6 +3106,7 @@ async def test_fallback_function_calls_have_unique_output_indexes(monkeypatch) -
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
         for c in (chunk1, chunk2):
             yield c
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="tool_calls")])
 
     async def patched_fetch_response(self, *args, **kwargs):
         resp = Response(
@@ -2468,6 +3208,7 @@ async def test_fallback_function_call_keeps_index_before_streamed_call(monkeypat
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
         for c in (chunk1, chunk2, chunk3):
             yield c
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="tool_calls")])
 
     async def patched_fetch_response(self, *args, **kwargs):
         resp = Response(
@@ -2562,6 +3303,7 @@ async def test_fallback_function_call_before_text_uses_final_output_index(
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
         for chunk in (chunk1, chunk2):
             yield chunk
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="tool_calls")])
 
     async def patched_fetch_response(self, *args, **kwargs):
         response = Response(
@@ -2665,6 +3407,7 @@ async def test_streamed_function_call_before_text_keeps_realtime_order(
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
         for chunk in (chunk1, chunk2, chunk3):
             yield chunk
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="tool_calls")])
 
     async def patched_fetch_response(self, *args, **kwargs):
         response = Response(
@@ -2780,6 +3523,7 @@ async def test_mixed_function_calls_before_text_keep_tracked_order(
     async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
         for chunk in (chunk1, chunk2, chunk3, chunk4):
             yield chunk
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="tool_calls")])
 
     async def patched_fetch_response(self, *args, **kwargs):
         response = Response(
@@ -3062,9 +3806,151 @@ async def test_buffer_tool_call_stream_forwards_content_filter_finish_reason() -
 
 
 @pytest.mark.asyncio
+async def test_handler_stream_raises_on_length_truncation() -> None:
+    """A stream that terminates with finish_reason == "length" and no emitted
+    content must raise ModelBehaviorError instead of manufacturing a refusal,
+    matching the non-streaming path, when the internal option is enabled."""
+    terminal = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(), finish_reason="length")],
+    )
+
+    with pytest.raises(ModelBehaviorError, match="finish_reason='length'"):
+        await _collect_handler_events(terminal, raise_on_length_truncation=True)
+
+
+@pytest.mark.asyncio
+async def test_handler_stream_length_is_ignored_without_internal_option() -> None:
+    """Without the internal option, a length terminal with no output must keep the
+    released behavior: no error and no refusal synthesis (an empty turn).
+
+    The shared handler also serves LiteLLM and AnyLLM, so the length-error behavior
+    must be opt-in rather than changing those providers' streaming output.
+    """
+    terminal = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(), finish_reason="length")],
+    )
+
+    output_events = await _collect_handler_events(terminal)
+
+    assert "response.refusal.delta" not in [e.type for e in output_events]
+    completed_event = output_events[-1]
+    assert isinstance(completed_event, ResponseCompletedEvent)
+    assert completed_event.response.output == []
+
+
+@pytest.mark.asyncio
+async def test_handler_stream_length_does_not_clobber_text() -> None:
+    """A length finish_reason arriving after real text was streamed must not
+    synthesize a refusal."""
+    chunk1 = _chunk_with([Choice(index=0, delta=ChoiceDelta(content="answer"))])
+    chunk2 = _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="length")])
+
+    output_events = await _collect_handler_events(chunk1, chunk2, raise_on_length_truncation=True)
+
+    assert "response.refusal.delta" not in [e.type for e in output_events]
+    completed_event = output_events[-1]
+    assert isinstance(completed_event, ResponseCompletedEvent)
+    assistant_msg = completed_event.response.output[0]
+    assert isinstance(assistant_msg, ResponseOutputMessage)
+    text_part = assistant_msg.content[0]
+    assert isinstance(text_part, ResponseOutputText)
+    assert text_part.text == "answer"
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_buffered_stream_raises_on_length_truncation(monkeypatch) -> None:
+    """With tool-call buffering enabled, a stream that terminates with
+    finish_reason == "length" and no emitted content must still raise
+    ModelBehaviorError, mirroring the non-buffered behavior."""
+    chunk1 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(role="assistant", content=""))],
+    )
+    chunk2 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(), finish_reason="length")],
+        usage=CompletionUsage(completion_tokens=0, prompt_tokens=7, total_tokens=7),
+    )
+
+    with pytest.raises(ModelBehaviorError, match="finish_reason='length'"):
+        await _buffered_stream_events(monkeypatch, [chunk1, chunk2])
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_buffered_stream_length_does_not_clobber_text(monkeypatch) -> None:
+    """A length finish_reason arriving after real text was streamed must not
+    synthesize a refusal, even with buffering enabled."""
+    chunk1 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(content="answer"))],
+    )
+    chunk2 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(), finish_reason="length")],
+        usage=CompletionUsage(completion_tokens=1, prompt_tokens=7, total_tokens=8),
+    )
+
+    output_events = await _buffered_stream_events(monkeypatch, [chunk1, chunk2])
+
+    assert "response.refusal.delta" not in [e.type for e in output_events]
+    completed_event = output_events[-1]
+    assert isinstance(completed_event, ResponseCompletedEvent)
+    assistant_msg = completed_event.response.output[0]
+    assert isinstance(assistant_msg, ResponseOutputMessage)
+    text_part = assistant_msg.content[0]
+    assert isinstance(text_part, ResponseOutputText)
+    assert text_part.text == "answer"
+
+
+@pytest.mark.asyncio
+async def test_buffer_tool_call_stream_forwards_length_finish_reason() -> None:
+    """The buffering layer must forward a length-truncated terminal choice even
+    though its delta is empty, so the finish_reason reaches the handler instead
+    of being swallowed (mirrors the content_filter forwarding behavior)."""
+    chunks = [
+        _chunk_with([Choice(index=0, delta=ChoiceDelta(content=""))]),
+        _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="length")]),
+    ]
+
+    async def source() -> AsyncIterator[ChatCompletionChunk]:
+        for chunk in chunks:
+            yield chunk
+
+    buffered = [c async for c in ChatCmplStreamHandler.buffer_tool_call_stream(source())]
+
+    terminal_choices = [
+        choice for chunk in buffered for choice in chunk.choices if choice.finish_reason == "length"
+    ]
+    assert len(terminal_choices) == 1
+    # The forwarded copy carries no delta output.
+    assert not ChatCmplStreamHandler._delta_has_passthrough_output(terminal_choices[0].delta)
+
+
+@pytest.mark.asyncio
 async def test_buffer_tool_call_stream_does_not_duplicate_tool_calls_finish() -> None:
-    """finish_reason == "tool_calls" is still emitted only by the synthesized
-    buffered chunk, so the terminal choice is not forwarded twice."""
+    """Only the real terminal choice carries a finish reason after buffering."""
     tool_call_delta = ChoiceDeltaToolCall(
         index=0,
         id="tool-id",
@@ -3089,4 +3975,579 @@ async def test_buffer_tool_call_stream_does_not_duplicate_tool_calls_finish() ->
         if choice.finish_reason == "tool_calls"
     ]
     assert len(finish_choices) == 1
-    assert finish_choices[0].delta.tool_calls
+    assert finish_choices[0].delta.tool_calls is None
+    assert buffered[-1].choices[0].delta.tool_calls == [tool_call_delta]
+    assert buffered[-1].choices[0].finish_reason is None
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_stream_response_propagates_request_id(monkeypatch) -> None:
+    """The OpenAI request ID must reach the terminal streamed response.
+
+    `Runner` reads `_request_id` off the terminal response to populate
+    `ModelResponse.request_id`, so the streamed Chat Completions path has to carry the
+    `x-request-id` header from the underlying HTTP response.
+    """
+    chunk = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(content="Hello"))],
+    )
+
+    class FakeStream:
+        """Mimics `openai.AsyncStream`, which exposes the raw HTTP response."""
+
+        def __init__(self) -> None:
+            self.response = httpx2.Response(
+                200,
+                headers={"x-request-id": "req_streamed_456"},
+                request=httpx2.Request("POST", "https://api.openai.com/v1/chat/completions"),
+            )
+
+        def __aiter__(self) -> AsyncIterator[ChatCompletionChunk]:
+            async def gen() -> AsyncIterator[ChatCompletionChunk]:
+                yield chunk
+                yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="stop")])
+
+            return gen()
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        resp = Response(
+            id="resp-id",
+            created_at=0,
+            model="fake-model",
+            object="response",
+            output=[],
+            tool_choice="none",
+            tools=[],
+            parallel_tool_calls=False,
+        )
+        return resp, FakeStream()
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(use_responses=False).get_model("gpt-4")
+
+    completed: ResponseCompletedEvent | None = None
+    async for event in model.stream_response(
+        system_instructions=None,
+        input="",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    ):
+        if event.type == "response.completed":
+            completed = event
+
+    assert completed is not None
+    assert getattr(completed.response, "_request_id", None) == "req_streamed_456"
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_stream_response_without_http_response_has_no_request_id(monkeypatch) -> None:
+    """Custom clients and test doubles that yield a bare async iterator still stream."""
+    chunk = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(content="Hello"))],
+    )
+
+    async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield chunk
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="stop")])
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        resp = Response(
+            id="resp-id",
+            created_at=0,
+            model="fake-model",
+            object="response",
+            output=[],
+            tool_choice="none",
+            tools=[],
+            parallel_tool_calls=False,
+        )
+        return resp, fake_stream()
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(use_responses=False).get_model("gpt-4")
+
+    completed: ResponseCompletedEvent | None = None
+    async for event in model.stream_response(
+        system_instructions=None,
+        input="",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    ):
+        if event.type == "response.completed":
+            completed = event
+
+    assert completed is not None
+    assert getattr(completed.response, "_request_id", None) is None
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_keeps_url_citations_on_the_text_delta() -> None:
+    """Citations reported alongside the text reach the output text, as when not streaming."""
+    events = await _collect_handler_events(
+        _annotated_chunk(
+            {
+                "role": "assistant",
+                "content": "It will rain tomorrow.",
+                "annotations": [_url_citation()],
+            },
+            finish_reason="stop",
+        )
+    )
+
+    assert _streamed_annotations(events) == [
+        {
+            "type": "url_citation",
+            "start_index": 0,
+            "end_index": 22,
+            "url": "https://example.com/weather",
+            "title": "Weather",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_keeps_url_citations_reported_after_the_text() -> None:
+    """A provider may cite on a later delta, once the text the citation indexes is sent."""
+    events = await _collect_handler_events(
+        _annotated_chunk({"role": "assistant", "content": "It will rain tomorrow."}),
+        _annotated_chunk({"annotations": [_url_citation()]}, finish_reason="stop"),
+    )
+
+    assert [annotation["url"] for annotation in _streamed_annotations(events)] == [
+        "https://example.com/weather"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_accumulates_url_citations_across_deltas() -> None:
+    """Citations accumulate rather than replace, as LiteLLM does in `stream_chunk_builder`.
+
+    `delta.annotations` is undocumented, so a provider may spread citations over several
+    deltas or report them only on the last one, and accumulating keeps both cases whole.
+    A provider repeating its full list on every delta would report duplicates, which is
+    the same tradeoff LiteLLM makes.
+    """
+    events = await _collect_handler_events(
+        _annotated_chunk(
+            {
+                "role": "assistant",
+                "content": "It will rain tomorrow.",
+                "annotations": [_url_citation()],
+            }
+        ),
+        _annotated_chunk(
+            {"annotations": [_url_citation(url="https://example.com/forecast", title="Forecast")]},
+            finish_reason="stop",
+        ),
+    )
+
+    assert [annotation["url"] for annotation in _streamed_annotations(events)] == [
+        "https://example.com/weather",
+        "https://example.com/forecast",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_buffering_keeps_a_citation_only_delta() -> None:
+    """Tool call buffering must forward a delta whose only output is a citation."""
+    chunks = await _collect_buffered_tool_call_chunks(
+        _annotated_chunk({"role": "assistant", "content": "It will rain tomorrow."}),
+        _annotated_chunk({"annotations": [_url_citation()]}, finish_reason="stop"),
+    )
+    events = await _collect_handler_events(*chunks)
+
+    assert [annotation["url"] for annotation in _streamed_annotations(events)] == [
+        "https://example.com/weather"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_skips_unsupported_annotation_shapes() -> None:
+    """An unsupported or incomplete citation is dropped instead of failing the turn."""
+    other_type = {"type": "file_citation", "file_citation": {"file_id": "file-1", "index": 0}}
+    incomplete = {"type": "url_citation", "url_citation": {"url": "https://example.com/partial"}}
+    events = await _collect_handler_events(
+        _annotated_chunk(
+            {
+                "role": "assistant",
+                "content": "It will rain tomorrow.",
+                "annotations": [other_type, incomplete, _url_citation()],
+            },
+            finish_reason="stop",
+        )
+    )
+
+    assert [annotation["url"] for annotation in _streamed_annotations(events)] == [
+        "https://example.com/weather"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_ignores_annotations_that_are_not_a_sequence() -> None:
+    """The streamed field is untyped, so an unexpected shape must not fail the turn."""
+    events = await _collect_handler_events(
+        _annotated_chunk(
+            {"role": "assistant", "content": "It will rain tomorrow.", "annotations": 5},
+            finish_reason="stop",
+        )
+    )
+
+    assert _streamed_annotations(events) == []
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_drops_citations_reported_before_any_text() -> None:
+    """Citations index into text, so one reported before any text part opens is dropped."""
+    events = await _collect_handler_events(
+        _annotated_chunk({"role": "assistant", "annotations": [_url_citation()]}),
+        _annotated_chunk({"content": "It will rain tomorrow."}, finish_reason="stop"),
+    )
+
+    assert _streamed_annotations(events) == []
+    completed = cast(ResponseCompletedEvent, events[-1])
+    message = cast(ResponseOutputMessage, completed.response.output[0])
+    assert len(message.content) == 1
+    assert cast(ResponseOutputText, message.content[0]).text == "It will rain tomorrow."
+
+
+def _usageless_stream_patch(usage: CompletionUsage | None = None):
+    """Patch `_fetch_response` with a stream whose only chunk carries `usage`."""
+    chunk = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(content="Hello"))],
+        usage=usage,
+    )
+
+    async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield chunk
+        yield _chunk_with([Choice(index=0, delta=ChoiceDelta(), finish_reason="stop")])
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        resp = Response(
+            id="resp-id",
+            created_at=0,
+            model="fake-model",
+            object="response",
+            output=[],
+            tool_choice="none",
+            tools=[],
+            parallel_tool_calls=False,
+        )
+        return resp, fake_stream()
+
+    return patched_fetch_response
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_streamed_run_counts_request_when_provider_omits_usage(monkeypatch) -> None:
+    """A stream that never carries a usage chunk still made a request.
+
+    Providers without `stream_options.include_usage` finish the stream with no usage payload.
+    The run must still report the request, while token counts stay at zero because the
+    provider genuinely did not report them.
+    """
+    monkeypatch.setattr(
+        OpenAIChatCompletionsModel, "_fetch_response", _usageless_stream_patch(usage=None)
+    )
+    agent = Agent(name="test", model=OpenAIProvider(use_responses=False).get_model("gpt-4"))
+
+    result = Runner.run_streamed(agent, "hi")
+    completed: ResponseCompletedEvent | None = None
+    async for event in result.stream_events():
+        raw = getattr(event, "data", None)
+        if isinstance(raw, ResponseCompletedEvent):
+            completed = raw
+
+    assert result.context_wrapper.usage.requests == 1
+    assert result.context_wrapper.usage.total_tokens == 0
+    # No usage payload is synthesized, so nothing reports token counts that never arrived.
+    assert completed is not None
+    assert completed.response.usage is None
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_streamed_run_does_not_double_count_when_usage_is_present(monkeypatch) -> None:
+    """The usage-less path must not add a second request when usage did arrive."""
+    monkeypatch.setattr(
+        OpenAIChatCompletionsModel,
+        "_fetch_response",
+        _usageless_stream_patch(
+            usage=CompletionUsage(completion_tokens=5, prompt_tokens=7, total_tokens=12)
+        ),
+    )
+    agent = Agent(name="test", model=OpenAIProvider(use_responses=False).get_model("gpt-4"))
+
+    result = Runner.run_streamed(agent, "hi")
+    async for _ in result.stream_events():
+        pass
+
+    assert result.context_wrapper.usage.requests == 1
+    assert result.context_wrapper.usage.total_tokens == 12
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_streamed_span_records_the_request_when_provider_omits_usage(monkeypatch) -> None:
+    """Streamed tracing must record the request the same way the non-streaming path does.
+
+    Non-streaming writes a span usage object with `requests: 1` when the provider reports no
+    usage. Streaming used to omit span usage entirely, so the run reported one request while
+    the model span showed none.
+    """
+    monkeypatch.setattr(
+        OpenAIChatCompletionsModel, "_fetch_response", _usageless_stream_patch(usage=None)
+    )
+    model = OpenAIProvider(use_responses=False).get_model("gpt-4")
+
+    with trace(workflow_name="test"):
+        async for _ in model.stream_response(
+            system_instructions=None,
+            input="",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.ENABLED,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
+        ):
+            pass
+
+    spans = fetch_ordered_spans()
+    generation = next(s for s in spans if s.span_data.type == "generation")
+    assert generation.span_data.usage is not None
+    assert generation.span_data.usage["requests"] == 1
+    # The provider reported no tokens, so every total stays at zero.
+    assert generation.span_data.usage["total_tokens"] == 0
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_usage", [False, True], ids=["no-usage", "detailed-usage"])
+@pytest.mark.parametrize("tracing", [ModelTracing.ENABLED, ModelTracing.ENABLED_WITHOUT_DATA])
+async def test_stream_span_is_recorded_for_a_consumer_that_stops_at_the_terminal_event(
+    monkeypatch, with_usage: bool, tracing: ModelTracing
+) -> None:
+    """A caller that stops at `response.completed` closes the generator.
+
+    Anything recorded only after the yield loop never runs for such a consumer, so the span
+    has to be populated before the terminal event is handed out.
+    """
+    usage = (
+        CompletionUsage(
+            completion_tokens=5,
+            prompt_tokens=7,
+            total_tokens=12,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=2),
+            completion_tokens_details=CompletionTokensDetails(reasoning_tokens=3),
+        )
+        if with_usage
+        else None
+    )
+    monkeypatch.setattr(
+        OpenAIChatCompletionsModel, "_fetch_response", _usageless_stream_patch(usage=usage)
+    )
+    model = OpenAIProvider(use_responses=False).get_model("gpt-4")
+
+    with trace(workflow_name="test"):
+        stream = model.stream_response(
+            system_instructions=None,
+            input="",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=tracing,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
+        )
+        stream_agen = cast(Any, stream)
+        try:
+            async for event in stream_agen:
+                if event.type == "response.completed":
+                    generation = get_current_span()
+                    assert generation is not None
+                    assert generation.span_data.usage == {
+                        "requests": 1,
+                        "input_tokens": 7 if with_usage else 0,
+                        "output_tokens": 5 if with_usage else 0,
+                        "total_tokens": 12 if with_usage else 0,
+                        "input_tokens_details": {
+                            "cached_tokens": 2 if with_usage else 0,
+                            "cache_write_tokens": 0,
+                        },
+                        "output_tokens_details": {"reasoning_tokens": 3 if with_usage else 0},
+                    }
+                    assert generation.span_data.output == (
+                        [event.response.model_dump()] if tracing == ModelTracing.ENABLED else None
+                    )
+                    assert (event.response.usage is not None) == with_usage
+                    break
+            else:
+                pytest.fail("The stream did not yield a completed response.")
+        finally:
+            await stream_agen.aclose()
+
+    generation = next(s for s in fetch_ordered_spans() if s.span_data.type == "generation")
+    assert generation.span_data.usage is not None
+    assert generation.span_data.usage["requests"] == 1
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_streamed_span_preserves_usage_on_length_truncation(monkeypatch) -> None:
+    """A stream terminated by finish_reason == "length" with no output raises
+    ModelBehaviorError, but the request and reported token usage must still be
+    preserved on the generation span before the error surfaces."""
+
+    def _length_stream_patch():
+        chunk = ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=ChoiceDelta(), finish_reason="length")],
+            usage=CompletionUsage(
+                completion_tokens=0,
+                prompt_tokens=7,
+                total_tokens=7,
+                prompt_tokens_details=PromptTokensDetails(cached_tokens=2),
+            ),
+        )
+
+        async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+            yield chunk
+
+        async def patched_fetch_response(self, *args, **kwargs):
+            resp = Response(
+                id="resp-id",
+                created_at=0,
+                model="fake-model",
+                object="response",
+                output=[],
+                tool_choice="none",
+                tools=[],
+                parallel_tool_calls=False,
+            )
+            return resp, fake_stream()
+
+        return patched_fetch_response
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", _length_stream_patch())
+    model = OpenAIProvider(use_responses=False).get_model("gpt-4")
+
+    with trace(workflow_name="stream-length-truncation"):
+        with pytest.raises(ModelBehaviorError, match="finish_reason='length'"):
+            async for _ in model.stream_response(
+                system_instructions=None,
+                input="",
+                model_settings=ModelSettings(),
+                tools=[],
+                output_schema=None,
+                handoffs=[],
+                tracing=ModelTracing.ENABLED,
+                previous_response_id=None,
+                conversation_id=None,
+                prompt=None,
+            ):
+                pass
+
+    generation = next(s for s in fetch_ordered_spans() if s.span_data.type == "generation")
+    exported_span = generation.export()
+    assert exported_span is not None
+    assert exported_span["error"] is not None
+    assert generation.span_data.usage is not None
+    assert generation.span_data.usage["requests"] == 1
+    assert generation.span_data.usage["input_tokens"] == 7
+    assert generation.span_data.usage["total_tokens"] == 7
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_streamed_span_counts_request_on_length_truncation_without_usage(
+    monkeypatch,
+) -> None:
+    """When the provider omits usage, a length-truncated empty completion still
+    counts the request on the generation span (tokens stay at zero), mirroring
+    the non-streaming path."""
+
+    def _length_stream_patch():
+        chunk = ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=ChoiceDelta(), finish_reason="length")],
+            usage=None,
+        )
+
+        async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+            yield chunk
+
+        async def patched_fetch_response(self, *args, **kwargs):
+            resp = Response(
+                id="resp-id",
+                created_at=0,
+                model="fake-model",
+                object="response",
+                output=[],
+                tool_choice="none",
+                tools=[],
+                parallel_tool_calls=False,
+            )
+            return resp, fake_stream()
+
+        return patched_fetch_response
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", _length_stream_patch())
+    model = OpenAIProvider(use_responses=False).get_model("gpt-4")
+
+    with trace(workflow_name="stream-length-no-usage"):
+        with pytest.raises(ModelBehaviorError, match="finish_reason='length'"):
+            async for _ in model.stream_response(
+                system_instructions=None,
+                input="",
+                model_settings=ModelSettings(),
+                tools=[],
+                output_schema=None,
+                handoffs=[],
+                tracing=ModelTracing.ENABLED,
+                previous_response_id=None,
+                conversation_id=None,
+                prompt=None,
+            ):
+                pass
+
+    generation = next(s for s in fetch_ordered_spans() if s.span_data.type == "generation")
+    assert generation.span_data.usage is not None
+    assert generation.span_data.usage["requests"] == 1
+    assert generation.span_data.usage["total_tokens"] == 0

@@ -1,13 +1,71 @@
 from __future__ import annotations
 
+import copy
+import json
 from collections.abc import Mapping
 from dataclasses import field
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 from openai.types.completion_usage import CompletionTokensDetails, PromptTokensDetails
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
-from pydantic import BeforeValidator, TypeAdapter, ValidationError
+from pydantic import BeforeValidator, JsonValue, TypeAdapter, ValidationError
 from pydantic.dataclasses import dataclass
+
+_RAW_USAGE_ATTRIBUTE = "_agents_sdk_raw_usage"
+_NORMALIZED_USAGE_ATTRIBUTE = "_agents_sdk_normalized_usage"
+_RAW_USAGE_ADAPTER = TypeAdapter(dict[str, JsonValue])
+_RAW_USAGE_MISSING = object()
+
+
+def _raw_usage_snapshot(raw_usage: Any | None) -> dict[str, Any] | None:
+    """Return a detached JSON-compatible usage object without adding omitted fields."""
+    if raw_usage is None:
+        return None
+
+    try:
+        if isinstance(raw_usage, Mapping):
+            candidate = dict(raw_usage)
+        else:
+            model_dump = getattr(raw_usage, "model_dump", None)
+            if not callable(model_dump):
+                return None
+            candidate = model_dump(mode="json", by_alias=True, exclude_unset=True)
+
+        if not isinstance(candidate, dict) or not all(isinstance(key, str) for key in candidate):
+            return None
+
+        validated = _RAW_USAGE_ADAPTER.validate_python(candidate)
+        return cast(
+            dict[str, Any],
+            json.loads(json.dumps(validated, allow_nan=False)),
+        )
+    except Exception:
+        # Usage preservation is diagnostic metadata. An adapter-specific value that cannot be
+        # represented as JSON must not turn an otherwise successful model call into a failure.
+        return None
+
+
+def _attach_raw_usage_snapshot(target: Any, raw_usage: Any | None) -> None:
+    """Attach a pre-normalization usage snapshot to an internal response object."""
+    snapshot = _raw_usage_snapshot(raw_usage)
+    try:
+        object.__setattr__(target, _RAW_USAGE_ATTRIBUTE, snapshot)
+    except Exception:
+        # Some custom response objects reject private attributes. Their completed response can
+        # still be processed normally, but no raw usage snapshot is available downstream.
+        return
+
+
+def _extract_raw_usage_snapshot(
+    target: Any,
+    *,
+    fallback: Any | None = None,
+) -> dict[str, Any] | None:
+    """Read an attached snapshot, or capture the provided unnormalized fallback."""
+    snapshot = getattr(target, _RAW_USAGE_ATTRIBUTE, _RAW_USAGE_MISSING)
+    if snapshot is not _RAW_USAGE_MISSING:
+        return snapshot if isinstance(snapshot, dict) else None
+    return _raw_usage_snapshot(fallback)
 
 
 def _make_input_tokens_details(
@@ -239,8 +297,10 @@ class Usage:
         # (this preserves nested token details that would otherwise be discarded
         # when synthesizing an entry from only the top-level fields).
         if other.request_usage_entries:
-            self.request_usage_entries.extend(other.request_usage_entries)
-        elif other.requests == 1 and other.total_tokens > 0:
+            self.request_usage_entries.extend(copy.deepcopy(other.request_usage_entries))
+        elif other.requests == 1 and (
+            other.input_tokens > 0 or other.output_tokens > 0 or other.total_tokens > 0
+        ):
             # Otherwise, if the other Usage represents a single request with tokens, record it.
             input_details = other.input_tokens_details or _make_input_tokens_details()
             output_details = other.output_tokens_details or OutputTokensDetails(reasoning_tokens=0)
@@ -248,14 +308,49 @@ class Usage:
                 input_tokens=other.input_tokens,
                 output_tokens=other.output_tokens,
                 total_tokens=other.total_tokens,
-                input_tokens_details=input_details,
-                output_tokens_details=output_details,
+                input_tokens_details=copy.deepcopy(input_details),
+                output_tokens_details=copy.deepcopy(output_details),
             )
             self.request_usage_entries.append(request_usage)
 
 
+_REQUEST_WITHOUT_USAGE_ATTR = "_agents_sdk_request_completed_without_usage"
+
+
+def _mark_request_completed_without_usage(response: Any) -> None:
+    """Record that a response completed even though the provider reported no usage.
+
+    Adapters call this instead of synthesizing a zero-filled usage payload, so the raw
+    provider usage stays absent while the request itself is still counted.
+    """
+    _mark_requests_completed_without_usage(response, 1)
+
+
+def _mark_requests_completed_without_usage(response: Any, requests: int) -> None:
+    """Record an adapter-owned physical request count without provider usage."""
+    if requests < 1:
+        raise ValueError("Completed request count must be at least one.")
+    object.__setattr__(response, _REQUEST_WITHOUT_USAGE_ATTR, requests)
+
+
+def _requests_for_response_without_usage(response: Any) -> int:
+    """How many requests a usage-less response represents.
+
+    Defaults to zero so adapters must explicitly opt in for both singular responses and
+    responses that aggregate several physical provider requests.
+    """
+    requests = getattr(response, _REQUEST_WITHOUT_USAGE_ATTR, 0)
+    if requests is True:
+        return 1
+    return requests if type(requests) is int and requests > 0 else 0
+
+
 def _response_usage_to_usage(response_usage: Any) -> Usage:
     """Convert Responses API usage, including adapter-supplied per-request details."""
+    normalized_usage = getattr(response_usage, _NORMALIZED_USAGE_ATTRIBUTE, None)
+    if isinstance(normalized_usage, Usage):
+        return copy.deepcopy(normalized_usage)
+
     request_usages = getattr(response_usage, "_agents_sdk_request_usages", None)
     request_count = getattr(response_usage, "_agents_sdk_request_count", 1)
 
@@ -277,12 +372,17 @@ def _response_usage_to_usage(response_usage: Any) -> Usage:
 
     return Usage(
         requests=request_count,
-        input_tokens=response_usage.input_tokens,
-        output_tokens=response_usage.output_tokens,
-        total_tokens=response_usage.total_tokens,
+        input_tokens=response_usage.input_tokens or 0,
+        output_tokens=response_usage.output_tokens or 0,
+        total_tokens=response_usage.total_tokens or 0,
         input_tokens_details=response_usage.input_tokens_details,
         output_tokens_details=response_usage.output_tokens_details,
     )
+
+
+def _attach_normalized_usage(target: Any, usage: Usage) -> None:
+    """Attach a detached normalized usage snapshot for lossless internal conversion."""
+    object.__setattr__(target, _NORMALIZED_USAGE_ATTRIBUTE, copy.deepcopy(usage))
 
 
 def _serialize_usage_details(details: Any, default: dict[str, int]) -> dict[str, Any]:

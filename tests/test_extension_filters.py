@@ -19,6 +19,9 @@ from agents import (
 from agents.extensions.handoff_filters import nest_handoff_history, remove_all_tools
 from agents.items import (
     HandoffOutputItem,
+    MCPApprovalRequestItem,
+    MCPApprovalResponseItem,
+    MCPListToolsItem,
     MessageOutputItem,
     ReasoningItem,
     ToolApprovalItem,
@@ -315,7 +318,8 @@ def test_removes_tools_from_new_items_and_history():
         ),
     )
     filtered_data = remove_all_tools(handoff_input_data)
-    assert len(filtered_data.input_history) == 3
+    # reasoning items are also removed (they become orphaned after tool calls are stripped)
+    assert len(filtered_data.input_history) == 2
     assert len(filtered_data.pre_handoff_items) == 1
     assert len(filtered_data.new_items) == 1
 

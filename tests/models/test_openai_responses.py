@@ -1,27 +1,41 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import logging
+from contextlib import nullcontext
+from dataclasses import asdict, fields, replace
 from types import SimpleNamespace
 from typing import Any, cast
 
-import httpx
+import httpx2
 import pytest
 from openai import NOT_GIVEN, APIConnectionError, AsyncOpenAI, RateLimitError, omit
-from openai.types.responses import ResponseCompletedEvent, ResponseErrorEvent
+from openai.types.responses import Response, ResponseCompletedEvent, ResponseErrorEvent
+from openai.types.responses.response import IncompleteDetails
 from openai.types.responses.response_create_params import ContextManagement, PromptCacheOptions
+from openai.types.responses.response_usage import ResponseUsage
+from openai.types.responses.tool_param import ImageGeneration
 from openai.types.shared.reasoning import Reasoning
 
 from agents import (
     Agent,
+    ApplyPatchTool,
     AsyncComputer,
     Computer,
     ComputerTool,
+    ImageGenerationTool,
     ModelSettings,
     ModelTracing,
     Runner,
+    ShellTool,
+    Tool,
     ToolSearchTool,
+    WebSearchTool,
     __version__,
+    function_tool,
+    handoff,
     trace,
 )
 from agents.exceptions import ModelBehaviorError, UserError
@@ -36,11 +50,89 @@ from agents.models.openai_responses import (
     OpenAIResponsesModel,
     OpenAIResponsesWSModel,
     ResponsesWebSocketError,
+    _ResponseStreamWithRequestId,
+    _should_retry_pre_event_websocket_disconnect,
 )
 from agents.retry import ModelRetryAdviceRequest
 from agents.usage import Usage
-from tests.fake_model import get_response_obj
+from tests.model_test_helpers import get_response_obj
+from tests.test_responses import get_text_message
 from tests.testing_processor import fetch_ordered_spans
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["non-streaming", "streaming"])
+@pytest.mark.parametrize(
+    ("counts", "expected"),
+    [
+        ((None, 5, 12), (0, 5, 12)),
+        ((7, None, 12), (7, 0, 12)),
+        ((7, 5, None), (7, 5, 0)),
+        ((None, None, None), (0, 0, 0)),
+        ((0, 0, 0), (0, 0, 0)),
+        ((7, 5, 12), (7, 5, 12)),
+    ],
+    ids=["null-input", "null-output", "null-total", "all-null", "zero", "valid"],
+)
+async def test_runner_normalizes_nullable_responses_usage(
+    stream: bool,
+    counts: tuple[int | None, int | None, int | None],
+    expected: tuple[int, int, int],
+) -> None:
+    usage = {
+        "input_tokens": counts[0],
+        "output_tokens": counts[1],
+        "total_tokens": counts[2],
+        "input_tokens_details": {"cached_tokens": 3},
+        "output_tokens_details": {"reasoning_tokens": 2},
+    }
+
+    # Exercise provider parsing and usage conversion instead of a normalized scripted model.
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        payload = get_response_obj([get_text_message("Hello")]).model_dump()
+        payload["usage"] = usage
+        if stream:
+            event = {"type": "response.completed", "response": payload, "sequence_number": 0}
+            return httpx2.Response(
+                200,
+                content=f"event: response.completed\ndata: {json.dumps(event)}\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx2.Response(200, json=payload)
+
+    async with AsyncOpenAI(
+        api_key="test-key",
+        base_url="https://provider.example/v1",
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+    ) as client:
+        agent = Agent(
+            name="test",
+            model=OpenAIResponsesModel(model="fake", openai_client=client),
+            model_settings=ModelSettings(preserve_raw_usage=True),
+        )
+        if stream:
+            result = Runner.run_streamed(agent, "hi")
+            async for _ in result.stream_events():
+                pass
+        else:
+            result = await Runner.run(agent, "hi")
+
+    assert result.final_output == "Hello"
+    normalized = result.context_wrapper.usage
+    assert normalized.requests == 1
+    assert (normalized.input_tokens, normalized.output_tokens, normalized.total_tokens) == expected
+    assert normalized.input_tokens_details.cached_tokens == 3
+    assert normalized.output_tokens_details.reasoning_tokens == 2
+    assert result.raw_responses[0].raw_usage == usage
+    if expected == (0, 0, 0):
+        assert normalized.request_usage_entries == []
+    else:
+        assert len(normalized.request_usage_entries) == 1
+        entry = normalized.request_usage_entries[0]
+        assert (entry.input_tokens, entry.output_tokens, entry.total_tokens) == expected
+        assert entry.input_tokens_details.cached_tokens == 3
+        assert entry.output_tokens_details.reasoning_tokens == 2
 
 
 async def _run_responses_model_with_custom_base_url(
@@ -57,7 +149,7 @@ async def _run_responses_model_with_custom_base_url(
     class DummyResponsesClient:
         def __init__(self, responses: DummyResponses) -> None:
             self.responses = responses
-            self.base_url = httpx.URL("https://custom.example.test/v1/")
+            self.base_url = httpx2.URL("https://custom.example.test/v1/")
 
     responses = DummyResponses()
     model = OpenAIResponsesModel(
@@ -73,19 +165,19 @@ async def _run_responses_model_with_custom_base_url(
 
 async def _run_responses_model_with_official_client(
     model_settings: ModelSettings | None = None,
-) -> list[httpx.Request]:
-    requests: list[httpx.Request] = []
+) -> list[httpx2.Request]:
+    requests: list[httpx2.Request] = []
 
-    async def handler(request: httpx.Request) -> httpx.Response:
+    async def handler(request: httpx2.Request) -> httpx2.Response:
         requests.append(request)
-        return httpx.Response(
+        return httpx2.Response(
             200,
             content=get_response_obj([]).model_dump_json(),
             headers={"content-type": "application/json"},
             request=request,
         )
 
-    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
     try:
         client = AsyncOpenAI(
             api_key="test-key",
@@ -107,6 +199,265 @@ async def _run_responses_model_with_official_client(
         await http_client.aclose()
 
     return requests
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_id_fields", [{}, {"call_id": None}], ids=["omitted", "null"])
+@pytest.mark.parametrize("stream", [False, True], ids=["non_streaming", "streaming"])
+async def test_unpaired_function_output_preserved_in_responses_request(
+    call_id_fields: dict[str, None], stream: bool
+) -> None:
+    """Responses keeps external-context output and its source without inventing a call ID."""
+    request_bodies: list[dict[str, Any]] = []
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        request_bodies.append(json.loads(request.content))
+        if stream:
+            event = _response_completed_frame("resp-id", sequence_number=0)
+            return httpx2.Response(
+                200,
+                content=f"event: response.completed\ndata: {event}\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx2.Response(
+            200,
+            content=get_response_obj([]).model_dump_json(),
+            headers={"content-type": "application/json"},
+        )
+
+    expected_input = {
+        "type": "function_call_output",
+        "name": "notifications",
+        "namespace": "slack",
+        "output": [
+            {"type": "input_text", "text": "Alice mentioned you in #deployments."},
+            {"type": "input_image", "image_url": "https://example.com/image.png"},
+        ],
+        **call_id_fields,
+    }
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http_client:
+        model = OpenAIResponsesModel(
+            model="gpt-4",
+            openai_client=AsyncOpenAI(api_key="test-key", http_client=http_client),
+        )
+        request_kwargs: dict[str, Any] = {
+            "system_instructions": None,
+            "input": [dict(expected_input)],
+            "model_settings": ModelSettings(),
+            "tools": [],
+            "output_schema": None,
+            "handoffs": [],
+            "tracing": ModelTracing.DISABLED,
+        }
+        if stream:
+            async for _ in model.stream_response(**request_kwargs):
+                pass
+        else:
+            await model.get_response(**request_kwargs)
+
+    assert [body["input"] for body in request_bodies] == [[expected_input]]
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["non_streaming", "streaming"])
+@pytest.mark.parametrize(
+    "tool_options, expected_include",
+    [
+        ({}, []),
+        ({"search_content_types": ["text"]}, []),
+        (
+            {
+                "search_content_types": ["image", "text"],
+                "image_settings": {"max_results": 3, "caption": False},
+            },
+            ["web_search_call.results"],
+        ),
+    ],
+    ids=["default", "text_only", "image_and_text"],
+)
+async def test_web_search_image_options_reach_responses_request(
+    stream: bool, tool_options: dict[str, Any], expected_include: list[str]
+) -> None:
+    """Inspect the provider wire payload, including fields not yet typed by openai-python."""
+    request_bodies: list[dict[str, Any]] = []
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        request_bodies.append(json.loads(request.content))
+        if stream:
+            event = _response_completed_frame("resp-id", sequence_number=0)
+            return httpx2.Response(
+                200,
+                content=f"event: response.completed\ndata: {event}\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx2.Response(
+            200,
+            content=get_response_obj([]).model_dump_json(),
+            headers={"content-type": "application/json"},
+        )
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http_client:
+        model = OpenAIResponsesModel(
+            model="gpt-5.6",
+            openai_client=AsyncOpenAI(api_key="test-key", http_client=http_client),
+        )
+        request_kwargs: dict[str, Any] = {
+            "system_instructions": None,
+            "input": "Find images of the Golden Gate Bridge.",
+            "model_settings": ModelSettings(),
+            "tools": [WebSearchTool(**tool_options)],
+            "output_schema": None,
+            "handoffs": [],
+            "tracing": ModelTracing.DISABLED,
+        }
+        if stream:
+            async for _ in model.stream_response(**request_kwargs):
+                pass
+        else:
+            await model.get_response(**request_kwargs)
+
+    assert len(request_bodies) == 1
+    body = request_bodies[0]
+    assert body["tools"] == [
+        {
+            "type": "web_search",
+            "filters": None,
+            "user_location": None,
+            "search_context_size": "medium",
+            **tool_options,
+        }
+    ]
+    assert body.get("include", []) == expected_include
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["non_streaming", "streaming"])
+@pytest.mark.parametrize(
+    "tool",
+    [
+        ImageGenerationTool(ImageGeneration(type="image_generation")),
+        ImageGenerationTool(
+            ImageGeneration(
+                type="image_generation",
+                model="gpt-image-1",
+                quality="high",
+                action="edit",
+                input_fidelity="high",
+                input_image_mask={"file_id": "file-mask"},
+            )
+        ),
+        ImageGenerationTool(
+            tool_config={
+                "type": "image_generation",
+                "model": "gpt-image-2.5-sunburst",
+                "quality": "max",
+                "action": "generate",
+                "size": "1536x864",
+                "background": "transparent",
+                "output_format": "webp",
+                "output_compression": 0,
+                "partial_images": 0,
+                "moderation": "auto",
+            }
+        ),
+        ImageGenerationTool(
+            tool_config={
+                "type": "image_generation",
+                "model": "gpt-image-2.5-flare",
+                "quality": "xhigh",
+                "action": "auto",
+                "size": "auto",
+                "output_format": "png",
+                "partial_images": 2,
+            }
+        ),
+    ],
+    ids=["defaults", "typed_edit", "sunburst_max", "flare_xhigh"],
+)
+async def test_image_generation_options_reach_responses_request(
+    stream: bool, tool: ImageGenerationTool
+) -> None:
+    """Use the real client's serializer to check options beyond its current annotations."""
+    expected_config = copy.deepcopy(tool.tool_config)
+    request_bodies: list[dict[str, Any]] = []
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        request_bodies.append(json.loads(request.content))
+        if stream:
+            event = _response_completed_frame("resp-id", sequence_number=0)
+            return httpx2.Response(
+                200,
+                content=f"event: response.completed\ndata: {event}\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx2.Response(
+            200,
+            content=get_response_obj([]).model_dump_json(),
+            headers={"content-type": "application/json"},
+        )
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http_client:
+        agent = Agent(
+            name="Image generator",
+            model=OpenAIResponsesModel(
+                model="gpt-5.5",
+                openai_client=AsyncOpenAI(api_key="test-key", http_client=http_client),
+            ),
+            tools=[tool],
+        )
+        prompt = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Generate an image, or edit this image."},
+                    {"type": "input_image", "file_id": "file-image", "detail": "auto"},
+                ],
+            }
+        ]
+        if stream:
+            result = Runner.run_streamed(agent, prompt)
+            async for _ in result.stream_events():
+                pass
+        else:
+            await Runner.run(agent, prompt)
+
+    assert len(request_bodies) == 1
+    assert request_bodies[0]["tools"] == [expected_config]
+    assert tool.tool_config == expected_config
+    assert request_bodies[0]["model"] == "gpt-5.5"
+
+
+def test_image_generation_config_remains_mutable() -> None:
+    config: ImageGeneration = {"type": "image_generation", "quality": "low"}
+    tool = ImageGenerationTool(config)
+    assert tool.tool_config is config
+    assert [field.name for field in fields(tool)] == ["tool_config"]
+    assert asdict(tool) == {"tool_config": config}
+    assert replace(tool).tool_config is config
+    tool.tool_config["quality"] = "high"
+    assert config["quality"] == "high"
+
+    replacement: ImageGeneration = {"type": "image_generation", "quality": "auto"}
+    assert replace(tool, tool_config=replacement).tool_config is replacement
+    tool.tool_config = replacement
+    assert tool.tool_config is replacement
+
+    tool.tool_config = {
+        "type": "image_generation",
+        "model": "gpt-image-2.5-flare",
+        "quality": "xhigh",
+    }
+    tool.tool_config["quality"] = "max"
+    assert Converter.convert_tools([tool], []).tools == [
+        {
+            "type": "image_generation",
+            "model": "gpt-image-2.5-flare",
+            "quality": "max",
+        }
+    ]
 
 
 class DummyWSConnection:
@@ -132,7 +483,7 @@ class DummyWSConnection:
 
 class DummyWSClient:
     def __init__(self):
-        self.base_url = httpx.URL("https://api.openai.com/v1/")
+        self.base_url = httpx2.URL("https://api.openai.com/v1/")
         self.websocket_base_url = None
         self.default_query: dict[str, Any] = {}
         self.auth_headers = {"Authorization": "Bearer test-key"}
@@ -168,6 +519,82 @@ def _response_error_frame(code: str, message: str, sequence_number: int) -> str:
             "sequence_number": sequence_number,
         }
     )
+
+
+def _connection_closed_error(message: str) -> Exception:
+    class ConnectionClosedError(Exception):
+        pass
+
+    ConnectionClosedError.__module__ = "websockets.client"
+    return ConnectionClosedError(message)
+
+
+def _invalid_message_error(message: str, *, cause: BaseException | None = None) -> Exception:
+    class InvalidMessage(Exception):
+        pass
+
+    InvalidMessage.__module__ = "websockets.exceptions"
+    error = InvalidMessage(message)
+    if cause is not None:
+        error.__cause__ = cause
+    return error
+
+
+@pytest.mark.parametrize("parallel_tool_calls", [True, False, None])
+@pytest.mark.parametrize("tool_source", ["none", "function", "handoff"])
+def test_parallel_tool_calls_follow_converted_responses_tools(
+    parallel_tool_calls: bool | None,
+    tool_source: str,
+) -> None:
+    tools: list[Tool] = (
+        [function_tool(lambda: "ok", name_override="test_tool")]
+        if tool_source == "function"
+        else []
+    )
+    handoffs = [handoff(Agent(name="handoff"))] if tool_source == "handoff" else []
+    model = OpenAIResponsesModel(
+        model="gpt-4",
+        openai_client=cast(Any, object()),
+    )
+
+    kwargs = model._build_response_create_kwargs(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(parallel_tool_calls=parallel_tool_calls),
+        tools=tools,
+        output_schema=None,
+        handoffs=handoffs,
+    )
+
+    expected_parallel_tool_calls = (
+        parallel_tool_calls if tool_source != "none" and parallel_tool_calls is not None else omit
+    )
+    assert kwargs["parallel_tool_calls"] is expected_parallel_tool_calls
+    assert bool(kwargs["tools"]) is (tool_source != "none")
+
+
+@pytest.mark.parametrize("parallel_tool_calls", [True, False, None])
+def test_parallel_tool_calls_preserve_stored_prompt_overrides(
+    parallel_tool_calls: bool | None,
+) -> None:
+    model = OpenAIResponsesModel(
+        model="gpt-4",
+        openai_client=cast(Any, object()),
+    )
+
+    kwargs = model._build_response_create_kwargs(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(parallel_tool_calls=parallel_tool_calls),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        prompt={"id": "pmpt_123"},
+    )
+
+    expected_parallel_tool_calls = parallel_tool_calls if parallel_tool_calls is not None else omit
+    assert kwargs["parallel_tool_calls"] is expected_parallel_tool_calls
+    assert kwargs["tools"] is omit
 
 
 @pytest.mark.allow_call_model_methods
@@ -243,7 +670,7 @@ async def test_get_response_exposes_request_id():
     response = await model.get_response(
         system_instructions=None,
         input="hi",
-        model_settings=ModelSettings(),
+        model_settings=ModelSettings(preserve_raw_usage=True),
         tools=[],
         output_schema=None,
         handoffs=[],
@@ -252,18 +679,27 @@ async def test_get_response_exposes_request_id():
 
     assert response.response_id == "resp-request-id"
     assert response.request_id == "req_nonstream_123"
+    assert response.raw_usage is not None
+    assert response.raw_usage["input_tokens_details"]["cached_tokens"] == 0
 
 
 @pytest.mark.allow_call_model_methods
 @pytest.mark.asyncio
 async def test_get_response_span_exports_usage():
+    class FalsyResponseUsage(ResponseUsage):
+        def __bool__(self) -> bool:
+            return False
+
     class DummyResponses:
         async def create(self, **kwargs):
-            return get_response_obj(
+            response = get_response_obj(
                 [],
                 response_id="resp-usage",
                 usage=Usage(requests=1, input_tokens=10, output_tokens=4, total_tokens=14),
             )
+            assert response.usage is not None
+            response.usage = FalsyResponseUsage.model_validate(response.usage.model_dump())
+            return response
 
     class DummyResponsesClient:
         def __init__(self):
@@ -549,7 +985,10 @@ async def test_fetch_response_stream_without_request_id_still_returns_events():
 
 @pytest.mark.allow_call_model_methods
 @pytest.mark.asyncio
-async def test_stream_response_ignores_streaming_context_exit_failure_after_terminal_event():
+@pytest.mark.parametrize("event_type", ["response.completed", "error"])
+async def test_stream_response_ignores_streaming_context_exit_failure_after_terminal_event(
+    event_type,
+):
     class DummyHTTPStream:
         def __init__(self):
             self._yielded = False
@@ -561,6 +1000,14 @@ async def test_stream_response_ignores_streaming_context_exit_failure_after_term
             if self._yielded:
                 raise StopAsyncIteration
             self._yielded = True
+            if event_type == "error":
+                return ResponseErrorEvent(
+                    type="error",
+                    code="server_error",
+                    message="synthetic provider failure",
+                    param=None,
+                    sequence_number=0,
+                )
             return ResponseCompletedEvent(
                 type="response.completed",
                 response=get_response_obj([], response_id="resp-stream-request-id"),
@@ -599,21 +1046,121 @@ async def test_stream_response_ignores_streaming_context_exit_failure_after_term
 
     model = OpenAIResponsesModel(model="gpt-4", openai_client=DummyResponsesClient())  # type: ignore[arg-type]
 
-    events: list[ResponseCompletedEvent] = []
-    async for event in model.stream_response(
-        system_instructions=None,
-        input="hi",
-        model_settings=ModelSettings(),
-        tools=[],
-        output_schema=None,
-        handoffs=[],
-        tracing=ModelTracing.DISABLED,
-    ):
-        assert isinstance(event, ResponseCompletedEvent)
-        events.append(event)
+    events = []
+    expected_error = (
+        pytest.raises(ModelBehaviorError, match="synthetic provider failure")
+        if event_type == "error"
+        else nullcontext()
+    )
+    with expected_error:
+        async for event in model.stream_response(
+            system_instructions=None,
+            input="hi",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+        ):
+            events.append(event)
 
-    assert len(events) == 1
+    assert [event.type for event in events] == [event_type]
     assert aexit_calls == [(None, None, None)]
+
+
+@pytest.mark.asyncio
+async def test_response_stream_preserves_error_event_when_cleanup_fails() -> None:
+    event = ResponseErrorEvent(
+        type="error",
+        code="server_error",
+        message="synthetic provider failure",
+        param=None,
+        sequence_number=0,
+    )
+    cleanup_calls = 0
+
+    async def events():
+        yield event
+
+    async def cleanup():
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        raise RuntimeError("transport close failed")
+
+    stream = _ResponseStreamWithRequestId(events(), request_id=None, cleanup=cleanup)
+    assert [item async for item in stream] == [event]
+    assert cleanup_calls == 1
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["error", "response.failed", "response.incomplete", None])
+async def test_stream_response_preserves_terminal_failure_when_http_close_fails(
+    event_type: str | None,
+) -> None:
+    # Exercise real SSE parsing and transport teardown, which a model fake would bypass.
+    close_calls = 0
+    if event_type == "error":
+        payload = ResponseErrorEvent(
+            type="error",
+            code="server_error",
+            message="synthetic provider failure",
+            param=None,
+            sequence_number=0,
+        ).model_dump()
+        expected_message = "code=server_error; message=synthetic provider failure"
+    elif event_type is not None:
+        status = event_type.removeprefix("response.")
+        payload = {
+            "type": event_type,
+            "sequence_number": 0,
+            "response": _response_with_terminal_status(status).model_dump(),
+        }
+        expected_message = f"status={status}"
+    else:
+        payload = None
+        expected_message = "transport close failed"
+
+    class FailingCloseStream(httpx2.AsyncByteStream):
+        async def __aiter__(self):
+            if payload is not None:
+                yield f"event: {event_type}\ndata: {json.dumps(payload)}\n\n".encode()
+            yield b"data: [DONE]\n\n"
+
+        async def aclose(self):
+            nonlocal close_calls
+            close_calls += 1
+            raise RuntimeError("transport close failed")
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=FailingCloseStream(),
+            request=request,
+        )
+
+    events = []
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http_client:
+        model = OpenAIResponsesModel(
+            model="gpt-4",
+            openai_client=AsyncOpenAI(api_key="test-key", http_client=http_client),
+        )
+        expected_exception = ModelBehaviorError if event_type is not None else RuntimeError
+        with pytest.raises(expected_exception, match=expected_message):
+            async for event in model.stream_response(
+                system_instructions=None,
+                input="hi",
+                model_settings=ModelSettings(),
+                tools=[],
+                output_schema=None,
+                handoffs=[],
+                tracing=ModelTracing.DISABLED,
+            ):
+                events.append(event)
+
+    assert [event.type for event in events] == ([event_type] if event_type is not None else [])
+    assert close_calls == 1
 
 
 @pytest.mark.allow_call_model_methods
@@ -667,6 +1214,76 @@ async def test_stream_response_close_closes_inner_http_stream_with_async_close(m
     await stream_agen.aclose()
 
     assert inner_stream.close_calls == 1
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_stream_span_records_io_when_consumer_stops_at_completed(monkeypatch):
+    """A consumer that stops at `response.completed` closes the generator.
+
+    The SDK's own run loop does this (it wraps the model stream in `aclosing()` and
+    breaks once it sees the terminal event). Anything recorded only after the yield
+    loop therefore never runs for such a consumer, so the response and input must be
+    attached to the span before the terminal event is yielded, mirroring the existing
+    usage handling and the non-streamed `get_response` path.
+    """
+    client = DummyWSClient()
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+
+    class DummyHTTPStream:
+        def __init__(self, response):
+            self._response = response
+            self._yielded = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._yielded:
+                raise StopAsyncIteration
+            self._yielded = True
+            return ResponseCompletedEvent(
+                type="response.completed",
+                response=self._response,
+                sequence_number=0,
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    response = get_response_obj(
+        [],
+        response_id="resp-stream-early-close",
+        usage=Usage(requests=1, input_tokens=10, output_tokens=4, total_tokens=14),
+    )
+    inner_stream = DummyHTTPStream(response)
+
+    async def fake_fetch_response(*args: Any, **kwargs: Any) -> DummyHTTPStream:
+        return inner_stream
+
+    monkeypatch.setattr(model, "_fetch_response", fake_fetch_response)
+
+    with trace(workflow_name="test"):
+        stream = model.stream_response(
+            system_instructions=None,
+            input="the user prompt",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.ENABLED,
+        )
+        stream_agen = cast(Any, stream)
+        async for event in stream_agen:
+            if event.type == "response.completed":
+                break  # stop consuming, as a caller watching for the terminal event would
+        await stream_agen.aclose()
+
+    response_spans = [span for span in fetch_ordered_spans() if span.span_data.type == "response"]
+    assert len(response_spans) == 1
+    assert response_spans[0].span_data.response is not None
+    assert response_spans[0].span_data.input is not None
+    assert response_spans[0].span_data.usage is not None
 
 
 @pytest.mark.allow_call_model_methods
@@ -966,7 +1583,7 @@ async def test_responses_requests_normalize_dictionary_agent_settings(use_dictio
     assert kwargs["top_p"] == 1.0
     assert kwargs["max_output_tokens"] == 64
     assert "max_tokens" not in kwargs
-    assert kwargs["parallel_tool_calls"] is False
+    assert kwargs["parallel_tool_calls"] is omit
     assert kwargs["extra_headers"]["x-model-settings-parity"] == "preserved"
     assert kwargs["extra_query"] == {"model_settings_parity": "verified"}
     assert kwargs["extra_body"] == {"prompt_cache_key": "extra-body-cache-key"}
@@ -1798,6 +2415,50 @@ async def test_preview_model_forced_computer_tool_choice_uses_preview_selector(
 
 @pytest.mark.allow_call_model_methods
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_choice", ["shell", "apply_patch"])
+async def test_builtin_tool_choice_selects_builtin_among_multiple_tools(tool_choice: str) -> None:
+    called_kwargs: dict[str, Any] = {}
+
+    class DummyResponses:
+        async def create(self, **kwargs):
+            nonlocal called_kwargs
+            called_kwargs = kwargs
+            return get_response_obj([])
+
+    class DummyResponsesClient:
+        def __init__(self):
+            self.responses = DummyResponses()
+
+    builtin_tool: Tool = (
+        ShellTool(executor=lambda request: "ok")
+        if tool_choice == "shell"
+        else ApplyPatchTool(editor=cast(Any, object()))
+    )
+    model = OpenAIResponsesModel(
+        model="gpt-5.4",
+        openai_client=DummyResponsesClient(),  # type: ignore[arg-type]
+    )
+
+    await model.get_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(tool_choice=tool_choice),
+        tools=[
+            function_tool(lambda: "ok", name_override="lookup_account"),
+            builtin_tool,
+            function_tool(lambda: "ok", name_override="summarize"),
+        ],
+        output_schema=None,
+        handoffs=[handoff(Agent(name="Target"))],
+        tracing=ModelTracing.DISABLED,
+    )
+
+    assert called_kwargs["tool_choice"] == {"type": tool_choice}
+    assert tool_choice in [dict(tool).get("type") for tool in called_kwargs["tools"]]
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
 async def test_websocket_model_reuses_connection_and_sends_response_create_frames(monkeypatch):
     client = DummyWSClient()
     ws = DummyWSConnection(
@@ -1905,6 +2566,7 @@ async def test_websocket_model_passes_keepalive_options_to_connect(monkeypatch):
     assert opened is ws
     assert captured_kwargs["ws_url"] == "wss://example.test/v1/responses"
     assert captured_kwargs["additional_headers"] == {"Authorization": "Bearer test-key"}
+    assert captured_kwargs["logger"].isEnabledFor(logging.DEBUG) is False
     assert captured_kwargs["open_timeout"] == 10.0
     assert captured_kwargs["ping_interval"] == 45.0
     assert captured_kwargs["ping_timeout"] is None
@@ -2050,6 +2712,32 @@ async def test_websocket_model_get_response_rejects_failed_terminal_response_pay
     monkeypatch.setattr(model, "_open_websocket_connection", fake_open)
 
     with pytest.raises(ModelBehaviorError, match=terminal_event_type):
+        await model.get_response(
+            system_instructions=None,
+            input="hi",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+        )
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["incomplete", "failed"])
+async def test_get_response_rejects_failed_terminal_response_status(status: str) -> None:
+    class Responses:
+        async def create(self, **kwargs: Any) -> Response:
+            return _response_with_terminal_status(status)
+
+    class Client:
+        responses = Responses()
+        base_url = httpx2.URL("https://custom.example.test/v1/")
+
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, Client()))
+
+    with pytest.raises(ModelBehaviorError, match=f"response.{status}"):
         await model.get_response(
             system_instructions=None,
             input="hi",
@@ -2690,6 +3378,292 @@ async def test_websocket_model_reconnects_if_cached_connection_is_closed(monkeyp
 
 @pytest.mark.allow_call_model_methods
 @pytest.mark.asyncio
+async def test_websocket_model_retries_if_handshake_fails_before_request(monkeypatch):
+    client = DummyWSClient()
+
+    ws = DummyWSConnection([_response_completed_frame("resp-retried", 1)])
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+    open_calls = 0
+
+    async def fake_open(
+        ws_url: str, headers: dict[str, str], *, connect_timeout: float | None = None
+    ) -> DummyWSConnection:
+        nonlocal open_calls
+        open_calls += 1
+        if open_calls == 1:
+            raise _invalid_message_error(
+                "did not receive a valid HTTP response",
+                cause=EOFError("connection closed while reading HTTP status line"),
+            )
+        return ws
+
+    monkeypatch.setattr(model, "_open_websocket_connection", fake_open)
+
+    response = await model.get_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+    )
+
+    assert response.response_id == "resp-retried"
+    assert open_calls == 2
+    assert len(ws.sent_messages) == 1
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_websocket_model_does_not_retry_malformed_handshake(monkeypatch):
+    client = DummyWSClient()
+    error = _invalid_message_error("malformed HTTP status line")
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+    open_calls = 0
+
+    async def fake_open(
+        ws_url: str, headers: dict[str, str], *, connect_timeout: float | None = None
+    ) -> DummyWSConnection:
+        nonlocal open_calls
+        open_calls += 1
+        raise error
+
+    monkeypatch.setattr(model, "_open_websocket_connection", fake_open)
+
+    with pytest.raises(type(error)) as exc_info:
+        await model.get_response(
+            system_instructions=None,
+            input="hi",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+        )
+
+    assert exc_info.value is error
+    assert open_calls == 1
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_websocket_model_exhausts_one_retry_after_repeated_eof_handshake_failures(
+    monkeypatch,
+):
+    client = DummyWSClient()
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+    open_calls = 0
+
+    async def fake_open(
+        ws_url: str, headers: dict[str, str], *, connect_timeout: float | None = None
+    ) -> DummyWSConnection:
+        nonlocal open_calls
+        open_calls += 1
+        raise _invalid_message_error(
+            "did not receive a valid HTTP response",
+            cause=EOFError("connection closed while reading HTTP status line"),
+        )
+
+    monkeypatch.setattr(model, "_open_websocket_connection", fake_open)
+
+    with pytest.raises(RuntimeError, match="before any response events were received"):
+        await model.get_response(
+            system_instructions=None,
+            input="hi",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+        )
+
+    assert open_calls == 2
+    assert model._ws_connection is None
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_websocket_model_close_during_failing_handshake_prevents_retry(monkeypatch):
+    client = DummyWSClient()
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+    handshake_started = asyncio.Event()
+    release_handshake = asyncio.Event()
+    error = _invalid_message_error(
+        "did not receive a valid HTTP response",
+        cause=EOFError("connection closed while reading HTTP status line"),
+    )
+    open_calls = 0
+
+    async def fake_open(
+        ws_url: str, headers: dict[str, str], *, connect_timeout: float | None = None
+    ) -> DummyWSConnection:
+        nonlocal open_calls
+        open_calls += 1
+        handshake_started.set()
+        await release_handshake.wait()
+        raise error
+
+    monkeypatch.setattr(model, "_open_websocket_connection", fake_open)
+
+    request_task = asyncio.create_task(
+        model.get_response(
+            system_instructions=None,
+            input="hi",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+        )
+    )
+    await handshake_started.wait()
+    await model.close()
+    release_handshake.set()
+
+    with pytest.raises(type(error)) as exc_info:
+        await request_task
+
+    assert exc_info.value is error
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(error=exc_info.value, attempt=1, stream=False)
+    )
+    assert advice is not None
+    assert advice.normalized is not None
+    assert advice.normalized.is_abort is True
+    assert open_calls == 1
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_websocket_model_close_during_retry_handshake_discards_acquired_connection(
+    monkeypatch,
+):
+    client = DummyWSClient()
+    ws = DummyWSConnection([_response_completed_frame("resp-after-close", 1)])
+    first_handshake = True
+    second_handshake_started = asyncio.Event()
+    release_second_handshake = asyncio.Event()
+    error = _invalid_message_error(
+        "did not receive a valid HTTP response",
+        cause=EOFError("connection closed while reading HTTP status line"),
+    )
+    open_calls = 0
+
+    async def fake_open(
+        ws_url: str, headers: dict[str, str], *, connect_timeout: float | None = None
+    ) -> DummyWSConnection:
+        nonlocal first_handshake, open_calls
+        open_calls += 1
+        if first_handshake:
+            first_handshake = False
+            raise error
+        second_handshake_started.set()
+        await release_second_handshake.wait()
+        return ws
+
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+    monkeypatch.setattr(model, "_open_websocket_connection", fake_open)
+
+    request_task = asyncio.create_task(
+        model.get_response(
+            system_instructions=None,
+            input="hi",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+        )
+    )
+    await second_handshake_started.wait()
+    await model.close()
+    release_second_handshake.set()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await request_task
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(error=exc_info.value, attempt=1, stream=False)
+    )
+    assert advice is not None
+    assert advice.normalized is not None
+    assert advice.normalized.is_abort is True
+    assert open_calls == 2
+    assert ws.sent_messages == []
+    assert ws.close_calls == 1
+    assert model._ws_connection is None
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_websocket_model_close_during_cached_connection_drop_prevents_replacement(
+    monkeypatch,
+):
+    client = DummyWSClient()
+
+    class BlockingCloseWSConnection(DummyWSConnection):
+        def __init__(self, frames: list[str]):
+            super().__init__(frames)
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+
+        async def close(self) -> None:
+            self.close_started.set()
+            await self.release_close.wait()
+            await super().close()
+
+    ws1 = BlockingCloseWSConnection([_response_completed_frame("resp-1", 1)])
+    ws2 = DummyWSConnection([_response_completed_frame("resp-2", 1)])
+    opened: list[DummyWSConnection] = []
+
+    async def fake_open(
+        ws_url: str, headers: dict[str, str], *, connect_timeout: float | None = None
+    ) -> DummyWSConnection:
+        connection = ws1 if not opened else ws2
+        opened.append(connection)
+        return connection
+
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+    monkeypatch.setattr(model, "_open_websocket_connection", fake_open)
+
+    first = await model.get_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+    )
+    assert first.response_id == "resp-1"
+
+    ws1.close_code = 1001
+    request_task = asyncio.create_task(
+        model.get_response(
+            system_instructions=None,
+            input="next",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+        )
+    )
+    await ws1.close_started.wait()
+    await model.close()
+    ws1.release_close.set()
+
+    with pytest.raises(RuntimeError):
+        await request_task
+
+    assert opened == [ws1]
+    assert ws2.sent_messages == []
+    assert model._ws_connection is None
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
 async def test_websocket_model_does_not_retry_if_send_raises_after_writing_on_reused_connection(
     monkeypatch,
 ):
@@ -2894,7 +3868,7 @@ async def test_websocket_model_does_not_retry_after_client_initiated_close(monke
 @pytest.mark.allow_call_model_methods
 def test_websocket_model_prepare_websocket_url_preserves_non_tls_scheme_mapping():
     client = DummyWSClient()
-    client.base_url = httpx.URL("http://127.0.0.1:8080/v1/")
+    client.base_url = httpx2.URL("http://127.0.0.1:8080/v1/")
     model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
 
     ws_url = model._prepare_websocket_url(extra_query=None)
@@ -2909,8 +3883,24 @@ def test_websocket_model_prepare_websocket_url_appends_path_with_existing_query(
     model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
 
     ws_url = model._prepare_websocket_url(extra_query={"route": "team-a"})
-    parsed = httpx.URL(ws_url)
+    parsed = httpx2.URL(ws_url)
 
+    assert parsed.path == "/v1/responses"
+    assert dict(parsed.params) == {"token": "abc", "route": "team-a"}
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_model_prepare_websocket_url_accepts_legacy_httpx_url():
+    import httpx
+
+    client = DummyWSClient()
+    client.websocket_base_url = httpx.URL("https://proxy.example.test/v1?token=abc")
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+
+    ws_url = model._prepare_websocket_url(extra_query={"route": "team-a"})
+    parsed = httpx2.URL(ws_url)
+
+    assert parsed.scheme == "wss"
     assert parsed.path == "/v1/responses"
     assert dict(parsed.params) == {"token": "abc", "route": "team-a"}
 
@@ -2931,7 +3921,7 @@ def test_websocket_model_prepare_websocket_url_normalizes_explicit_http_schemes(
     model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
 
     ws_url = model._prepare_websocket_url(extra_query={"route": "team-a"})
-    parsed = httpx.URL(ws_url)
+    parsed = httpx2.URL(ws_url)
 
     assert parsed.scheme == expected_scheme
     assert parsed.path == "/v1/responses"
@@ -2948,7 +3938,7 @@ def test_websocket_model_prepare_websocket_url_treats_top_level_omit_sentinels_a
     model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
 
     ws_url = model._prepare_websocket_url(extra_query=extra_query)
-    parsed = httpx.URL(ws_url)
+    parsed = httpx2.URL(ws_url)
 
     assert parsed.path == "/v1/responses"
     assert dict(parsed.params) == {"token": "abc"}
@@ -2962,7 +3952,7 @@ def test_websocket_model_prepare_websocket_url_skips_not_given_query_values():
     model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
 
     ws_url = model._prepare_websocket_url(extra_query={"tenant": NOT_GIVEN, "region": "us"})
-    parsed = httpx.URL(ws_url)
+    parsed = httpx2.URL(ws_url)
 
     assert parsed.path == "/v1/responses"
     assert dict(parsed.params) == {"token": "abc", "route": "team-a", "region": "us"}
@@ -3122,6 +4112,63 @@ async def test_websocket_model_get_response_applies_timeout_to_recv(monkeypatch)
 
 @pytest.mark.allow_call_model_methods
 @pytest.mark.asyncio
+async def test_websocket_model_get_response_marks_partial_receive_timeout_unsafe_to_replay(
+    monkeypatch,
+):
+    client = DummyWSClient()
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+
+    class PartialThenSlowRecvWSConnection(DummyWSConnection):
+        def __init__(self) -> None:
+            super().__init__([_response_event_frame("response.created", "resp-partial", 1)])
+            self.recv_calls = 0
+
+        async def recv(self) -> str:
+            self.recv_calls += 1
+            if self.recv_calls == 1:
+                return await super().recv()
+            await asyncio.sleep(0.2)
+            return await super().recv()
+
+    ws = PartialThenSlowRecvWSConnection()
+
+    async def fake_open(
+        ws_url: str, headers: dict[str, str], *, connect_timeout: float | None = None
+    ) -> DummyWSConnection:
+        return ws
+
+    monkeypatch.setattr(model, "_open_websocket_connection", fake_open)
+
+    with pytest.raises(TimeoutError, match="Responses websocket receive timed out") as exc_info:
+        await model.get_response(
+            system_instructions=None,
+            input="hi",
+            model_settings=ModelSettings(extra_args={"timeout": 0.01}),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+        )
+
+    error = exc_info.value
+    assert getattr(error, "_openai_agents_ws_replay_safety", None) == "unsafe"
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is False
+    assert advice.replay_safety == "unsafe"
+    assert ws.close_calls == 1
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
 async def test_websocket_model_get_response_applies_timeout_while_waiting_for_request_lock(
     monkeypatch,
 ):
@@ -3188,7 +4235,7 @@ async def test_websocket_model_get_response_allows_zero_pool_timeout_when_lock_u
     monkeypatch,
 ):
     client = DummyWSClient()
-    client.timeout = httpx.Timeout(connect=1.0, read=1.0, write=1.0, pool=0.0)
+    client.timeout = httpx2.Timeout(connect=1.0, read=1.0, write=1.0, pool=0.0)
     model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
     ws = DummyWSConnection([_response_completed_frame("resp-zero-pool", 1)])
 
@@ -3211,6 +4258,23 @@ async def test_websocket_model_get_response_allows_zero_pool_timeout_when_lock_u
 
     assert response.response_id == "resp-zero-pool"
     assert len(ws.sent_messages) == 1
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_model_request_timeouts_accept_legacy_httpx_timeout():
+    import httpx
+
+    client = DummyWSClient()
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+
+    timeouts = model._get_websocket_request_timeouts(
+        httpx.Timeout(connect=1.0, read=2.0, write=3.0, pool=4.0)
+    )
+
+    assert timeouts.lock == 4.0
+    assert timeouts.connect == 1.0
+    assert timeouts.send == 3.0
+    assert timeouts.recv == 2.0
 
 
 @pytest.mark.allow_call_model_methods
@@ -3249,7 +4313,7 @@ async def test_websocket_model_get_response_uses_client_default_timeout_when_no_
     monkeypatch,
 ):
     client = DummyWSClient()
-    client.timeout = httpx.Timeout(connect=1.0, read=0.01, write=1.0, pool=1.0)
+    client.timeout = httpx2.Timeout(connect=1.0, read=0.01, write=1.0, pool=1.0)
     model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
 
     class SlowRecvWSConnection(DummyWSConnection):
@@ -3286,7 +4350,7 @@ async def test_websocket_model_get_response_uses_client_default_timeout_when_ove
     monkeypatch,
 ):
     client = DummyWSClient()
-    client.timeout = httpx.Timeout(connect=1.0, read=0.01, write=1.0, pool=1.0)
+    client.timeout = httpx2.Timeout(connect=1.0, read=0.01, write=1.0, pool=1.0)
     model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
 
     class SlowRecvWSConnection(DummyWSConnection):
@@ -3429,7 +4493,7 @@ def test_websocket_model_prepare_websocket_url_includes_client_default_query():
     ws_url = model._prepare_websocket_url(
         extra_query={"route": "team-a", "api-version": "2026-01-01-preview"}
     )
-    parsed = httpx.URL(ws_url)
+    parsed = httpx2.URL(ws_url)
 
     assert parsed.path == "/v1/responses"
     assert dict(parsed.params) == {
@@ -3447,7 +4511,7 @@ def test_websocket_model_prepare_websocket_url_omit_removes_inherited_query_para
     model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
 
     ws_url = model._prepare_websocket_url(extra_query={"token": omit, "route": omit, "keep": "1"})
-    parsed = httpx.URL(ws_url)
+    parsed = httpx2.URL(ws_url)
 
     assert parsed.path == "/v1/responses"
     assert dict(parsed.params) == {"region": "us", "keep": "1"}
@@ -3605,3 +4669,1121 @@ async def test_websocket_model_open_websocket_connection_honors_connect_timeout(
 
     assert result is sentinel
     assert captured["kwargs"]["open_timeout"] == 42.0
+
+
+@pytest.mark.allow_call_model_methods
+def test_get_retry_advice_uses_openai_headers() -> None:
+    request = httpx2.Request("POST", "https://api.openai.com/v1/responses")
+    response = httpx2.Response(
+        429,
+        request=request,
+        headers={
+            "x-should-retry": "true",
+            "retry-after-ms": "250",
+            "x-request-id": "req_456",
+        },
+        json={"error": {"code": "rate_limit"}},
+    )
+    error = RateLimitError(
+        "rate limited", response=response, body={"error": {"code": "rate_limit"}}
+    )
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, object()))
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.retry_after == 0.25
+    assert advice.replay_safety == "safe"
+    assert advice.normalized is not None
+    assert advice.normalized.error_code == "rate_limit"
+    assert advice.normalized.status_code == 429
+    assert advice.normalized.request_id == "req_456"
+
+
+@pytest.mark.allow_call_model_methods
+def test_get_retry_advice_keeps_stateful_transport_failures_ambiguous() -> None:
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, object()))
+    error = APIConnectionError(
+        message="connection error",
+        request=httpx2.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety is None
+    assert advice.normalized is not None
+    assert advice.normalized.is_network_error is True
+
+
+@pytest.mark.allow_call_model_methods
+def test_get_retry_advice_marks_stateful_http_failures_replay_safe() -> None:
+    request = httpx2.Request("POST", "https://api.openai.com/v1/responses")
+    response = httpx2.Response(
+        429,
+        request=request,
+        json={"error": {"code": "rate_limit"}},
+    )
+    error = RateLimitError(
+        "rate limited", response=response, body={"error": {"code": "rate_limit"}}
+    )
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, object()))
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety == "safe"
+    assert advice.normalized is not None
+    assert advice.normalized.status_code == 429
+
+
+@pytest.mark.allow_call_model_methods
+def test_get_retry_advice_keeps_stateless_transport_failures_retryable() -> None:
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, object()))
+    error = APIConnectionError(
+        message="connection error",
+        request=httpx2.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety is None
+    assert advice.normalized is not None
+    assert advice.normalized.is_network_error is True
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_marks_ambiguous_replay_unsafe() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = RuntimeError("Responses websocket connection closed before a terminal response event.")
+    error.__cause__ = _connection_closed_error("peer closed after request send")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is False
+    assert advice.replay_safety == "unsafe"
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_allows_stateless_ambiguous_disconnect_retry() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = RuntimeError("Responses websocket connection closed before a terminal response event.")
+    error.__cause__ = _connection_closed_error("peer closed after request send")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety is None
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_keeps_wrapped_pre_send_disconnect_safe() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = RuntimeError(
+        "Responses websocket connection closed before any response events were received."
+    )
+    setattr(error, "_openai_agents_ws_replay_safety", "safe")  # noqa: B010
+    error.__cause__ = _connection_closed_error("peer closed before request send")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety == "safe"
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_allows_stateless_wrapped_post_send_disconnect_retry() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = RuntimeError(
+        "Responses websocket connection closed before any response events were received."
+    )
+    setattr(error, "_openai_agents_ws_replay_safety", "unsafe")  # noqa: B010
+    error.__cause__ = _connection_closed_error("peer closed after request send")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety is None
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_allows_stateless_nonstream_post_send_retry() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = RuntimeError(
+        "Responses websocket connection closed before any response events were received."
+    )
+    setattr(error, "_openai_agents_ws_replay_safety", "unsafe")  # noqa: B010
+    error.__cause__ = _connection_closed_error("peer closed after request send")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety is None
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_marks_wrapped_post_send_disconnect_unsafe() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = RuntimeError(
+        "Responses websocket connection closed before any response events were received."
+    )
+    setattr(error, "_openai_agents_ws_replay_safety", "unsafe")  # noqa: B010
+    error.__cause__ = _connection_closed_error("peer closed after request send")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is False
+    assert advice.replay_safety == "unsafe"
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_marks_partial_nonstream_failure_unsafe() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = TimeoutError("Responses websocket receive timed out after 5.0 seconds.")
+    setattr(error, "_openai_agents_ws_replay_safety", "unsafe")  # noqa: B010
+    setattr(error, "_openai_agents_ws_response_started", True)  # noqa: B010
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is False
+    assert advice.replay_safety == "unsafe"
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_marks_connect_timeout_replay_safe() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = TimeoutError("Responses websocket connect timed out after 5.0 seconds.")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety == "safe"
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_marks_handshake_failure_replay_safe() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = _invalid_message_error(
+        "did not receive a valid HTTP response",
+        cause=EOFError("connection closed while reading HTTP status line"),
+    )
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety == "safe"
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_ignores_malformed_handshake() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = _invalid_message_error("malformed HTTP status line")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is None
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_marks_close_invalidation_non_retryable() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = RuntimeError("Responses websocket connection closed while establishing a connection.")
+    setattr(error, "_openai_agents_ws_close_invalidated", True)  # noqa: B010
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is False
+    assert advice.normalized is not None
+    assert advice.normalized.is_abort is True
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_marks_request_lock_timeout_replay_safe() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = TimeoutError("Responses websocket request lock wait timed out after 5.0 seconds.")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety == "safe"
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_marks_stateful_receive_timeout_unsafe() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = TimeoutError("Responses websocket receive timed out after 5.0 seconds.")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is False
+    assert advice.replay_safety == "unsafe"
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_allows_stateless_receive_timeout_retry() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = TimeoutError("Responses websocket receive timed out after 5.0 seconds.")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety is None
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.parametrize("previous_response_id", [None, "resp_prev"])
+def test_websocket_get_retry_advice_marks_pre_response_overload_retryable(
+    previous_response_id: str | None,
+) -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = ResponsesWebSocketError(
+        {
+            "type": "error",
+            "error": {
+                "type": "service_unavailable_error",
+                "code": "server_is_overloaded",
+                "message": "Our servers are currently overloaded. Please try again later.",
+            },
+        }
+    )
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+            previous_response_id=previous_response_id,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety is None
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.parametrize("previous_response_id", [None, "resp_prev"])
+def test_websocket_get_retry_advice_marks_pre_response_server_error_retryable(
+    previous_response_id: str | None,
+) -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = ResponsesWebSocketError(
+        {
+            "type": "error",
+            "error": {
+                "type": "server_error",
+                "code": None,
+                "message": "Sorry, something went wrong.",
+            },
+        }
+    )
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+            previous_response_id=previous_response_id,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety is None
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_does_not_override_non_transient_error_code() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = ResponsesWebSocketError(
+        {
+            "type": "error",
+            "error": {
+                "type": "server_error",
+                "code": "invalid_request_error",
+                "message": "Invalid request.",
+            },
+        }
+    )
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+        )
+    )
+
+    assert advice is None
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.parametrize(
+    ("error_type", "code"),
+    [
+        ("service_unavailable_error", "server_is_overloaded"),
+        ("server_error", None),
+    ],
+)
+def test_websocket_get_retry_advice_keeps_partial_transient_error_unsafe(
+    error_type: str,
+    code: str | None,
+) -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = ResponsesWebSocketError(
+        {
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "code": code,
+                "message": "Transient provider error.",
+            },
+        }
+    )
+    setattr(error, "_openai_agents_ws_replay_safety", "unsafe")  # noqa: B010
+    setattr(error, "_openai_agents_ws_response_started", True)  # noqa: B010
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is False
+    assert advice.replay_safety == "unsafe"
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_ignores_other_pre_response_error_codes() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = ResponsesWebSocketError(
+        {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_request",
+                "message": "Invalid request.",
+            },
+        }
+    )
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+        )
+    )
+
+    assert advice is None
+
+
+def test_get_client_disables_provider_managed_retries_when_requested() -> None:
+    class DummyClient:
+        def __init__(self):
+            self.calls: list[dict[str, int]] = []
+
+        def with_options(self, **kwargs):
+            self.calls.append(kwargs)
+            return "retry-client"
+
+    client = DummyClient()
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, client))
+
+    assert cast(object, model._get_client()) is client
+
+    with provider_managed_retries_disabled(True):
+        assert cast(object, model._get_client()) == "retry-client"
+
+    assert client.calls == [{"max_retries": 0}]
+
+
+def test_websocket_pre_event_disconnect_retry_respects_websocket_retry_disable() -> None:
+    assert _should_retry_pre_event_websocket_disconnect() is True
+
+    with websocket_pre_event_retries_disabled(True):
+        assert _should_retry_pre_event_websocket_disconnect() is False
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_stream_response_lets_in_flight_close_finish_after_cancellation() -> None:
+    """Cancelling during the cleanup `aclose` continues that close instead of abandoning it."""
+
+    class CloseSignalingStream:
+        """Exhausts normally, then signals from `aclose` and blocks until released."""
+
+        def __init__(self, close_started: asyncio.Event, release: asyncio.Event) -> None:
+            self._yielded = False
+            self._close_started = close_started
+            self._release = release
+            self.aclose_calls = 0
+            self.aclose_completed = 0
+
+        def __aiter__(self) -> CloseSignalingStream:
+            return self
+
+        async def __anext__(self):
+            if self._yielded:
+                raise StopAsyncIteration
+            self._yielded = True
+            return ResponseCompletedEvent(
+                type="response.completed",
+                response=get_response_obj([]),
+                sequence_number=0,
+            )
+
+        async def aclose(self) -> None:
+            self.aclose_calls += 1
+            self._close_started.set()
+            await self._release.wait()
+            self.aclose_completed += 1
+
+    close_started = asyncio.Event()
+    release = asyncio.Event()
+    provider_stream = CloseSignalingStream(close_started, release)
+
+    class DummyResponses:
+        async def create(self, **kwargs):
+            return provider_stream
+
+    class DummyResponsesClient:
+        def __init__(self):
+            self.responses = DummyResponses()
+
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=DummyResponsesClient())  # type: ignore[arg-type]
+
+    stream_agen = cast(
+        Any,
+        model.stream_response(
+            system_instructions=None,
+            input="hi",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+        ),
+    )
+
+    async def consume() -> None:
+        async for _event in stream_agen:
+            pass
+
+    task = asyncio.create_task(consume())
+    try:
+        # The stream exhausts on its own, so the consumer reaches the cleanup `finally`
+        # and suspends inside the provider close.
+        await asyncio.wait_for(close_started.wait(), timeout=5)
+        assert provider_stream.aclose_calls == 1
+        assert provider_stream.aclose_completed == 0
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+
+        # The cancelled consumer must not have started a second close.
+        assert provider_stream.aclose_calls == 1
+        assert provider_stream.aclose_completed == 0
+
+        release.set()
+        for _ in range(200):
+            if provider_stream.aclose_completed == 1:
+                break
+            await asyncio.sleep(0.01)
+
+        assert provider_stream.aclose_calls == 1
+        assert provider_stream.aclose_completed == 1
+    finally:
+        release.set()
+        task.cancel()
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_reports_response_started() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = _connection_closed_error("no close frame received or sent")
+    setattr(error, "_openai_agents_ws_replay_safety", "unsafe")  # noqa: B010
+    setattr(error, "_openai_agents_ws_response_started", True)  # noqa: B010
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+        )
+    )
+
+    assert advice is not None
+    assert advice.replay_safety == "unsafe"
+    # A retry policy needs this to tell a response-started disconnect apart from
+    # other replay-unsafe failures before approving a replay.
+    assert advice.response_started is True
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_reports_no_response_started_for_stateful_request() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = _connection_closed_error("no close frame received or sent")
+    setattr(error, "_openai_agents_ws_replay_safety", "unsafe")  # noqa: B010
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+            previous_response_id="resp_1",
+        )
+    )
+
+    assert advice is not None
+    assert advice.replay_safety == "unsafe"
+    assert advice.response_started is False
+
+
+def _response_without_usage() -> Response:
+    return Response(
+        id="resp-no-usage",
+        created_at=0,
+        model="fake",
+        object="response",
+        output=[],
+        tool_choice="none",
+        tools=[],
+        top_p=None,
+        parallel_tool_calls=False,
+        usage=None,
+    )
+
+
+def _response_with_terminal_status(status: str) -> Response:
+    return Response(
+        id="resp-terminal",
+        created_at=0,
+        model="fake",
+        object="response",
+        output=[],
+        tool_choice="none",
+        tools=[],
+        top_p=None,
+        parallel_tool_calls=False,
+        usage=None,
+        status=status,
+        incomplete_details=(
+            IncompleteDetails(reason="max_output_tokens") if status == "incomplete" else None
+        ),
+    )
+
+
+def _completed_event_without_usage() -> ResponseCompletedEvent:
+    return ResponseCompletedEvent(
+        response=_response_without_usage(),
+        type="response.completed",
+        sequence_number=0,
+    )
+
+
+def _streaming_client_for(events: list[Any]) -> Any:
+    class IteratorStream:
+        def __init__(self) -> None:
+            self._remaining = list(events)
+
+        def __aiter__(self) -> IteratorStream:
+            return self
+
+        async def __anext__(self) -> Any:
+            if not self._remaining:
+                raise StopAsyncIteration
+            return self._remaining.pop(0)
+
+        async def close(self) -> None:
+            return None
+
+    stream = IteratorStream()
+
+    class APIResponse:
+        request_id = "req-1"
+
+        async def parse(self) -> Any:
+            return stream
+
+    class StreamingContextManager:
+        async def __aenter__(self) -> APIResponse:
+            return APIResponse()
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            return False
+
+    class Responses:
+        with_streaming_response = SimpleNamespace(create=lambda **kwargs: StreamingContextManager())
+
+    class Client:
+        responses = Responses()
+        base_url = httpx2.URL("https://custom.example.test/v1/")
+
+    return Client()
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_request_is_counted_when_responses_provider_omits_usage() -> None:
+    class Responses:
+        async def create(self, **kwargs: Any) -> Response:
+            return _response_without_usage()
+
+    class Client:
+        responses = Responses()
+        base_url = httpx2.URL("https://custom.example.test/v1/")
+
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, Client()))
+    response = await model.get_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(preserve_raw_usage=True),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+    )
+
+    assert response.usage.requests == 1
+    assert response.usage.total_tokens == 0
+    assert response.raw_usage is None
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_streamed_request_is_counted_when_responses_provider_omits_usage() -> None:
+    completed = _completed_event_without_usage()
+    client = _streaming_client_for([completed])
+    agent = Agent(
+        name="test",
+        model=OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, client)),
+    )
+
+    result = Runner.run_streamed(agent, "hi")
+    async for _ in result.stream_events():
+        pass
+
+    assert result.context_wrapper.usage.requests == 1
+    assert result.context_wrapper.usage.total_tokens == 0
+    assert completed.response.usage is None
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_fallback_response_stream_counts_request_without_usage() -> None:
+    completed = _completed_event_without_usage()
+
+    class IteratorStream:
+        def __init__(self) -> None:
+            self._remaining = [completed]
+            self.close_calls = 0
+
+        def __aiter__(self) -> IteratorStream:
+            return self
+
+        async def __anext__(self) -> ResponseCompletedEvent:
+            if not self._remaining:
+                raise StopAsyncIteration
+            return self._remaining.pop()
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    stream = IteratorStream()
+
+    class Responses:
+        async def create(self, **kwargs: Any) -> IteratorStream:
+            return stream
+
+    class Client:
+        responses = Responses()
+        base_url = httpx2.URL("https://custom.example.test/v1/")
+
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, Client()))
+    result = Runner.run_streamed(Agent(name="test", model=model), "hi")
+    async for _ in result.stream_events():
+        pass
+
+    assert result.context_wrapper.usage.requests == 1
+    assert result.context_wrapper.usage.total_tokens == 0
+    assert stream.close_calls == 1
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_fallback_response_stream_closes_resolved_iterable_iterator() -> None:
+    class IterableStream:
+        def __init__(self) -> None:
+            self.source_closed = False
+            self.iterator_closed = False
+
+        async def __aiter__(self) -> Any:
+            try:
+                yield _completed_event_without_usage()
+                yield _completed_event_without_usage()
+            finally:
+                self.iterator_closed = True
+
+        async def aclose(self) -> None:
+            self.source_closed = True
+
+    source = IterableStream()
+
+    class Responses:
+        async def create(self, **kwargs: Any) -> IterableStream:
+            return source
+
+    class Client:
+        responses = Responses()
+        base_url = httpx2.URL("https://custom.example.test/v1/")
+
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, Client()))
+    stream = model.stream_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+    )
+    async for _ in stream:
+        break
+    await stream.aclose()
+
+    assert source.iterator_closed
+    assert source.source_closed
+
+
+@pytest.mark.asyncio
+async def test_response_stream_closes_source_when_resolved_iterator_close_fails() -> None:
+    class FailingIterator:
+        def __init__(self) -> None:
+            self._remaining = [_completed_event_without_usage()]
+
+        def __aiter__(self) -> FailingIterator:
+            return self
+
+        async def __anext__(self) -> ResponseCompletedEvent:
+            if not self._remaining:
+                raise StopAsyncIteration
+            return self._remaining.pop()
+
+        async def aclose(self) -> None:
+            raise RuntimeError("iterator close failed")
+
+    iterator = FailingIterator()
+
+    class IterableSource:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __aiter__(self) -> FailingIterator:
+            return iterator
+
+        async def aclose(self) -> None:
+            self.closed = True
+            raise RuntimeError("source close failed")
+
+    source = IterableSource()
+
+    async def cleanup() -> None:
+        return None
+
+    stream = _ResponseStreamWithRequestId(source, request_id=None, cleanup=cleanup)
+    await stream.__anext__()
+
+    with pytest.raises(RuntimeError, match="iterator close failed"):
+        await stream.aclose()
+    assert source.closed
+
+
+@pytest.mark.asyncio
+async def test_response_stream_closes_distinct_source_after_normal_exhaustion() -> None:
+    class IterableSource:
+        def __init__(self) -> None:
+            self.source_close_calls = 0
+            self.iterator_finalized = False
+
+        async def __aiter__(self) -> Any:
+            try:
+                yield _completed_event_without_usage()
+            finally:
+                self.iterator_finalized = True
+
+        async def aclose(self) -> None:
+            self.source_close_calls += 1
+
+    source = IterableSource()
+    cleanup_calls = 0
+
+    async def cleanup() -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+
+    stream = _ResponseStreamWithRequestId(source, request_id=None, cleanup=cleanup)
+    async for _ in stream:
+        pass
+
+    assert source.iterator_finalized
+    assert source.source_close_calls == 1
+    assert cleanup_calls == 1
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_websocket_request_is_counted_when_responses_provider_omits_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = json.dumps(
+        {
+            "type": "response.completed",
+            "response": _response_without_usage().model_dump(),
+            "sequence_number": 1,
+        }
+    )
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+
+    async def fake_open(
+        ws_url: str, headers: dict[str, str], *, connect_timeout: float | None = None
+    ) -> DummyWSConnection:
+        return DummyWSConnection([frame])
+
+    monkeypatch.setattr(model, "_open_websocket_connection", fake_open)
+    response = await model.get_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+    )
+
+    assert response.usage.requests == 1
+    assert response.usage.total_tokens == 0
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_websocket_stream_counts_request_without_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = json.dumps(
+        {
+            "type": "response.completed",
+            "response": _response_without_usage().model_dump(),
+            "sequence_number": 1,
+        }
+    )
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+
+    async def fake_open(
+        ws_url: str, headers: dict[str, str], *, connect_timeout: float | None = None
+    ) -> DummyWSConnection:
+        return DummyWSConnection([frame])
+
+    monkeypatch.setattr(model, "_open_websocket_connection", fake_open)
+    result = Runner.run_streamed(Agent(name="test", model=model), "hi")
+    async for _ in result.stream_events():
+        pass
+
+    assert result.context_wrapper.usage.requests == 1
+    assert result.context_wrapper.usage.total_tokens == 0
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_response_span_counts_request_without_usage() -> None:
+    class Responses:
+        async def create(self, **kwargs: Any) -> Response:
+            return _response_without_usage()
+
+    class Client:
+        responses = Responses()
+        base_url = httpx2.URL("https://custom.example.test/v1/")
+
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, Client()))
+    with trace("test"):
+        await model.get_response(
+            system_instructions=None,
+            input="hi",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.ENABLED,
+        )
+
+    spans = [span.export() for span in fetch_ordered_spans() if span.span_data.type == "response"]
+    assert len(spans) == 1
+    assert spans[0]["span_data"]["usage"]["requests"] == 1  # type: ignore[index]
+    assert spans[0]["span_data"]["usage"]["total_tokens"] == 0  # type: ignore[index]
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_streamed_span_counts_request_before_terminal_event_close() -> None:
+    client = _streaming_client_for([_completed_event_without_usage()])
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, client))
+
+    with trace("test"):
+        stream = model.stream_response(
+            system_instructions=None,
+            input="hi",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.ENABLED,
+        )
+        async for event in stream:
+            if event.type == "response.completed":
+                break
+        await stream.aclose()
+
+    spans = [span.export() for span in fetch_ordered_spans() if span.span_data.type == "response"]
+    assert len(spans) == 1
+    assert spans[0]["span_data"]["usage"]["requests"] == 1  # type: ignore[index]
+    assert spans[0]["span_data"]["usage"]["total_tokens"] == 0  # type: ignore[index]
